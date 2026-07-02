@@ -1,0 +1,1 @@
+//! biohazardfs-fuse scaffold.

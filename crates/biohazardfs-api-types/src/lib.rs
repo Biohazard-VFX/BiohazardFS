@@ -1,0 +1,1 @@
+//! biohazardfs-api-types scaffold.

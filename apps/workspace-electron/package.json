@@ -1,0 +1,10 @@
+{
+  "name": "@biohazardfs/workspace-electron",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Biohazard Workspace Electron shell for BiohazardFS",
+  "scripts": {
+    "dev": "echo scaffold",
+    "test": "echo scaffold"
+  }
+}
