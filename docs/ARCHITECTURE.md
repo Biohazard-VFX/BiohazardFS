@@ -18,7 +18,7 @@ Electron is a shell. Rust is the sync/filesystem engine.
 
 ## Versioning model
 
-BiohazardFS is not a Git repository mounted as a drive. The live filesystem core should follow a LucidLink-like model:
+BiohazardFS is not a Git repository mounted as a drive. The live filesystem core should follow a virtual filesystem model:
 
 ```text
 virtual filesystem

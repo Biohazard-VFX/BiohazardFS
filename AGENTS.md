@@ -1,7 +1,7 @@
 # BiohazardFS Repository Guidelines
 
 - Repo: https://github.com/Biohazard-VFX/BiohazardFS
-- Product: BiohazardFS, an open-source LucidLink-style virtual sync filesystem for VFX.
+- Product: BiohazardFS, an open-source virtual sync filesystem for VFX.
 - Desktop app: Biohazard Workspace.
 - Primary implementation language: Rust.
 - Desktop shell: Electron + React + TypeScript + Tailwind + shadcn/ui.
@@ -256,7 +256,7 @@ Platform CI roadmap:
 
 - Linux: always required.
 - Windows: required before any filesystem MVP claim.
-- macOS: required before any Finder/File Provider/FUSE MVP claim.
+- macOS: required before any native file-provider or filesystem-adapter MVP claim.
 
 No release artifacts should be cut from a commit that fails CI.
 
@@ -264,7 +264,7 @@ No release artifacts should be cut from a commit that fails CI.
 
 - Never commit credentials, tokens, API keys, signed URLs, storage secrets, personal project data, or private artist/client files.
 - Do not print secrets in test output, debug logs, audit logs, CLI JSON, or UI error panes.
-- Permanent S3/Postgres credentials must not be the normal artist-client auth model.
+- Permanent storage/database credentials must not be the normal artist-client auth model.
 - Use short-lived tokens or server-mediated transfer authorization for normal clients.
 - Device sessions must be revocable.
 - Auth and transfer scopes must be least-privilege.
@@ -281,12 +281,12 @@ Distribution targets:
 - Homebrew.
 - npm wrapper for CLI/install convenience.
 - Website download link.
-- GitHub Releases artifacts.
+- Versioned release artifacts.
 
 Packaging must account for:
 
 - Rust daemon/CLI binaries bundled with Electron app.
-- Driver/runtime prerequisites: WinFsp/Cloud Files, macFUSE/File Provider/FUSE-T, Linux FUSE.
+- Platform filesystem/placeholder driver or runtime prerequisites.
 - Auto-update path for Electron app and Rust binaries.
 - Admin privilege requirements.
 - Clean uninstall that does not delete user cache unless explicitly requested.

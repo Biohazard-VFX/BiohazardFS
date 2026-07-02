@@ -1,6 +1,6 @@
 # BiohazardFS
 
-BiohazardFS is an open-source LucidLink-style virtual sync filesystem for VFX production.
+BiohazardFS is an open-source virtual sync filesystem for VFX production.
 
 It is being built for Biohazard first, then intended to become a public, self-hostable product for other studios.
 
@@ -15,7 +15,7 @@ Install the app, paste an invite code or sign in, choose a cache drive, and get 
 - React + TypeScript + Tailwind + shadcn/ui primitives
 - S3-compatible object storage backend
 - PostgreSQL control/metadata database
-- Optional Kitsu integration for assignments/worksets
+- Optional project-tracker integration for assignments/worksets
 - Agent-native JSON CLI from day one
 
 ## Repository status
