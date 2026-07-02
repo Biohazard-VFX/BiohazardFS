@@ -67,6 +67,21 @@ Git/Git LFS may be supported as optional import/export or for code/manifests/tem
 
 Every event should include provenance: actor, device, source (`ui`, `cli`, `agent`, `api`, `server`), timestamp, affected paths/IDs, and request/correlation ID.
 
+## Packaging/release boundary
+
+Packaging and release behavior is a product contract. See `docs/PACKAGING.md`.
+
+Key decisions:
+
+- Public/open-source distribution discipline starts from the beginning.
+- Primary distribution is one platform-native installer per OS.
+- The desktop installer installs the desktop app, CLI, daemon, autostart service, and required integration helpers.
+- Use one product version across desktop app, CLI, daemon, and server/control-plane artifacts at first.
+- Release channels are `dev`, `nightly`, `alpha`, `beta`, and `stable`.
+- Default artist install uses a per-user daemon that auto-starts at login.
+- Uninstall preserves cache/config/user data unless explicit purge/remove-data is selected.
+- Code signing/notarization is required before serious public/stable distribution, but not earliest MVP/dev artifacts.
+
 ## Filesystem/cache semantics boundary
 
 Filesystem and cache semantics are product contracts. See `docs/FILESYSTEM_SEMANTICS.md`.

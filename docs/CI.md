@@ -120,11 +120,12 @@ Release artifacts must not be cut if any of the following are true:
 
 Release artifacts include:
 
-- CLI binaries
-- daemon binaries
-- desktop installers
+- platform-native desktop installers that bundle the desktop app, CLI, daemon, autostart registration, and required platform helpers
+- CLI/daemon binaries when published as advanced/standalone artifacts
 - package-manager artifacts
 - server/control-plane images or bundles
+
+Packaging and release-channel policy is defined in `docs/PACKAGING.md`.
 
 ## Warnings and flaky tests
 

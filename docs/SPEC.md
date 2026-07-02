@@ -236,6 +236,18 @@ The local daemon contract is specified in `docs/DAEMON_API.md` and is a product 
 - Divergent reconnects always preserve both sides and create conflict records; no silent overwrite.
 - Explicit direct-server/headless/admin mode is allowed only for operations that do not require local mount/cache/filesystem state.
 
+### Packaging and release behavior
+
+Packaging and release behavior is specified in `docs/PACKAGING.md` and is a product requirement, not an implementation detail.
+
+- Primary distribution is one platform-native installer per OS.
+- The desktop installer installs Biohazard Workspace, `biohazardfs`, `biohazardfsd`, autostart registration, and required platform helpers.
+- Public/open-source distribution discipline starts from the beginning.
+- Release channels are `dev`, `nightly`, `alpha`, `beta`, and `stable`.
+- Use one product version across desktop app, CLI, daemon, and server/control-plane artifacts at first.
+- Default uninstall preserves cache, config, credentials, logs, and user data unless the user explicitly chooses purge/remove-data.
+- Code signing/notarization is required before serious public/stable distribution, but not required for earliest MVP/dev artifacts.
+
 ### Agent-native behavior
 
 Agents are first-class users. The CLI contract is specified in `docs/COMMANDS.md` and is a product requirement, not an implementation detail.
@@ -321,14 +333,15 @@ The `crates/` subdirectories intentionally avoid repeating the product name; pac
 4. Daemon API foundation: endpoint discovery, IPC transport, local session token auth, SQLite local state DB, standard envelopes, event stream, mock mount/cache/file methods.
 5. Metadata schema foundation: org/users/devices/tokens/projects/worksets/nodes/file versions/grants/operations/audit/locks/conflicts/snapshots/trash.
 6. Filesystem/cache semantics foundation: path normalization, case-insensitive sibling uniqueness, full-file hydrate, safe dehydrate, durable dirty state, cache-full behavior, lock/conflict mock paths.
-7. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
-8. Read-only Linux FUSE prototype with mock namespace.
-9. Hydrate-on-open into local cache from simple HTTP/S3 backend.
-10. Cache pin/dehydrate controls.
-11. Safe writes and conflict preservation.
-12. Electron/shadcn utility shell connected to daemon mock, then real daemon.
-13. Windows placeholder spike: Cloud Files API vs WinFsp.
-14. macOS placeholder spike: File Provider vs FUSE.
+7. Packaging foundation: version/channel metadata, one-installer contract, bundled CLI/daemon, per-user autostart, checksum metadata, uninstall preserves cache/config by default.
+8. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
+9. Read-only Linux FUSE prototype with mock namespace.
+10. Hydrate-on-open into local cache from simple HTTP/S3 backend.
+11. Cache pin/dehydrate controls.
+12. Safe writes and conflict preservation.
+13. Electron/shadcn utility shell connected to daemon mock, then real daemon.
+14. Windows placeholder spike: Cloud Files API vs WinFsp.
+15. macOS placeholder spike: File Provider vs FUSE.
 
 ## 6. Reference project conventions
 

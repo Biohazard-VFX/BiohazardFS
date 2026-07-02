@@ -5,6 +5,8 @@
 3. Hydration/cache prototype.
 4. Writes/conflicts/locks.
 5. Electron/shadcn workspace shell.
-6. Windows native placeholder spike.
-7. macOS native placeholder spike.
-8. Kitsu worksets and folder templates.
+6. Packaging foundation: one installer bundles desktop app, CLI, daemon, and per-user autostart.
+7. Release channels: dev, nightly, alpha, beta, stable.
+8. Windows native placeholder spike.
+9. macOS native placeholder spike.
+10. Kitsu worksets and folder templates.

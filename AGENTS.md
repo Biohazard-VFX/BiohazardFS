@@ -284,13 +284,17 @@ Distribution targets:
 
 Packaging must account for:
 
-- Rust daemon/CLI binaries bundled with Electron app.
-- Platform filesystem/placeholder driver or runtime prerequisites.
-- Auto-update path for Electron app and Rust binaries.
-- Admin privilege requirements.
-- Clean uninstall that does not delete user cache unless explicitly requested.
+- one platform-native installer per OS as the primary distribution path
+- Rust daemon/CLI binaries bundled with the desktop app installer
+- per-user daemon autostart registration
+- platform filesystem/placeholder driver or runtime prerequisites
+- release channels: `dev`, `nightly`, `alpha`, `beta`, `stable`
+- one product version across desktop app, CLI, daemon, and server/control-plane artifacts at first
+- auto-update path for desktop app and Rust binaries
+- admin privilege requirements
+- clean uninstall that preserves user cache/config unless explicit purge/remove-data is requested
 
-Packaging code must be tested. Installer scripts are production code.
+Packaging code must be tested. Installer scripts are production code. See `docs/PACKAGING.md`.
 
 ## Documentation Requirements
 
@@ -310,6 +314,7 @@ Required docs:
 - `docs/CONFIG.md`: config, profiles, env vars, credential storage.
 - `docs/SECURITY.md`: threat model and security behavior.
 - `docs/CI.md`: CI and release-gate policy.
+- `docs/PACKAGING.md`: packaging, installers, release channels, and artifact policy.
 - `docs/SMOKE.md`: validation workflows.
 - `docs/ROADMAP.md`: planned phases and non-goals.
 - `AGENTS.md`: this file.
