@@ -41,10 +41,46 @@ if [[ -z "$HOST_PORT" ]]; then
   exit 1
 fi
 
+for _ in $(seq 1 60); do
+  if python3 - <<PY
+import socket
+try:
+    with socket.create_connection(('127.0.0.1', int('$HOST_PORT')), timeout=1):
+        raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+PY
+  then
+    break
+  fi
+  sleep 1
+done
+
 export BIOHAZARDFS_DATABASE_URL="postgres://biohazardfs:${POSTGRES_PASSWORD}@127.0.0.1:${HOST_PORT}/biohazardfs?sslmode=disable"
 
-target/debug/biohazardfs-server migrate >/tmp/biohazardfs-server-db-migrate-1.json
-target/debug/biohazardfs-server migrate >/tmp/biohazardfs-server-db-migrate-2.json
+run_migrate_with_retries() {
+  local output_path="$1"
+  local attempt
+  for attempt in $(seq 1 10); do
+    if target/debug/biohazardfs-server migrate >"$output_path"; then
+      return 0
+    fi
+    if [[ "$attempt" == "10" ]]; then
+      echo "biohazardfs-server migrate failed after ${attempt} attempts" >&2
+      python3 - <<PY
+from pathlib import Path
+text = Path('$output_path').read_text() if Path('$output_path').exists() else ''
+text = text.replace('$POSTGRES_PASSWORD', '[redacted]')
+print(text, file=__import__('sys').stderr)
+PY
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+run_migrate_with_retries /tmp/biohazardfs-server-db-migrate-1.json
+run_migrate_with_retries /tmp/biohazardfs-server-db-migrate-2.json
 
 python3 - <<'PY'
 import json
