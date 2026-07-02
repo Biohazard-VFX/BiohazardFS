@@ -244,21 +244,20 @@ CI must be boring and strict.
 
 Minimum CI jobs:
 
-- Rust format check.
-- Rust clippy with `-D warnings`.
-- Rust test workspace.
-- Rust check workspace all features.
+- Linux full suite:
+  - Rust format check.
+  - Rust clippy with `-D warnings`.
+  - Rust test workspace.
+  - Rust check workspace all features.
+  - `git diff --check` equivalent for whitespace.
+  - Rust dependency/security/license audit.
+- Windows check/test.
+- macOS check/test.
 - TypeScript install/typecheck/lint/test/build once Electron app is real.
-- `git diff --check` equivalent for whitespace.
-- Dependency/license audit jobs once dependencies stabilize.
 
-Platform CI roadmap:
+No release artifacts should be cut when required CI fails, required smoke tests for claimed features/platforms fail or are missing, or known critical data-loss/security blockers are open.
 
-- Linux: always required.
-- Windows: required before any filesystem MVP claim.
-- macOS: required before any native file-provider or filesystem-adapter MVP claim.
-
-No release artifacts should be cut from a commit that fails CI.
+See `docs/CI.md` for CI and release-gate policy.
 
 ## Security Rules
 
@@ -304,9 +303,13 @@ Required docs:
 - `README.md`: product intro and quick start.
 - `docs/SPEC.md`: product contract.
 - `docs/COMMANDS.md`: command surface.
+- `docs/DAEMON_API.md`: local daemon API contract.
+- `docs/METADATA_SCHEMA.md`: server/control-plane metadata contract.
+- `docs/FILESYSTEM_SEMANTICS.md`: mounted filesystem and cache behavior.
 - `docs/ARCHITECTURE.md`: system design and boundaries.
 - `docs/CONFIG.md`: config, profiles, env vars, credential storage.
 - `docs/SECURITY.md`: threat model and security behavior.
+- `docs/CI.md`: CI and release-gate policy.
 - `docs/SMOKE.md`: validation workflows.
 - `docs/ROADMAP.md`: planned phases and non-goals.
 - `AGENTS.md`: this file.

@@ -6,25 +6,60 @@ on:
     branches: [main]
 
 jobs:
-  rust:
-    name: Rust quality gates
+  linux:
+    name: Linux full suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
       - name: Format
         run: cargo fmt --all -- --check
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features
+
       - name: Check
         run: cargo check --workspace --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
       - name: Whitespace
         run: git diff-tree --check --root -r HEAD
+
+      - name: Dependency, license, and advisory policy
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  cross-platform:
+    name: ${{ matrix.os }} check/test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
