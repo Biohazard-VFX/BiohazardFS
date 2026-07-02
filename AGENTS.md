@@ -305,6 +305,9 @@ When behavior changes, update relevant docs in the same change.
 Required docs:
 
 - `README.md`: product intro and quick start.
+- `CONTRIBUTING.md`: contributor workflow and expectations.
+- `CHANGELOG.md`: user-visible, contract, CI, packaging, and security changes.
+- `SECURITY.md`: vulnerability reporting policy.
 - `docs/SPEC.md`: product contract.
 - `docs/COMMANDS.md`: command surface.
 - `docs/DAEMON_API.md`: local daemon API contract.
@@ -317,9 +320,20 @@ Required docs:
 - `docs/PACKAGING.md`: packaging, installers, release channels, and artifact policy.
 - `docs/SMOKE.md`: validation workflows.
 - `docs/ROADMAP.md`: planned phases and non-goals.
+- `docs/skills.md`: index for repository-provided agent skills.
 - `AGENTS.md`: this file.
 
 Docs must use placeholders for hostnames, users, paths, and credentials unless a value is intentionally public.
+
+Changelog policy:
+
+- Update `CHANGELOG.md` for user-visible behavior, product contracts, CI/release gates, packaging, security, contributor workflow, and public-facing docs changes.
+- Do not include secrets, private hostnames, private customer/project names, or uncoordinated security details.
+
+Agent skills policy:
+
+- Keep `skills/` entries as stubs until the corresponding CLI/daemon behavior exists and is tested.
+- When skills become authoritative, update them in the same change as relevant CLI or behavior changes.
 
 ## Dependency Policy
 
