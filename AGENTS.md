@@ -50,11 +50,11 @@ Expected repository shape:
 
 ```text
 crates/
-  biohazardfs-core/        # pure domain logic: models, policy, cache state, transfer state
-  biohazardfs-api-types/   # shared API request/response/event types
-  biohazardfs-cli/         # thin CLI over core/daemon APIs; JSON-first
-  biohazardfs-daemon/      # background service: mounts, transfer queue, cache manager
-  biohazardfs-fuse/        # Linux FUSE adapter/prototype
+  core/        # pure domain logic: models, policy, cache state, transfer state
+  api-types/   # shared API request/response/event types
+  cli/         # thin CLI over core/daemon APIs; JSON-first
+  daemon/      # background service: mounts, transfer queue, cache manager
+  fuse/        # Linux FUSE adapter/prototype
 apps/
   workspace-electron/      # Electron shell, React UI, shadcn components
 docs/
@@ -66,6 +66,8 @@ docs/
   ROADMAP.md
   SMOKE.md
 ```
+
+Crate directory names should stay concise and unprefixed inside `crates/`; the package names may still use `biohazardfs-*` for published crate identity.
 
 Architectural rule: Electron is a UI shell. Rust owns filesystem semantics, cache state, transfer state, auth/session state, conflict handling, and all safety-critical behavior.
 

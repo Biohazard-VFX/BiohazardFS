@@ -264,22 +264,25 @@ Frontend stack:
 
 ```text
 crates/
-  biohazardfs-core/
-  biohazardfs-cli/
-  biohazardfs-daemon/
-  biohazardfs-api-types/
-  biohazardfs-fuse/
+  core/
+  api-types/
+  cli/
+  daemon/
+  fuse/
 apps/
   workspace-electron/
 docs/
   SPEC.md
   COMMANDS.md
+  DAEMON_API.md
   ARCHITECTURE.md
   CONFIG.md
   SECURITY.md
   ROADMAP.md
   SMOKE.md
 ```
+
+The `crates/` subdirectories intentionally avoid repeating the product name; package/crate identifiers may remain `biohazardfs-*` where that helps external publication and dependency clarity.
 
 ## 5. Immediate implementation phases
 

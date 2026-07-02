@@ -1,10 +1,10 @@
 [workspace]
 members = [
-  "crates/biohazardfs-core",
-  "crates/biohazardfs-cli",
-  "crates/biohazardfs-daemon",
-  "crates/biohazardfs-api-types",
-  "crates/biohazardfs-fuse",
+  "crates/core",
+  "crates/api-types",
+  "crates/cli",
+  "crates/daemon",
+  "crates/fuse",
 ]
 resolver = "2"
 
