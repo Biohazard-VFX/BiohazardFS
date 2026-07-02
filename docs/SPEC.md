@@ -143,6 +143,28 @@ Permissions should support at least:
 
 Kitsu should be the source of truth for assignments when integrated, but BiohazardFS must work without Kitsu.
 
+### Versioning, audit, snapshots, and conflict model
+
+BiohazardFS should copy LucidLink's broad filesystem model rather than using Git/Git LFS as the live filesystem core.
+
+Core decision:
+
+- Do not make raw Git or Git LFS the primary storage engine.
+- Use a mounted virtual filesystem with local cache/pinning, distributed locks, immutable file versions, an append-only event journal, and point-in-time snapshots.
+- Make audit and version control explicit and agent-friendly.
+- Keep Git/Git LFS optional for code, templates, manifests, explicit import/export, or project-specific workflows.
+
+Required primitives:
+
+- Every committed write creates an immutable file version.
+- Every meaningful operation creates an audit event with actor, device, source, path, object IDs, and timestamp.
+- Source/provenance must distinguish UI, CLI, agent, API, and server automation.
+- Snapshots capture point-in-time filesystem/project/workset state.
+- Snapshots are mountable/browsable read-only when feasible.
+- Restores copy or promote data from snapshots without destroying current data by default.
+- Conflicts preserve every version and never silently overwrite.
+- File locks protect binary/scene files where merging is impossible.
+
 ### Writes and conflicts
 
 MVP must support writes.
