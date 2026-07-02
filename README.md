@@ -154,6 +154,9 @@ Currently runnable:
 biohazardfs status
 biohazardfs daemon status
 biohazardfs daemon methods
+biohazardfs config path
+biohazardfs config show --redacted
+biohazardfs config validate
 biohazardfs schema list
 biohazardfs schema command daemon.status
 ```

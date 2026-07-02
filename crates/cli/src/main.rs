@@ -1,8 +1,13 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use biohazardfs_api_types::{
     ApiError, ClientStatus, CommandResponseEnvelope, CommandSchemaSummary,
     DEV_LOOPBACK_HTTP_ENDPOINT, DaemonRequest, DaemonStatus, Source,
+};
+use biohazardfs_core::config::{
+    CONFIG_SCHEMA_VERSION, ConfigError, ConfigLoadOptions, ENV_PROFILE, LoadedConfig,
+    RuntimeConfig, resolve_config_file_path,
 };
 use biohazardfs_daemon::{DaemonClientError, DaemonHttpClient, LOCAL_TOKEN_ENV};
 use clap::{Parser, Subcommand};
@@ -20,6 +25,14 @@ struct Cli {
     #[arg(long, global = true, default_value = DEV_LOOPBACK_HTTP_ENDPOINT)]
     daemon_endpoint: String,
 
+    /// Explicit TOML config file path. This is safe for argv; secrets are not.
+    #[arg(long = "config", global = true, value_name = "PATH")]
+    config_file: Option<PathBuf>,
+
+    /// Config profile name. Overrides env/config-file profile selection.
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -32,6 +45,11 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Config inspection and validation.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
     /// Schema-introspection scaffold.
     Schema {
@@ -48,6 +66,20 @@ enum DaemonCommand {
     Status,
     /// List daemon RPC methods exposed by the scaffold daemon.
     Methods,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the resolved config file path without parsing the file.
+    Path,
+    /// Print the resolved config. Output is redacted even without --redacted.
+    Show {
+        /// Explicitly request redacted output. Secrets are never printed by this scaffold.
+        #[arg(long)]
+        redacted: bool,
+    },
+    /// Parse and validate config, returning warnings in the command envelope.
+    Validate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +101,7 @@ fn main() -> ExitCode {
         Command::Daemon {
             command: DaemonCommand::Methods,
         } => daemon_methods_json(&cli),
+        Command::Config { command } => config_json(&cli, command),
         Command::Schema { command } => (schema_json(command), EXIT_OK),
         Command::Commands => (schema_json(SchemaCommand::List), EXIT_OK),
     };
@@ -206,6 +239,129 @@ fn daemon_methods_json(cli: &Cli) -> (String, u8) {
     }
 }
 
+fn config_json(cli: &Cli, command: ConfigCommand) -> (String, u8) {
+    match command {
+        ConfigCommand::Path => config_path_json(cli),
+        ConfigCommand::Show { redacted } => config_show_json(cli, redacted),
+        ConfigCommand::Validate => config_validate_json(cli),
+    }
+}
+
+fn config_path_json(cli: &Cli) -> (String, u8) {
+    let options = config_load_options(cli);
+    let path = resolve_config_file_path(&options);
+    let profile = cli
+        .profile
+        .clone()
+        .or_else(|| {
+            std::env::var(ENV_PROFILE)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| biohazardfs_core::config::DEFAULT_PROFILE.to_string());
+    let envelope = CommandResponseEnvelope::ok(
+        "config.path",
+        serde_json::json!({
+            "path": path.to_string_lossy(),
+            "exists": path.exists(),
+            "profile": profile,
+            "schema_version": CONFIG_SCHEMA_VERSION,
+        }),
+        Source::Cli,
+    );
+    (
+        serde_json::to_string_pretty(&envelope).expect("config path serializes"),
+        EXIT_OK,
+    )
+}
+
+fn config_show_json(cli: &Cli, redacted: bool) -> (String, u8) {
+    match load_config(cli) {
+        Ok(loaded) => {
+            let mut warnings = loaded.validation_warnings();
+            if !redacted {
+                warnings.push(biohazardfs_core::config::ConfigWarning {
+                    code: "config_show_redacted_by_default".to_string(),
+                    message: "config show output is redacted by default; pass --redacted to acknowledge this behavior".to_string(),
+                });
+            }
+            config_ok_json("config.show", loaded, warnings)
+        }
+        Err(error) => config_error_json("config.show", error),
+    }
+}
+
+fn config_validate_json(cli: &Cli) -> (String, u8) {
+    match load_config(cli) {
+        Ok(loaded) => {
+            let warnings = loaded.validation_warnings();
+            let data = serde_json::json!({
+                "valid": true,
+                "config_file_path": loaded.config_file_path,
+                "config_file_exists": loaded.config_file_exists,
+                "selected_profile": loaded.selected_profile,
+                "schema_version": CONFIG_SCHEMA_VERSION,
+                "warning_count": warnings.len(),
+            });
+            let mut envelope = CommandResponseEnvelope::ok("config.validate", data, Source::Cli);
+            envelope.warnings = warnings
+                .into_iter()
+                .map(|warning| biohazardfs_api_types::Warning {
+                    code: warning.code,
+                    message: warning.message,
+                })
+                .collect();
+            (
+                serde_json::to_string_pretty(&envelope).expect("config validation serializes"),
+                EXIT_OK,
+            )
+        }
+        Err(error) => config_error_json("config.validate", error),
+    }
+}
+
+fn config_ok_json(
+    command: &str,
+    loaded: LoadedConfig,
+    warnings: Vec<biohazardfs_core::config::ConfigWarning>,
+) -> (String, u8) {
+    let mut envelope = CommandResponseEnvelope::ok(command, loaded, Source::Cli);
+    envelope.warnings = warnings
+        .into_iter()
+        .map(|warning| biohazardfs_api_types::Warning {
+            code: warning.code,
+            message: warning.message,
+        })
+        .collect();
+    (
+        serde_json::to_string_pretty(&envelope).expect("config serializes"),
+        EXIT_OK,
+    )
+}
+
+fn config_error_json(command: &str, error: ConfigError) -> (String, u8) {
+    let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+        command,
+        ApiError::new(error.code, error.message),
+        Source::Cli,
+    );
+    (
+        serde_json::to_string_pretty(&envelope).expect("config error serializes"),
+        EXIT_USAGE,
+    )
+}
+
+fn load_config(cli: &Cli) -> Result<LoadedConfig, ConfigError> {
+    RuntimeConfig::load(config_load_options(cli))
+}
+
+fn config_load_options(cli: &Cli) -> ConfigLoadOptions {
+    ConfigLoadOptions {
+        config_file: cli.config_file.clone(),
+        profile: cli.profile.clone(),
+    }
+}
+
 fn daemon_exit_code(code: &str) -> u8 {
     match code {
         "auth_required" => EXIT_AUTH,
@@ -230,6 +386,9 @@ fn schema_json(command: SchemaCommand) -> String {
         "client.status".to_string(),
         "daemon.status".to_string(),
         "daemon.methods".to_string(),
+        "config.path".to_string(),
+        "config.show".to_string(),
+        "config.validate".to_string(),
         "schema.list".to_string(),
         "schema.command".to_string(),
     ];

@@ -41,6 +41,40 @@ assert status['data']['state'] == 'ready', status
 print('daemon-cli-smoke-ok')
 PY
 
+CONFIG_SMOKE_DIR="$(mktemp -d)"
+cat >"$CONFIG_SMOKE_DIR/config.toml" <<'TOML'
+schema_version = "2026-07-config-v1"
+profile = "smoke"
+
+[profiles.smoke.server]
+bind = "127.0.0.1:49999"
+
+[profiles.smoke.object_store]
+provider = "rustfs"
+endpoint = "http://object-store:9000"
+bucket = "biohazardfs-smoke"
+access_key_id = "biohazardfs"
+secret_access_key = "do-not-print"
+TOML
+
+target/debug/biohazardfs --config "$CONFIG_SMOKE_DIR/config.toml" config path >/tmp/biohazardfs-config-path.json
+target/debug/biohazardfs --config "$CONFIG_SMOKE_DIR/config.toml" config show --redacted >/tmp/biohazardfs-config-show.json
+target/debug/biohazardfs --config "$CONFIG_SMOKE_DIR/config.toml" config validate >/tmp/biohazardfs-config-validate.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+for path in ['/tmp/biohazardfs-config-path.json', '/tmp/biohazardfs-config-show.json', '/tmp/biohazardfs-config-validate.json']:
+    text = Path(path).read_text()
+    payload = json.loads(text)
+    assert payload['ok'] is True, payload
+    assert 'do-not-print' not in text, text
+show = json.loads(Path('/tmp/biohazardfs-config-show.json').read_text())
+assert show['command'] == 'config.show', show
+assert show['data']['config']['server']['bind'] == '127.0.0.1:49999', show
+assert show['data']['config']['object_store']['secret_access_key'] == '***REDACTED***', show
+print('config-cli-smoke-ok')
+PY
+
 if [[ "${BIOHAZARDFS_SKIP_ELECTRON_BUILD:-0}" != "1" ]]; then
   pnpm --dir apps/workspace-electron install --frozen-lockfile
   pnpm --dir apps/workspace-electron run build

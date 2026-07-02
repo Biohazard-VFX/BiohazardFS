@@ -299,19 +299,26 @@ Rules:
 
 ## Config commands
 
-Config is TOML on disk and JSON through the CLI.
+Config is TOML on disk and JSON through the CLI. Currently implemented:
 
 ```bash
 biohazardfs config path
-biohazardfs config show
 biohazardfs config show --redacted
+biohazardfs config validate
+```
+
+Planned:
+
+```bash
+biohazardfs config show
 biohazardfs config get <key>
 biohazardfs config set <key> <value> --dry-run
 biohazardfs config set <key> <value> --yes
-biohazardfs config validate
 biohazardfs config migrate --dry-run
 biohazardfs config migrate --yes
 ```
+
+`config show` is redacted by default in the current scaffold even when `--redacted` is omitted.
 
 Expected config keys include:
 

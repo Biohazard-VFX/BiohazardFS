@@ -3,9 +3,12 @@
 Status: draft reference, partially implemented
 Audience: CLI/daemon/server/desktop implementers, operators, automation agents
 
-BiohazardFS uses one shared typed runtime configuration model across the Rust CLI, daemon, server, and desktop app. The current implementation has the first Rust shared config scaffold in `biohazardfs-core::config` and server-side redacted introspection via:
+BiohazardFS uses one shared typed runtime configuration model across the Rust CLI, daemon, server, and desktop app. The current implementation has TOML-backed Rust config loading in `biohazardfs-core::config`, CLI redacted introspection, and server-side redacted introspection via:
 
 ```bash
+biohazardfs config path
+biohazardfs config show --redacted
+biohazardfs config validate
 biohazardfs-server config
 ```
 
@@ -53,7 +56,7 @@ Overrides:
 | `BIOHAZARDFS_CONFIG_DIR` | explicit config directory for tests/agents/headless installs |
 | `BIOHAZARDFS_PROFILE` | profile name, default `dev` |
 
-The current Rust scaffold records these path overrides but does not yet parse TOML files. Until TOML loading lands, deployment scaffolds should use the environment contract below.
+The Rust scaffold now parses TOML config files. Missing default config files are allowed and produce built-in defaults. Invalid TOML or unreadable explicit config files return `config_parse_error` / `config_read_error` through the CLI command envelope.
 
 ## Shared environment variables
 
@@ -113,28 +116,52 @@ Rules:
 - Local token must not be accepted through argv.
 - Daemon RPC stays separate from CLI config: daemon envelopes use `method`; CLI output uses `command`.
 
-## Server config contract
+## TOML shape
 
-Current shared fields:
+Top-level fields apply to every profile. `[profiles.<name>]` fields override top-level fields for the selected profile. Environment variables override both.
 
 ```toml
+schema_version = "2026-07-config-v1"
+profile = "dev"
+log = "info"
+
 [server]
 bind = "127.0.0.1:8080"
 public_url = "http://localhost:8080"
 
 [database]
-url_set = false
+url = "postgres://user:password@postgres:5432/biohazardfs"
 
 [object_store]
 provider = "rustfs"
 endpoint = "http://object-store:9000"
 bucket = "biohazardfs-dev"
 region = "us-east-1"
-access_key_id_set = true
-secret_access_key = "***REDACTED***"
+access_key_id = "biohazardfs"
+secret_access_key = "dev-only-secret"
+
+[profiles.ci]
+log = "debug"
+
+[profiles.ci.server]
+bind = "0.0.0.0:8080"
 ```
 
-`biohazardfs-server config` prints a JSON server envelope with this config redacted. It is safe for CI logs as long as new secret-bearing fields use the redaction type or boolean `*_set` convention.
+The redacted runtime shape reports secret-bearing values as booleans or `***REDACTED***`:
+
+```json
+{
+  "schema_version": "2026-07-config-v1",
+  "database": { "url_set": true },
+  "object_store": {
+    "provider": "rustfs",
+    "access_key_id_set": true,
+    "secret_access_key": "***REDACTED***"
+  }
+}
+```
+
+`biohazardfs config show --redacted` and `biohazardfs-server config` print safe JSON envelopes. It is safe for CI logs as long as new secret-bearing fields use the redaction type or boolean `*_set` convention.
 
 ## Validation warnings
 
@@ -148,10 +175,9 @@ These are warnings for now because the server scaffold does not yet connect to P
 
 ## Next implementation steps
 
-1. Add TOML parsing/writing and profile selection.
-2. Add `biohazardfs config path/show --redacted/validate` in the CLI.
-3. Generate a JSON schema for `2026-07-config-v1` under `generated/schemas/`.
-4. Mirror the shared config shape in the Electron TypeScript preload/renderer boundary.
-5. Add secure credential lookup: OS keyring first, owner-only fallback for headless/dev.
-6. Add server dependency checks that validate Postgres connectivity and RustFS bucket access.
-7. Add Compose integration smoke that boots RustFS and creates/checks the dev bucket.
+1. Add config file writing and controlled `config get/set` commands.
+2. Generate a JSON schema for `2026-07-config-v1` under `generated/schemas/`.
+3. Mirror the shared config shape in the Electron TypeScript preload/renderer boundary.
+4. Add secure credential lookup: OS keyring first, owner-only fallback for headless/dev.
+5. Add server dependency checks that validate Postgres connectivity and RustFS bucket access.
+6. Add Compose integration smoke that boots RustFS and creates/checks the dev bucket.
