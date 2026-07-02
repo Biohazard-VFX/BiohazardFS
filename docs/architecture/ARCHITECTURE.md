@@ -18,7 +18,7 @@ Electron is a shell. Rust is the sync/filesystem engine.
 
 ## Daemon API boundary
 
-The local daemon API is a product contract. See `docs/DAEMON_API.md`.
+The local daemon API is a product contract. See `docs/architecture/DAEMON_API.md`.
 
 Key decisions:
 
@@ -69,7 +69,7 @@ Every event should include provenance: actor, device, source (`ui`, `cli`, `agen
 
 ## Packaging/release boundary
 
-Packaging and release behavior is a product contract. See `docs/PACKAGING.md`.
+Packaging and release behavior is a product contract. See `docs/reference/PACKAGING.md`.
 
 Key decisions:
 
@@ -84,7 +84,7 @@ Key decisions:
 
 ## Filesystem/cache semantics boundary
 
-Filesystem and cache semantics are product contracts. See `docs/FILESYSTEM_SEMANTICS.md`.
+Filesystem and cache semantics are product contracts. See `docs/architecture/FILESYSTEM_SEMANTICS.md`.
 
 Key decisions:
 
@@ -100,9 +100,25 @@ Key decisions:
 - Symlinks are supported but constrained to authorized roots unless policy allows otherwise.
 - Image sequences are normal files in v1 with listing/prefetch optimization, not special version semantics.
 
+## Server/control-plane runtime boundary
+
+The server/control-plane runtime architecture is a product contract. See `docs/architecture/SERVER_ARCHITECTURE.md`.
+
+Key decisions:
+
+- The server/control plane lives in the public BiohazardFS repo from the beginning.
+- Docker packaging and an in-repo Helm chart are required for self-hosting.
+- Start as a modular monolith, not microservices.
+- One server codebase can run API, worker, migration, and admin modes.
+- PostgreSQL is the metadata/audit/operation source of truth.
+- S3-compatible object storage holds content manifests and file data.
+- Normal clients never receive permanent storage/database credentials.
+- Server issues short-lived scoped transfer authorization.
+- Server validates every daemon/client operation and never blindly trusts the daemon.
+
 ## Server metadata boundary
 
-The server/control-plane metadata schema is a product contract. See `docs/METADATA_SCHEMA.md`.
+The server/control-plane metadata schema is a product contract. See `docs/architecture/METADATA_SCHEMA.md`.
 
 Key decisions:
 

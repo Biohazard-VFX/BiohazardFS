@@ -17,11 +17,11 @@ This is a placeholder for the future shared BiohazardFS agent skill.
 
 It is intentionally not authoritative yet. Use the repository docs as source of truth:
 
-- `docs/SPEC.md`
-- `docs/COMMANDS.md`
-- `docs/DAEMON_API.md`
-- `docs/FILESYSTEM_SEMANTICS.md`
-- `docs/SECURITY.md`
+- `docs/product/SPEC.md`
+- `docs/reference/COMMANDS.md`
+- `docs/architecture/DAEMON_API.md`
+- `docs/architecture/FILESYSTEM_SEMANTICS.md`
+- `docs/reference/SECURITY.md`
 
 Future versions of this skill should cover:
 

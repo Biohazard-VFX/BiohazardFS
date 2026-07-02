@@ -82,12 +82,13 @@ Current completed foundations:
 
 Start with:
 
-- [`docs/SPEC.md`](docs/SPEC.md) — product contract
-- [`docs/COMMANDS.md`](docs/COMMANDS.md) — CLI and agent contract
-- [`docs/DAEMON_API.md`](docs/DAEMON_API.md) — local daemon API
-- [`docs/METADATA_SCHEMA.md`](docs/METADATA_SCHEMA.md) — server/control-plane schema
-- [`docs/FILESYSTEM_SEMANTICS.md`](docs/FILESYSTEM_SEMANTICS.md) — filesystem/cache safety rules
-- [`docs/PACKAGING.md`](docs/PACKAGING.md) — installer and release-channel policy
+- [`docs/product/SPEC.md`](docs/product/SPEC.md) — product contract
+- [`docs/reference/COMMANDS.md`](docs/reference/COMMANDS.md) — CLI and agent contract
+- [`docs/architecture/DAEMON_API.md`](docs/architecture/DAEMON_API.md) — local daemon API
+- [`docs/architecture/SERVER_ARCHITECTURE.md`](docs/architecture/SERVER_ARCHITECTURE.md) — server/control-plane runtime
+- [`docs/architecture/METADATA_SCHEMA.md`](docs/architecture/METADATA_SCHEMA.md) — server/control-plane schema
+- [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md) — filesystem/cache safety rules
+- [`docs/reference/PACKAGING.md`](docs/reference/PACKAGING.md) — installer and release-channel policy
 
 ## Installation
 
@@ -126,13 +127,13 @@ biohazardfs schema command file.history
 biohazardfs mcp
 ```
 
-See [`docs/COMMANDS.md`](docs/COMMANDS.md).
+See [`docs/reference/COMMANDS.md`](docs/reference/COMMANDS.md).
 
 ## AI agent skill stubs
 
 This repository includes placeholder agent skills so the repo shape is ready for agent-native distribution later.
 
-See the [Skills Index](docs/skills.md):
+See the [Skills Index](docs/reference/skills.md):
 
 - [`skills/biohazardfs-shared/SKILL.md`](skills/biohazardfs-shared/SKILL.md)
 - [`skills/biohazardfs-workspace/SKILL.md`](skills/biohazardfs-workspace/SKILL.md)
@@ -149,7 +150,7 @@ cargo check --workspace --all-features
 cargo test --workspace --all-features
 ```
 
-CI runs the full Linux suite plus Windows/macOS check+test. See [`docs/CI.md`](docs/CI.md).
+CI runs the full Linux suite plus Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 

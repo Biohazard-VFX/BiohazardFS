@@ -41,6 +41,15 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
+
+      - name: Helm template
+        run: helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret >/tmp/biohazardfs-helm.yaml
+
   cross-platform:
     name: ${{ matrix.os }} check/test
     runs-on: ${{ matrix.os }}

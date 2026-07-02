@@ -6,9 +6,9 @@
 - Primary implementation language: Rust.
 - Desktop shell: Electron + React + TypeScript + Tailwind + shadcn/ui.
 - License target: Apache-2.0.
-- Canonical product spec: `docs/SPEC.md`.
-- Canonical architecture doc: `docs/ARCHITECTURE.md`.
-- Canonical command surface: `docs/COMMANDS.md`.
+- Canonical product spec: `docs/product/SPEC.md`.
+- Canonical architecture doc: `docs/architecture/ARCHITECTURE.md`.
+- Canonical command surface: `docs/reference/COMMANDS.md`.
 
 This project has a deliberately high quality bar. BiohazardFS is filesystem and sync software: sloppy code can corrupt work, lose artist time, or make recovery impossible five days before delivery. Prefer boring, obvious, testable code over clever abstractions every time.
 
@@ -27,16 +27,23 @@ Code should be self-describing. Comments explain why, invariants, tradeoffs, and
 
 ## Required Workflow
 
-1. Read `docs/SPEC.md` before changing product behavior.
-2. Read `docs/ARCHITECTURE.md` before changing daemon, filesystem, cache, transfer, or server boundaries.
+1. Read `docs/product/SPEC.md` before changing product behavior.
+2. Read `docs/architecture/ARCHITECTURE.md` before changing daemon, filesystem, cache, transfer, or server boundaries.
 3. Keep docs aligned with behavior changes:
    - `README.md`
-   - `docs/SPEC.md`
-   - `docs/COMMANDS.md`
-   - `docs/ARCHITECTURE.md`
-   - `docs/CONFIG.md`
-   - `docs/SECURITY.md`
-   - `docs/SMOKE.md`
+   - `docs/product/SPEC.md`
+   - `docs/product/ROADMAP.md`
+   - `docs/architecture/ARCHITECTURE.md`
+   - `docs/architecture/SERVER_ARCHITECTURE.md`
+   - `docs/architecture/DAEMON_API.md`
+   - `docs/architecture/METADATA_SCHEMA.md`
+   - `docs/architecture/FILESYSTEM_SEMANTICS.md`
+   - `docs/reference/COMMANDS.md`
+   - `docs/reference/CONFIG.md`
+   - `docs/reference/SECURITY.md`
+   - `docs/reference/CI.md`
+   - `docs/reference/PACKAGING.md`
+   - `docs/reference/SMOKE.md`
 4. Make changes in the smallest coherent vertical slice.
 5. Add tests with behavior changes. If a change cannot be tested yet, document why and add the seam that will make it testable.
 6. Run validation before committing.
@@ -48,21 +55,31 @@ Expected repository shape:
 
 ```text
 crates/
-  core/        # pure domain logic: models, policy, cache state, transfer state
-  api-types/   # shared API request/response/event types
-  cli/         # thin CLI over core/daemon APIs; JSON-first
-  daemon/      # background service: mounts, transfer queue, cache manager
-  fuse/        # Linux FUSE adapter/prototype
+  core/                 # domain logic: models, policy, cache state, transfer state
+  api-types/            # shared API request/response/event/schema types
+  cli/                  # thin CLI over core/daemon/server APIs; JSON-first
+  daemon/               # local daemon: mounts, transfer queue, cache manager
+  fuse/                 # Linux FUSE adapter/prototype
+  server/               # public server/control-plane binary and modules
 apps/
-  workspace-electron/      # Electron shell, React UI, shadcn components
+  workspace-electron/   # Electron shell, React UI, shadcn components
+  admin-web/            # reserved for future admin web UI
+  docs-site/            # reserved for future docs site
+deploy/
+  docker/               # Docker packaging
+  helm/                 # Helm charts
+  compose/              # local/dev compose stacks
+packaging/              # macOS, Windows, Linux installer/release assets
 docs/
-  SPEC.md
-  COMMANDS.md
-  ARCHITECTURE.md
-  CONFIG.md
-  SECURITY.md
-  ROADMAP.md
-  SMOKE.md
+  product/              # product spec and roadmap
+  architecture/         # architecture and behavioral contracts
+  reference/            # CLI/config/CI/security/packaging/smoke references
+  adr/                  # architecture decision records
+  operations/           # self-hosting and operations runbooks
+generated/              # generated schemas, MCP manifests, CLI reference
+tests/                  # product-level smoke/integration/filesystem safety tests
+scripts/                # CI/dev/release helper scripts
+skills/                 # repository-provided agent skills
 ```
 
 Crate directory names should stay concise and unprefixed inside `crates/`; the package names may still use `biohazardfs-*` for published crate identity.
@@ -206,7 +223,7 @@ Use a CLI contract similar to mature agent-facing CLIs, but keep the requirement
 - OS keyring credential backend with owner-only local fallback for dev/headless.
 - Dry-run and `--yes` guardrails for destructive operations.
 - Secret-redacted JSONL audit/provenance logs.
-- Document the exact command contract in `docs/COMMANDS.md`; do not require contributors to inspect another local repository to understand expected behavior.
+- Document the exact command contract in `docs/reference/COMMANDS.md`; do not require contributors to inspect another local repository to understand expected behavior.
 
 Agents may administer the system only when authorized. If an agent acts on behalf of a user, provenance must record the actor, target user, entry point, command/API operation, and time.
 
@@ -257,7 +274,7 @@ Minimum CI jobs:
 
 No release artifacts should be cut when required CI fails, required smoke tests for claimed features/platforms fail or are missing, or known critical data-loss/security blockers are open.
 
-See `docs/CI.md` for CI and release-gate policy.
+See `docs/reference/CI.md` for CI and release-gate policy.
 
 ## Security Rules
 
@@ -268,7 +285,7 @@ See `docs/CI.md` for CI and release-gate policy.
 - Device sessions must be revocable.
 - Auth and transfer scopes must be least-privilege.
 - Public share links must support expiry and revocation.
-- Any security-sensitive behavior change must update `docs/SECURITY.md`.
+- Any security-sensitive behavior change must update `docs/reference/SECURITY.md`.
 
 ## Build and Packaging Requirements
 
@@ -294,7 +311,7 @@ Packaging must account for:
 - admin privilege requirements
 - clean uninstall that preserves user cache/config unless explicit purge/remove-data is requested
 
-Packaging code must be tested. Installer scripts are production code. See `docs/PACKAGING.md`.
+Packaging code must be tested. Installer scripts are production code. See `docs/reference/PACKAGING.md`.
 
 ## Documentation Requirements
 
@@ -308,19 +325,21 @@ Required docs:
 - `CONTRIBUTING.md`: contributor workflow and expectations.
 - `CHANGELOG.md`: user-visible, contract, CI, packaging, and security changes.
 - `SECURITY.md`: vulnerability reporting policy.
-- `docs/SPEC.md`: product contract.
-- `docs/COMMANDS.md`: command surface.
-- `docs/DAEMON_API.md`: local daemon API contract.
-- `docs/METADATA_SCHEMA.md`: server/control-plane metadata contract.
-- `docs/FILESYSTEM_SEMANTICS.md`: mounted filesystem and cache behavior.
-- `docs/ARCHITECTURE.md`: system design and boundaries.
-- `docs/CONFIG.md`: config, profiles, env vars, credential storage.
-- `docs/SECURITY.md`: threat model and security behavior.
-- `docs/CI.md`: CI and release-gate policy.
-- `docs/PACKAGING.md`: packaging, installers, release channels, and artifact policy.
-- `docs/SMOKE.md`: validation workflows.
-- `docs/ROADMAP.md`: planned phases and non-goals.
-- `docs/skills.md`: index for repository-provided agent skills.
+- `docs/product/SPEC.md`: product contract.
+- `docs/reference/COMMANDS.md`: command surface.
+- `docs/architecture/SERVER_ARCHITECTURE.md`: server/control-plane runtime contract.
+- `docs/architecture/DAEMON_API.md`: local daemon API contract.
+- `docs/architecture/METADATA_SCHEMA.md`: server/control-plane metadata contract.
+- `docs/architecture/FILESYSTEM_SEMANTICS.md`: mounted filesystem and cache behavior.
+- `docs/architecture/ARCHITECTURE.md`: system design and boundaries.
+- `docs/reference/CONFIG.md`: config, profiles, env vars, credential storage.
+- `docs/reference/SECURITY.md`: threat model and security behavior.
+- `docs/reference/CI.md`: CI and release-gate policy.
+- `docs/reference/PACKAGING.md`: packaging, installers, release channels, and artifact policy.
+- `docs/reference/SMOKE.md`: validation workflows.
+- `docs/product/ROADMAP.md`: planned phases and non-goals.
+- `docs/reference/skills.md`: index for repository-provided agent skills.
+- `docs/adr/0001-repository-layout.md`: accepted repository layout decision.
 - `AGENTS.md`: this file.
 
 Docs must use placeholders for hostnames, users, paths, and credentials unless a value is intentionally public.

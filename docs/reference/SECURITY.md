@@ -3,7 +3,7 @@
 Status: draft reference
 Audience: contributors, daemon/server implementers, packaging maintainers, security reviewers
 
-This document describes the security expectations for BiohazardFS. For vulnerability reporting, see the root [`SECURITY.md`](../SECURITY.md).
+This document describes the security expectations for BiohazardFS. For vulnerability reporting, see the root [`SECURITY.md`](../../SECURITY.md).
 
 ## Security goals
 
@@ -39,7 +39,7 @@ Token rules:
 
 ## Local daemon security
 
-`biohazardfsd` local API security is defined in [`DAEMON_API.md`](DAEMON_API.md).
+`biohazardfsd` local API security is defined in [`DAEMON_API.md`](../architecture/DAEMON_API.md).
 
 Required controls:
 

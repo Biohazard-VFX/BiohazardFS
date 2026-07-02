@@ -8,9 +8,9 @@ Current status: **stub only**. These skills are placeholders and are not authori
 
 | Skill | Description |
 |---|---|
-| [biohazardfs-shared](../skills/biohazardfs-shared/SKILL.md) | Stub for future shared CLI patterns, safety rules, mutation policy, output parsing, daemon boundaries. |
-| [biohazardfs-workspace](../skills/biohazardfs-workspace/SKILL.md) | Stub for future workspace operations: status, mount, cache, file history, snapshots, locks, conflicts. |
-| [biohazardfs-admin-audit](../skills/biohazardfs-admin-audit/SKILL.md) | Stub for future admin/audit operations: invites, shares, grants, devices, tokens, audit events, release safety. |
+| [biohazardfs-shared](../../skills/biohazardfs-shared/SKILL.md) | Stub for future shared CLI patterns, safety rules, mutation policy, output parsing, daemon boundaries. |
+| [biohazardfs-workspace](../../skills/biohazardfs-workspace/SKILL.md) | Stub for future workspace operations: status, mount, cache, file history, snapshots, locks, conflicts. |
+| [biohazardfs-admin-audit](../../skills/biohazardfs-admin-audit/SKILL.md) | Stub for future admin/audit operations: invites, shares, grants, devices, tokens, audit events, release safety. |
 
 ## Installation pattern
 

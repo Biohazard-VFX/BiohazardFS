@@ -517,7 +517,7 @@ admin.support_bundle.create
 
 ## Mutation and dry-run behavior
 
-Daemon mutation behavior must follow `docs/COMMANDS.md` safety profiles.
+Daemon mutation behavior must follow `docs/reference/COMMANDS.md` safety profiles.
 
 - Fresh installs default to `agent-safe`.
 - The daemon stores and enforces the selected mutation policy.

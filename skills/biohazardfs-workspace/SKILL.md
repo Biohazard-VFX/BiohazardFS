@@ -19,10 +19,10 @@ This is a placeholder for the future BiohazardFS workspace operations skill.
 
 It is intentionally not authoritative yet. Use the repository docs as source of truth:
 
-- `docs/COMMANDS.md`
-- `docs/DAEMON_API.md`
-- `docs/FILESYSTEM_SEMANTICS.md`
-- `docs/SMOKE.md`
+- `docs/reference/COMMANDS.md`
+- `docs/architecture/DAEMON_API.md`
+- `docs/architecture/FILESYSTEM_SEMANTICS.md`
+- `docs/reference/SMOKE.md`
 
 Future versions of this skill should cover:
 

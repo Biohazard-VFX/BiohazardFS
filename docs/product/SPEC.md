@@ -194,7 +194,7 @@ Artists should not manually create top-level project folders.
 
 ### Filesystem and cache semantics
 
-Filesystem and cache semantics are specified in `docs/FILESYSTEM_SEMANTICS.md` and are product requirements, not implementation details.
+Filesystem and cache semantics are specified in `docs/architecture/FILESYSTEM_SEMANTICS.md` and are product requirements, not implementation details.
 
 - Preserve filename case, but enforce case-insensitive sibling uniqueness by default.
 - Delete in mounted workspace means server/cloud trash; local cache removal is separate dehydrate/uncache behavior.
@@ -207,9 +207,23 @@ Filesystem and cache semantics are specified in `docs/FILESYSTEM_SEMANTICS.md` a
 - Symlinks are supported but constrained to authorized roots unless policy allows otherwise.
 - Image sequences are normal files in v1 with listing/prefetch optimization, not special version semantics.
 
+### Server/control-plane runtime behavior
+
+The server/control-plane runtime architecture is specified in `docs/architecture/SERVER_ARCHITECTURE.md` and is a product requirement, not an implementation detail.
+
+- The server/control plane lives in the public BiohazardFS repo from the beginning.
+- Docker packaging and an in-repo Helm chart are required for self-hosting.
+- Start as a modular monolith, not microservices.
+- One server codebase can run API, worker, migration, and admin modes.
+- PostgreSQL is the metadata/audit/operation source of truth.
+- S3-compatible object storage holds content manifests and file data.
+- Normal clients never receive permanent storage/database credentials.
+- Server issues short-lived scoped transfer authorization.
+- Server validates every daemon/client operation and never blindly trusts the daemon.
+
 ### Server metadata behavior
 
-The server/control-plane metadata schema is specified in `docs/METADATA_SCHEMA.md` and is a product requirement, not an implementation detail.
+The server/control-plane metadata schema is specified in `docs/architecture/METADATA_SCHEMA.md` and is a product requirement, not an implementation detail.
 
 - Schema includes an org/studio boundary from day one.
 - Filesystem nodes use stable `node_id` identity; path is derived from mutable parent/name.
@@ -223,7 +237,7 @@ The server/control-plane metadata schema is specified in `docs/METADATA_SCHEMA.m
 
 ### Local daemon behavior
 
-The local daemon contract is specified in `docs/DAEMON_API.md` and is a product requirement, not an implementation detail.
+The local daemon contract is specified in `docs/architecture/DAEMON_API.md` and is a product requirement, not an implementation detail.
 
 - Artist installs run `biohazardfsd` as a per-user daemon that auto-starts at login.
 - Electron, CLI, MCP, agents, and tests use one local daemon API for mount/cache/filesystem state.
@@ -238,7 +252,7 @@ The local daemon contract is specified in `docs/DAEMON_API.md` and is a product 
 
 ### Packaging and release behavior
 
-Packaging and release behavior is specified in `docs/PACKAGING.md` and is a product requirement, not an implementation detail.
+Packaging and release behavior is specified in `docs/reference/PACKAGING.md` and is a product requirement, not an implementation detail.
 
 - Primary distribution is one platform-native installer per OS.
 - The desktop installer installs Biohazard Workspace, `biohazardfs`, `biohazardfsd`, autostart registration, and required platform helpers.
@@ -250,7 +264,7 @@ Packaging and release behavior is specified in `docs/PACKAGING.md` and is a prod
 
 ### Agent-native behavior
 
-Agents are first-class users. The CLI contract is specified in `docs/COMMANDS.md` and is a product requirement, not an implementation detail.
+Agents are first-class users. The CLI contract is specified in `docs/reference/COMMANDS.md` and is a product requirement, not an implementation detail.
 
 - CLI must be noninteractive-friendly.
 - JSON output is the default for every command.
@@ -310,17 +324,26 @@ crates/
   cli/
   daemon/
   fuse/
+  server/
 apps/
   workspace-electron/
+  admin-web/
+  docs-site/
+deploy/
+  docker/
+  helm/
+  compose/
+packaging/
 docs/
-  SPEC.md
-  COMMANDS.md
-  DAEMON_API.md
-  ARCHITECTURE.md
-  CONFIG.md
-  SECURITY.md
-  ROADMAP.md
-  SMOKE.md
+  product/
+  architecture/
+  reference/
+  adr/
+  operations/
+generated/
+tests/
+scripts/
+skills/
 ```
 
 The `crates/` subdirectories intentionally avoid repeating the product name; package/crate identifiers may remain `biohazardfs-*` where that helps external publication and dependency clarity.
@@ -332,16 +355,17 @@ The `crates/` subdirectories intentionally avoid repeating the product name; pac
 3. Agent-first CLI contract implementation: standard JSON envelope, schema registry, TOML config, redacted auth status, doctor/smoke, and `biohazardfs mcp` for implemented commands.
 4. Daemon API foundation: endpoint discovery, IPC transport, local session token auth, SQLite local state DB, standard envelopes, event stream, mock mount/cache/file methods.
 5. Metadata schema foundation: org/users/devices/tokens/projects/worksets/nodes/file versions/grants/operations/audit/locks/conflicts/snapshots/trash.
-6. Filesystem/cache semantics foundation: path normalization, case-insensitive sibling uniqueness, full-file hydrate, safe dehydrate, durable dirty state, cache-full behavior, lock/conflict mock paths.
-7. Packaging foundation: version/channel metadata, one-installer contract, bundled CLI/daemon, per-user autostart, checksum metadata, uninstall preserves cache/config by default.
-8. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
-9. Read-only Linux FUSE prototype with mock namespace.
-10. Hydrate-on-open into local cache from simple HTTP/S3 backend.
-11. Cache pin/dehydrate controls.
-12. Safe writes and conflict preservation.
-13. Electron/shadcn utility shell connected to daemon mock, then real daemon.
-14. Windows placeholder spike: Cloud Files API vs WinFsp.
-15. macOS placeholder spike: File Provider vs FUSE.
+6. Server architecture foundation: public server crate, modular monolith, serve/worker/migrate/admin modes, Dockerfile, Helm chart skeleton, health/readiness endpoints, config, migrations, object-store validation.
+7. Filesystem/cache semantics foundation: path normalization, case-insensitive sibling uniqueness, full-file hydrate, safe dehydrate, durable dirty state, cache-full behavior, lock/conflict mock paths.
+8. Packaging foundation: version/channel metadata, one-installer contract, bundled CLI/daemon, per-user autostart, checksum metadata, uninstall preserves cache/config by default.
+9. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
+10. Read-only Linux FUSE prototype with mock namespace.
+11. Hydrate-on-open into local cache from simple HTTP/S3 backend.
+12. Cache pin/dehydrate controls.
+13. Safe writes and conflict preservation.
+14. Electron/shadcn utility shell connected to daemon mock, then real daemon.
+15. Windows placeholder spike: Cloud Files API vs WinFsp.
+16. macOS placeholder spike: File Provider vs FUSE.
 
 ## 6. Reference project conventions
 

@@ -34,6 +34,8 @@ cargo check --workspace --all-features
 cargo test --workspace --all-features
 git diff-tree --check --root -r HEAD
 cargo deny check advisories bans licenses sources
+helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
+helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
 ```
 
 ### Windows/macOS suite
@@ -125,7 +127,7 @@ Release artifacts include:
 - package-manager artifacts
 - server/control-plane images or bundles
 
-Packaging and release-channel policy is defined in `docs/PACKAGING.md`.
+Packaging and release-channel policy is defined in `docs/reference/PACKAGING.md`.
 
 ## Warnings and flaky tests
 
@@ -165,16 +167,21 @@ Docs are part of the product, but docs are reviewed manually rather than enforce
 
 Reviewers should verify relevant docs when behavior changes:
 
-- `docs/SPEC.md`
-- `docs/COMMANDS.md`
-- `docs/DAEMON_API.md`
-- `docs/METADATA_SCHEMA.md`
-- `docs/FILESYSTEM_SEMANTICS.md`
-- `docs/ARCHITECTURE.md`
-- `docs/CONFIG.md`
-- `docs/SECURITY.md`
-- `docs/SMOKE.md`
-- `docs/ROADMAP.md`
+- `docs/product/SPEC.md`
+- `docs/product/ROADMAP.md`
+- `docs/architecture/ARCHITECTURE.md`
+- `docs/architecture/SERVER_ARCHITECTURE.md`
+- `docs/architecture/DAEMON_API.md`
+- `docs/architecture/METADATA_SCHEMA.md`
+- `docs/architecture/FILESYSTEM_SEMANTICS.md`
+- `docs/reference/COMMANDS.md`
+- `docs/reference/CONFIG.md`
+- `docs/reference/SECURITY.md`
+- `docs/reference/CI.md`
+- `docs/reference/PACKAGING.md`
+- `docs/reference/SMOKE.md`
+- `docs/reference/skills.md`
+- `docs/adr/0001-repository-layout.md`
 
 ## First implementation target
 
@@ -184,6 +191,7 @@ The current scaffold CI should establish:
 2. Windows/macOS check+test.
 3. Rust dependency/security/license audit.
 4. Whitespace check.
+5. Helm chart lint/template check.
 
 The next implementation phase should add:
 

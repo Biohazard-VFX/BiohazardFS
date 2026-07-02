@@ -19,11 +19,11 @@ This is a placeholder for the future BiohazardFS admin and audit skill.
 
 It is intentionally not authoritative yet. Use the repository docs as source of truth:
 
-- `docs/COMMANDS.md`
-- `docs/METADATA_SCHEMA.md`
-- `docs/SECURITY.md`
-- `docs/CI.md`
-- `docs/PACKAGING.md`
+- `docs/reference/COMMANDS.md`
+- `docs/architecture/METADATA_SCHEMA.md`
+- `docs/reference/SECURITY.md`
+- `docs/reference/CI.md`
+- `docs/reference/PACKAGING.md`
 
 Future versions of this skill should cover:
 

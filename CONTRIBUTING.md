@@ -12,11 +12,11 @@ Start by reading:
 
 - [`README.md`](README.md)
 - [`AGENTS.md`](AGENTS.md)
-- [`docs/SPEC.md`](docs/SPEC.md)
-- [`docs/COMMANDS.md`](docs/COMMANDS.md)
-- [`docs/FILESYSTEM_SEMANTICS.md`](docs/FILESYSTEM_SEMANTICS.md)
-- [`docs/CI.md`](docs/CI.md)
-- [`docs/SECURITY.md`](docs/SECURITY.md)
+- [`docs/product/SPEC.md`](docs/product/SPEC.md)
+- [`docs/reference/COMMANDS.md`](docs/reference/COMMANDS.md)
+- [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md)
+- [`docs/reference/CI.md`](docs/reference/CI.md)
+- [`docs/reference/SECURITY.md`](docs/reference/SECURITY.md)
 
 ## Development setup
 
@@ -100,4 +100,4 @@ Do not report vulnerabilities in public issues. See [`SECURITY.md`](SECURITY.md)
 
 ## Releases
 
-Release policy is defined in [`docs/PACKAGING.md`](docs/PACKAGING.md) and [`docs/CI.md`](docs/CI.md). Do not publish release artifacts when CI/smoke gates fail or critical data-loss/security blockers are open.
+Release policy is defined in [`docs/reference/PACKAGING.md`](docs/reference/PACKAGING.md) and [`docs/reference/CI.md`](docs/reference/CI.md). Do not publish release artifacts when CI/smoke gates fail or critical data-loss/security blockers are open.
