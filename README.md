@@ -66,11 +66,15 @@ S3-compatible object storage + PostgreSQL metadata
 
 ## Current status
 
-The repo is in planning/scaffolding mode.
+The repo is in planning/scaffolding mode with a runnable Linux-first client foundation.
 
 Current completed foundations:
 
 - Rust workspace scaffold
+- runnable `biohazardfs` CLI scaffold
+- runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC and local-token auth
+- runnable Electron + React + TypeScript + Tailwind/shadcn-compatible Biohazard Workspace shell
+- Linux client smoke path that verifies daemon, CLI, and Electron launch together
 - strict cross-platform CI
 - product spec
 - CLI/agent contract
@@ -101,6 +105,32 @@ git clone https://github.com/Biohazard-VFX/BiohazardFS.git
 cd BiohazardFS
 cargo check --workspace --all-features
 cargo test --workspace --all-features
+pnpm --dir apps/workspace-electron install --frozen-lockfile
+pnpm --dir apps/workspace-electron run static
+pnpm --dir apps/workspace-electron run build
+```
+
+To install and run the current Linux client scaffold locally:
+
+```bash
+cargo install --path crates/cli --force
+cargo install --path crates/daemon --force
+export BIOHAZARDFS_LOCAL_TOKEN=local_dev_token
+biohazardfsd --dev-loopback-http --addr 127.0.0.1:47666
+```
+
+In another terminal:
+
+```bash
+export BIOHAZARDFS_LOCAL_TOKEN=local_dev_token
+biohazardfs daemon status
+pnpm --dir apps/workspace-electron exec electron dist/electron/main.js
+```
+
+For the automated Linux smoke path used by CI:
+
+```bash
+scripts/ci/client-smoke.sh
 ```
 
 Future public artifacts will target:
@@ -111,19 +141,27 @@ Future public artifacts will target:
 
 ## CLI direction
 
-The CLI will default to structured JSON and expose schema introspection for agents.
+The CLI defaults to structured JSON for implemented scaffold commands and calls the daemon through the same JSON-RPC-like method envelope described in `docs/architecture/DAEMON_API.md`. The current loopback HTTP transport is development/test-only; production transport is still intended to be platform IPC discovered from an owner-only descriptor.
+
+Currently runnable:
+
+```bash
+biohazardfs status
+biohazardfs daemon status
+biohazardfs daemon methods
+biohazardfs schema list
+biohazardfs schema command daemon.status
+```
 
 Planned examples:
 
 ```bash
 biohazardfs auth status
-biohazardfs daemon status
 biohazardfs mount status
 biohazardfs file history /Project/Shot010/scene.nk
 biohazardfs cache pin /Project/Shot010
 biohazardfs snapshot list --limit 20
 biohazardfs audit events --path /Project/Shot010 --limit 50
-biohazardfs schema command file.history
 biohazardfs mcp
 ```
 
@@ -144,13 +182,11 @@ The current skills are intentionally stubs, not authoritative operational instru
 ## Development
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo check --workspace --all-features
-cargo test --workspace --all-features
+scripts/ci/static-analysis.sh
+scripts/ci/client-smoke.sh
 ```
 
-CI runs the full Linux suite plus Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
+CI runs the full Linux suite, Electron build/smoke, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 

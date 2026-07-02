@@ -41,6 +41,45 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Electron install
+        run: pnpm --dir apps/workspace-electron install --frozen-lockfile
+
+      - name: Electron static analysis
+        run: pnpm --dir apps/workspace-electron run static
+
+      - name: Electron build
+        run: pnpm --dir apps/workspace-electron run build
+
+      - name: Install Linux static/smoke dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck xvfb
+
+      - name: ShellCheck
+        run: shellcheck scripts/ci/*.sh
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+
+      - name: Dockerfile lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: deploy/docker/server/Dockerfile
+
+
+      - name: Client smoke
+        env:
+          BIOHAZARDFS_SKIP_ELECTRON_BUILD: "1"
+        run: bash scripts/ci/client-smoke.sh
+
       - name: Install Helm
         uses: azure/setup-helm@v4
 

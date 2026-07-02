@@ -107,17 +107,38 @@ CI must run equivalent gates. A pull request is not reviewable if it does not pa
 
 ### TypeScript/Electron baseline
 
-Once `apps/workspace-electron` has real dependencies, every UI change must pass the package scripts defined there. The expected gates are:
+`apps/workspace-electron` uses pnpm. Every UI change must pass the package scripts defined there:
 
 ```bash
 pnpm --dir apps/workspace-electron install --frozen-lockfile
-pnpm --dir apps/workspace-electron typecheck
-pnpm --dir apps/workspace-electron lint
-pnpm --dir apps/workspace-electron test
-pnpm --dir apps/workspace-electron build
+pnpm --dir apps/workspace-electron run static
+pnpm --dir apps/workspace-electron run build
 ```
 
-If the project uses another package manager for the Electron app, update this file and CI in the same change. Do not leave undocumented local build requirements.
+For full local static analysis, run:
+
+```bash
+scripts/ci/static-analysis.sh
+```
+
+For Linux client integration changes, also run:
+
+```bash
+scripts/ci/client-smoke.sh
+```
+
+Do not use npm for this app. If the project ever changes package manager, update this file and CI in the same change. Do not leave undocumented local build requirements.
+
+### Non-Rust static analysis
+
+CI also enforces:
+
+- Electron ESLint with strict TypeScript rules and React hooks rules.
+- Electron Prettier formatting checks.
+- ShellCheck for shell scripts.
+- actionlint for GitHub Actions workflows.
+- Hadolint for Dockerfiles.
+- Helm lint/template for the server chart.
 
 ### Full repo validation target
 

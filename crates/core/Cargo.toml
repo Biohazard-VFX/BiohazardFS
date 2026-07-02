@@ -9,3 +9,4 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+biohazardfs-api-types = { path = "../api-types" }

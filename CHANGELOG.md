@@ -19,6 +19,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 ### Added
 
 - Rust workspace scaffold for core, API types, CLI, daemon, and filesystem adapter crates.
+- Runnable `biohazardfs` CLI scaffold with JSON response envelopes and daemon status integration.
+- Runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC, local-token auth, loopback-only enforcement, and daemon status/health methods.
+- Runnable Biohazard Workspace Electron scaffold using React, TypeScript, Tailwind, and shadcn-compatible design tokens.
+- Linux client smoke script that verifies daemon, CLI, and Electron launch together over authenticated dev-loopback JSON-RPC.
+- Concrete repository static-analysis script for Rust, Electron, shell scripts, GitHub Actions, and whitespace checks.
 - Product contract docs for BiohazardFS.
 - Agent-first CLI contract.
 - Local daemon API contract.
@@ -26,7 +31,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Filesystem and cache semantics contract.
 - CI and release-gate policy.
 - Packaging and release-channel contract.
-- Strict cross-platform CI with Linux full suite and Windows/macOS check+test.
+- Strict cross-platform CI with Linux full suite, Electron typecheck/ESLint/Prettier/build, ShellCheck, actionlint, Hadolint, client smoke, and Windows/macOS check+test.
 - Cargo dependency/license/security audit policy.
 - Initial stub agent skills directory.
 - Public-facing README draft.

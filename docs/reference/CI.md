@@ -16,6 +16,11 @@ Required baseline:
 - tests are blocking
 - dependency/security/license checks are blocking for Rust
 - cross-platform check/test runs on Linux, Windows, and macOS
+- Linux builds and statically analyzes the Electron desktop app with pnpm
+- Linux runs ShellCheck for shell scripts
+- Linux runs actionlint for GitHub Actions workflows
+- Linux runs Hadolint for Dockerfiles
+- Linux runs a client smoke test across daemon, CLI, and Electron launch using the dev-loopback JSON-RPC transport with local-token auth
 - generated artifacts must be current once generators exist
 - contract snapshots become blocking as soon as the corresponding command/API/schema exists
 
@@ -34,6 +39,13 @@ cargo check --workspace --all-features
 cargo test --workspace --all-features
 git diff-tree --check --root -r HEAD
 cargo deny check advisories bans licenses sources
+pnpm --dir apps/workspace-electron install --frozen-lockfile
+pnpm --dir apps/workspace-electron run static
+pnpm --dir apps/workspace-electron run build
+shellcheck scripts/ci/*.sh
+actionlint
+hadolint deploy/docker/server/Dockerfile
+scripts/ci/client-smoke.sh
 helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
 helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
 ```
@@ -68,7 +80,7 @@ Policy:
 - licenses must be compatible with the repository's Apache-2.0 distribution goal
 - duplicate dependency versions are warnings unless they become installation/security problems
 
-Electron/npm dependency and license jobs are required once the Electron app has real dependencies and build scripts.
+The Electron app uses pnpm. Dependency installation, TypeScript typecheck, ESLint, Prettier format check, and production build run in CI now. Electron dependency/license policy should become stricter before publishing desktop installers.
 
 ## Contract tests
 
@@ -185,13 +197,16 @@ Reviewers should verify relevant docs when behavior changes:
 
 ## First implementation target
 
-The current scaffold CI should establish:
+The current scaffold CI establishes:
 
 1. Linux full Rust suite.
 2. Windows/macOS check+test.
 3. Rust dependency/security/license audit.
 4. Whitespace check.
-5. Helm chart lint/template check.
+5. Electron typecheck, ESLint, Prettier, and build with pnpm.
+6. ShellCheck, actionlint, and Hadolint.
+7. Linux daemon + CLI + Electron launch smoke over authenticated dev-loopback JSON-RPC.
+8. Helm chart lint/template check.
 
 The next implementation phase should add:
 

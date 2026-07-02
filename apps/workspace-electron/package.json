@@ -3,8 +3,39 @@
   "private": true,
   "version": "0.1.0",
   "description": "Biohazard Workspace Electron shell for BiohazardFS",
+  "packageManager": "pnpm@10.33.0",
+  "main": "dist/electron/main.js",
   "scripts": {
-    "dev": "echo scaffold",
-    "test": "echo scaffold"
+    "dev": "vite --host 127.0.0.1",
+    "build": "pnpm run build:electron && pnpm run build:renderer",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:renderer": "vite build",
+    "start": "pnpm run build && electron dist/electron/main.js",
+    "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "lint": "eslint src --max-warnings=0",
+    "format:check": "prettier --check .",
+    "static": "pnpm run typecheck && pnpm run lint && pnpm run format:check",
+    "test": "pnpm run static"
+  },
+  "dependencies": {
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@eslint/js": "latest",
+    "@types/react-dom": "latest",
+    "@tailwindcss/vite": "latest",
+    "@vitejs/plugin-react": "latest",
+    "electron": "latest",
+    "eslint": "latest",
+    "eslint-plugin-react-hooks": "latest",
+    "globals": "latest",
+    "prettier": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vite": "latest"
   }
 }
