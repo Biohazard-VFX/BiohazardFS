@@ -14,8 +14,6 @@ This project has a deliberately high quality bar. BiohazardFS is filesystem and 
 
 ## Core Engineering Philosophy
 
-BiohazardFS should be written in the spirit of the Linux kernel's best engineering culture:
-
 - Make data structures obvious.
 - Make control flow obvious.
 - Make failure states explicit.
