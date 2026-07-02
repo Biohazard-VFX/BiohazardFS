@@ -10,4 +10,4 @@ RUN useradd --system --create-home --uid 10001 biohazardfs
 COPY --from=builder /src/target/release/biohazardfs-server /usr/local/bin/biohazardfs-server
 USER biohazardfs
 ENTRYPOINT ["/usr/local/bin/biohazardfs-server"]
-CMD ["serve"]
+CMD ["serve", "--addr", "0.0.0.0:8080"]

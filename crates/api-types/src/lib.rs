@@ -4,6 +4,7 @@ use serde_json::Value;
 pub const COMMAND_SCHEMA_VERSION: &str = "2026-07-commands-v1";
 pub const DAEMON_SCHEMA_VERSION: &str = "2026-07-daemon-v1";
 pub const EVENT_SCHEMA_VERSION: &str = "2026-07-events-v1";
+pub const SERVER_SCHEMA_VERSION: &str = "2026-07-server-v1";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Development/integration-only loopback endpoint for the optional HTTP transport.
@@ -151,6 +152,103 @@ impl ResponseMeta {
             server_direct: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerResponseEnvelope<T> {
+    pub ok: bool,
+    pub operation: String,
+    pub data: Option<T>,
+    pub warnings: Vec<Warning>,
+    pub error: Option<ApiError>,
+    pub meta: ServerResponseMeta,
+}
+
+impl<T> ServerResponseEnvelope<T>
+where
+    T: Serialize,
+{
+    pub fn ok(operation: impl Into<String>, data: T, source: Source) -> Self {
+        Self {
+            ok: true,
+            operation: operation.into(),
+            data: Some(data),
+            warnings: Vec::new(),
+            error: None,
+            meta: ServerResponseMeta::new(source),
+        }
+    }
+
+    pub fn error(operation: impl Into<String>, error: ApiError, source: Source) -> Self {
+        Self {
+            ok: false,
+            operation: operation.into(),
+            data: None,
+            warnings: Vec::new(),
+            error: Some(error),
+            meta: ServerResponseMeta::new(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerResponseMeta {
+    pub request_id: String,
+    pub timestamp: String,
+    pub source: Source,
+    pub schema_version: String,
+    pub api_version: String,
+}
+
+impl ServerResponseMeta {
+    pub fn new(source: Source) -> Self {
+        Self {
+            request_id: request_id(),
+            timestamp: timestamp(),
+            source,
+            schema_version: SERVER_SCHEMA_VERSION.to_string(),
+            api_version: "v1".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub name: String,
+    pub version: String,
+    pub state: ServerState,
+    pub mode: String,
+    pub api_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerState {
+    Ready,
+    Degraded,
+    Migrating,
+    WorkerReady,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerVersion {
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+    pub schema_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerHealth {
+    pub state: ServerState,
+    pub checks: Vec<ServerHealthCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerHealthCheck {
+    pub name: String,
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,6 +435,28 @@ mod tests {
         let first = request_id();
         let second = request_id();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn server_response_envelope_uses_operation_and_server_schema() {
+        let envelope = ServerResponseEnvelope::ok(
+            "server.status",
+            ServerStatus {
+                name: "biohazardfs-server".to_string(),
+                version: PRODUCT_VERSION.to_string(),
+                state: ServerState::Ready,
+                mode: "serve".to_string(),
+                api_version: "v1".to_string(),
+            },
+            Source::Server,
+        );
+
+        let value = serde_json::to_value(envelope).expect("envelope serializes");
+        assert_eq!(value["operation"], "server.status");
+        assert!(value.get("command").is_none());
+        assert!(value.get("method").is_none());
+        assert_eq!(value["meta"]["schema_version"], SERVER_SCHEMA_VERSION);
+        assert_eq!(value["meta"]["api_version"], "v1");
     }
 
     #[test]

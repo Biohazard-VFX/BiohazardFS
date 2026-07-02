@@ -24,7 +24,7 @@ spec:
         - name: api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["serve"]
+          args: ["serve", "--addr", "0.0.0.0:8080"]
           ports:
             - name: http
               containerPort: 8080
@@ -40,11 +40,11 @@ spec:
                   key: {{ .Values.secrets.databaseUrlKey | quote }}
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /readyz
               port: http
           livenessProbe:
             httpGet:
-              path: /health
+              path: /healthz
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

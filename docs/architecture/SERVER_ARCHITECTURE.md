@@ -45,12 +45,21 @@ The exact layout can evolve, but Docker and Helm assets should stay in-repo and 
 
 ## Runtime model
 
-Start with one server binary that supports multiple modes:
+Start with one server binary that supports multiple modes.
+
+Current scaffold modes:
 
 ```bash
-biohazardfs-server serve
+biohazardfs-server serve --addr 127.0.0.1:8080
 biohazardfs-server worker
 biohazardfs-server migrate
+biohazardfs-server health
+biohazardfs-server version
+```
+
+Planned future admin surface:
+
+```bash
 biohazardfs-server admin ...
 ```
 
@@ -112,6 +121,8 @@ The self-hosted MVP should not require proprietary/private Biohazard infrastruct
 ## API style
 
 The server exposes an HTTP JSON API.
+
+The current running scaffold is documented in [`SERVER_API.md`](SERVER_API.md). It exposes `/healthz`, `/readyz`, `/version`, and `/api/v1/status` using the `2026-07-server-v1` envelope.
 
 Rules:
 

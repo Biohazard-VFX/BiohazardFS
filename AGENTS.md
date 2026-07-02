@@ -35,6 +35,7 @@ Code should be self-describing. Comments explain why, invariants, tradeoffs, and
    - `docs/product/ROADMAP.md`
    - `docs/architecture/ARCHITECTURE.md`
    - `docs/architecture/SERVER_ARCHITECTURE.md`
+   - `docs/architecture/SERVER_API.md`
    - `docs/architecture/DAEMON_API.md`
    - `docs/architecture/METADATA_SCHEMA.md`
    - `docs/architecture/FILESYSTEM_SEMANTICS.md`
@@ -127,6 +128,14 @@ For Linux client integration changes, also run:
 scripts/ci/client-smoke.sh
 ```
 
+For server/control-plane changes, also run:
+
+```bash
+scripts/ci/server-smoke.sh
+docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:local .
+docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
+```
+
 Do not use npm for this app. If the project ever changes package manager, update this file and CI in the same change. Do not leave undocumented local build requirements.
 
 ### Non-Rust static analysis
@@ -139,6 +148,8 @@ CI also enforces:
 - actionlint for GitHub Actions workflows.
 - Hadolint for Dockerfiles.
 - Helm lint/template for the server chart.
+- Server smoke tests for health, readiness, version, status, and mode commands.
+- Docker server image build and Compose config validation.
 
 ### Full repo validation target
 
@@ -349,6 +360,7 @@ Required docs:
 - `docs/product/SPEC.md`: product contract.
 - `docs/reference/COMMANDS.md`: command surface.
 - `docs/architecture/SERVER_ARCHITECTURE.md`: server/control-plane runtime contract.
+- `docs/architecture/SERVER_API.md`: current server API scaffold contract.
 - `docs/architecture/DAEMON_API.md`: local daemon API contract.
 - `docs/architecture/METADATA_SCHEMA.md`: server/control-plane metadata contract.
 - `docs/architecture/FILESYSTEM_SEMANTICS.md`: mounted filesystem and cache behavior.

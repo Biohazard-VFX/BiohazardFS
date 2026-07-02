@@ -21,6 +21,8 @@ Required baseline:
 - Linux runs actionlint for GitHub Actions workflows
 - Linux runs Hadolint for Dockerfiles
 - Linux runs a client smoke test across daemon, CLI, and Electron launch using the dev-loopback JSON-RPC transport with local-token auth
+- Linux runs a server smoke test across server modes and HTTP health/readiness/version/status endpoints
+- Linux builds the server Docker image and validates the dev Compose config
 - generated artifacts must be current once generators exist
 - contract snapshots become blocking as soon as the corresponding command/API/schema exists
 
@@ -45,6 +47,9 @@ pnpm --dir apps/workspace-electron run build
 shellcheck scripts/ci/*.sh
 actionlint
 hadolint deploy/docker/server/Dockerfile
+scripts/ci/server-smoke.sh
+docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:ci .
+docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
 scripts/ci/client-smoke.sh
 helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
 helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
@@ -206,7 +211,9 @@ The current scaffold CI establishes:
 5. Electron typecheck, ESLint, Prettier, and build with pnpm.
 6. ShellCheck, actionlint, and Hadolint.
 7. Linux daemon + CLI + Electron launch smoke over authenticated dev-loopback JSON-RPC.
-8. Helm chart lint/template check.
+8. Server mode/HTTP smoke.
+9. Docker server image build and Compose config validation.
+10. Helm chart lint/template check.
 
 The next implementation phase should add:
 

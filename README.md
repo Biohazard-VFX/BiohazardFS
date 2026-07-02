@@ -75,6 +75,8 @@ Current completed foundations:
 - runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC and local-token auth
 - runnable Electron + React + TypeScript + Tailwind/shadcn-compatible Biohazard Workspace shell
 - Linux client smoke path that verifies daemon, CLI, and Electron launch together
+- runnable `biohazardfs-server` scaffold with health/readiness/version/status endpoints
+- server smoke path plus Docker build and Compose config validation
 - strict cross-platform CI
 - product spec
 - CLI/agent contract
@@ -90,6 +92,7 @@ Start with:
 - [`docs/reference/COMMANDS.md`](docs/reference/COMMANDS.md) — CLI and agent contract
 - [`docs/architecture/DAEMON_API.md`](docs/architecture/DAEMON_API.md) — local daemon API
 - [`docs/architecture/SERVER_ARCHITECTURE.md`](docs/architecture/SERVER_ARCHITECTURE.md) — server/control-plane runtime
+- [`docs/architecture/SERVER_API.md`](docs/architecture/SERVER_API.md) — current server API scaffold
 - [`docs/architecture/METADATA_SCHEMA.md`](docs/architecture/METADATA_SCHEMA.md) — server/control-plane schema
 - [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md) — filesystem/cache safety rules
 - [`docs/reference/PACKAGING.md`](docs/reference/PACKAGING.md) — installer and release-channel policy
@@ -127,10 +130,11 @@ biohazardfs daemon status
 pnpm --dir apps/workspace-electron exec electron dist/electron/main.js
 ```
 
-For the automated Linux smoke path used by CI:
+For the automated Linux smoke paths used by CI:
 
 ```bash
 scripts/ci/client-smoke.sh
+scripts/ci/server-smoke.sh
 ```
 
 Future public artifacts will target:
@@ -184,9 +188,10 @@ The current skills are intentionally stubs, not authoritative operational instru
 ```bash
 scripts/ci/static-analysis.sh
 scripts/ci/client-smoke.sh
+scripts/ci/server-smoke.sh
 ```
 
-CI runs the full Linux suite, Electron build/smoke, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
+CI runs the full Linux suite, Electron build/smoke, server smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 

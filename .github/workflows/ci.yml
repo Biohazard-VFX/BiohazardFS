@@ -74,6 +74,14 @@ jobs:
         with:
           dockerfile: deploy/docker/server/Dockerfile
 
+      - name: Server smoke
+        run: bash scripts/ci/server-smoke.sh
+
+      - name: Docker server image build
+        run: docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:ci .
+
+      - name: Compose config
+        run: docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
 
       - name: Client smoke
         env:

@@ -95,6 +95,12 @@ version = "0.1.0"
 [[package]]
 name = "biohazardfs-server"
 version = "0.1.0"
+dependencies = [
+ "biohazardfs-api-types",
+ "clap",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "clap"
