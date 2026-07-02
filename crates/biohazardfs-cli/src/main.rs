@@ -18,10 +18,16 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Commands) => {
-            println!("{}", serde_json::json!({"commands": [], "status": "scaffold"}));
+            println!(
+                "{}",
+                serde_json::json!({"commands": [], "status": "scaffold"})
+            );
         }
         None => {
-            println!("{}", serde_json::json!({"name": "biohazardfs", "status": "scaffold"}));
+            println!(
+                "{}",
+                serde_json::json!({"name": "biohazardfs", "status": "scaffold"})
+            );
         }
     }
 }
