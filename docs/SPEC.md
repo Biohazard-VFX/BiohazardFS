@@ -1,7 +1,7 @@
 # BiohazardFS Product Spec
 
-Status: draft scaffold  
-Primary product: Biohazard Workspace  
+Status: draft scaffold
+Primary product: Biohazard Workspace
 Core filesystem/client: BiohazardFS
 
 ## 1. Product summary
