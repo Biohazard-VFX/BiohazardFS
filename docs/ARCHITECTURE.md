@@ -16,6 +16,23 @@ S3-compatible object storage + PostgreSQL metadata
 
 Electron is a shell. Rust is the sync/filesystem engine.
 
+## Daemon API boundary
+
+The local daemon API is a product contract. See `docs/DAEMON_API.md`.
+
+Key decisions:
+
+- Artist machines run `biohazardfsd` as a per-user daemon that auto-starts at login.
+- Primary local transport is platform IPC: Unix domain socket on Linux/macOS, named pipe on Windows.
+- Optional loopback HTTP is allowed for dev/test/integration mode only.
+- Local clients authenticate through same-OS-user ownership plus an owner-only local session token.
+- The daemon uses JSON-RPC-like method calls for IPC and optional HTTP.
+- The daemon exposes a structured one-way event stream first: NDJSON/SSE; bidirectional streaming can be added later.
+- The daemon stores local operational state in an owner-only SQLite DB.
+- Normal CLI/Electron/MCP operations go through the daemon for mount/cache/local state.
+- Explicit direct-server/headless/admin mode is allowed only for operations that do not require local mount/cache/filesystem state.
+- The daemon supports full optimistic offline mode and preserves both sides as conflicts after divergent reconnects.
+
 ## Versioning model
 
 BiohazardFS is not a Git repository mounted as a drive. The live filesystem core should follow a virtual filesystem model:

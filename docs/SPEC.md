@@ -192,6 +192,21 @@ It should support:
 
 Artists should not manually create top-level project folders.
 
+### Local daemon behavior
+
+The local daemon contract is specified in `docs/DAEMON_API.md` and is a product requirement, not an implementation detail.
+
+- Artist installs run `biohazardfsd` as a per-user daemon that auto-starts at login.
+- Electron, CLI, MCP, agents, and tests use one local daemon API for mount/cache/filesystem state.
+- Platform IPC is the preferred production transport; loopback HTTP is optional for dev/test/integration mode.
+- Local daemon auth uses same OS user boundary plus an owner-only local session token.
+- The daemon API uses JSON-RPC-like method calls and a standard traceable response envelope.
+- The daemon exposes an NDJSON/SSE-style event stream first; bidirectional streaming can be added later.
+- Local daemon operational state lives in an owner-only SQLite DB.
+- Full optimistic offline mode is required: local changes queue durably and reconcile on reconnect.
+- Divergent reconnects always preserve both sides and create conflict records; no silent overwrite.
+- Explicit direct-server/headless/admin mode is allowed only for operations that do not require local mount/cache/filesystem state.
+
 ### Agent-native behavior
 
 Agents are first-class users. The CLI contract is specified in `docs/COMMANDS.md` and is a product requirement, not an implementation detail.
@@ -271,14 +286,15 @@ docs/
 1. Product/architecture ADRs.
 2. Rust workspace skeleton.
 3. Agent-first CLI contract implementation: standard JSON envelope, schema registry, TOML config, redacted auth status, doctor/smoke, and `biohazardfs mcp` for implemented commands.
-4. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
-5. Read-only Linux FUSE prototype with mock namespace.
-6. Hydrate-on-open into local cache from simple HTTP/S3 backend.
-7. Cache pin/dehydrate controls.
-8. Safe writes and conflict preservation.
-9. Electron/shadcn utility shell connected to daemon mock, then real daemon.
-10. Windows placeholder spike: Cloud Files API vs WinFsp.
-11. macOS placeholder spike: File Provider vs FUSE.
+4. Daemon API foundation: endpoint discovery, IPC transport, local session token auth, SQLite local state DB, standard envelopes, event stream, mock mount/cache/file methods.
+5. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
+6. Read-only Linux FUSE prototype with mock namespace.
+7. Hydrate-on-open into local cache from simple HTTP/S3 backend.
+8. Cache pin/dehydrate controls.
+9. Safe writes and conflict preservation.
+10. Electron/shadcn utility shell connected to daemon mock, then real daemon.
+11. Windows placeholder spike: Cloud Files API vs WinFsp.
+12. macOS placeholder spike: File Provider vs FUSE.
 
 ## 6. Reference project conventions
 
