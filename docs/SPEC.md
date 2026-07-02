@@ -194,11 +194,19 @@ Artists should not manually create top-level project folders.
 
 ### Agent-native behavior
 
-Agents are first-class users.
+Agents are first-class users. The CLI contract is specified in `docs/COMMANDS.md` and is a product requirement, not an implementation detail.
 
 - CLI must be noninteractive-friendly.
-- JSON output by default.
-- Destructive/cloud-mutating commands require dry-run/yes guardrails.
+- JSON output is the default for every command.
+- Every command returns one standard traceable JSON envelope.
+- Complex and mutating commands accept canonical JSON payloads; human-friendly flags are aliases.
+- Command, event, error, and config schemas are introspectable at runtime.
+- Fresh installs default to an `agent-safe` mutation profile until first-run setup chooses a policy.
+- First-run setup offers `agent-safe` and `human-friendly` mutation profiles.
+- Destructive/admin/data-moving commands require dry-run operation tokens in `agent-safe` mode.
+- Large reads use safe defaults, warnings, truncation metadata, and pagination cursors.
+- The CLI exposes a stdio MCP surface through `biohazardfs mcp`.
+- Supported noninteractive auth methods include env token, credential file, and device enrollment code.
 - Agents can administer everything if authorized.
 - Agents can impersonate users only with explicit provenance.
 - Provenance records whether actions came from UI, CLI, agent, or API.
@@ -262,14 +270,15 @@ docs/
 
 1. Product/architecture ADRs.
 2. Rust workspace skeleton.
-3. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
-4. Read-only Linux FUSE prototype with mock namespace.
-5. Hydrate-on-open into local cache from simple HTTP/S3 backend.
-6. Cache pin/dehydrate controls.
-7. Safe writes and conflict preservation.
-8. Electron/shadcn utility shell connected to daemon mock, then real daemon.
-9. Windows placeholder spike: Cloud Files API vs WinFsp.
-10. macOS placeholder spike: File Provider vs FUSE.
+3. Agent-first CLI contract implementation: standard JSON envelope, schema registry, TOML config, redacted auth status, doctor/smoke, and `biohazardfs mcp` for implemented commands.
+4. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
+5. Read-only Linux FUSE prototype with mock namespace.
+6. Hydrate-on-open into local cache from simple HTTP/S3 backend.
+7. Cache pin/dehydrate controls.
+8. Safe writes and conflict preservation.
+9. Electron/shadcn utility shell connected to daemon mock, then real daemon.
+10. Windows placeholder spike: Cloud Files API vs WinFsp.
+11. macOS placeholder spike: File Provider vs FUSE.
 
 ## 6. Reference project conventions
 
