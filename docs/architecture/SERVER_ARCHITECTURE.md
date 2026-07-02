@@ -285,6 +285,8 @@ Rules:
 - Destructive migrations require extra review and backup/rollback notes.
 - Self-hosted operators need clear migration instructions.
 
+Current MVP foundation: `biohazardfs-server migrate` uses `BIOHAZARDFS_DATABASE_URL` to apply bundled Postgres migrations and records applied versions in `schema_migrations`. It fails closed with a redacted JSON error envelope when the database URL is missing or migrations cannot be applied. The current synchronous Postgres client supports explicit plaintext only, so self-hosted/local URLs must include `sslmode=disable` until TLS support is implemented. The baseline creates only metadata tables/indexes; object-store/file APIs are intentionally out of scope.
+
 ## Docker packaging
 
 The repo should include Docker packaging for the server.
@@ -382,7 +384,7 @@ The first server implementation should establish:
 1. Server crate/binary skeleton.
 2. Config loading and redacted config display through `biohazardfs-server config`.
 3. Health/readiness endpoints.
-4. Database connection and migration runner stub.
+4. Database connection and migration runner foundation.
 5. Object-store config validation stub.
 6. Standard JSON envelope and stable error codes.
 7. Minimal auth/device token validation skeleton.

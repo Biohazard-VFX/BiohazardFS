@@ -7,7 +7,7 @@ This document captures the currently runnable server API scaffold. It is intenti
 
 ## Scope
 
-The current server is a running foundation only. It does not yet implement auth, metadata persistence, transfer authorization, migrations, workers, or object-storage operations.
+The current server is a running foundation only. It does not yet implement auth, metadata persistence APIs, transfer authorization, workers, or object-storage operations. It does include the first Postgres migration foundation for MVP metadata tables.
 
 It does establish:
 
@@ -72,7 +72,7 @@ biohazardfs-server version
 biohazardfs-server config
 ```
 
-Current non-serve modes are scaffold/no-op modes that print JSON and exit successfully.
+`worker` remains a scaffold mode. `migrate` requires `BIOHAZARDFS_DATABASE_URL`, applies bundled Postgres migrations, prints a server JSON envelope, and exits nonzero with a redacted JSON error envelope when the database URL is missing or unusable.
 
 ## Current HTTP endpoints
 
@@ -81,7 +81,7 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 | Endpoint | Operation | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | `server.health` | Liveness check |
-| `GET /readyz` | `server.ready` | Readiness check |
+| `GET /readyz` | `server.ready` | Readiness check; returns degraded/not-ready when a configured database cannot verify the latest migration |
 | `GET /version` | `server.version` | Version and schema info |
 | `GET /api/v1/status` | `server.status` | Server/control-plane status |
 
@@ -105,7 +105,7 @@ This script:
 1. Builds `biohazardfs-server`.
 2. Starts `serve` on a local test port.
 3. Validates `/healthz`, `/readyz`, `/version`, and `/api/v1/status`.
-4. Validates `health`, `version`, `migrate`, and `worker` CLI modes.
+4. Validates `health`, `version`, `worker`, and the redacted missing-database error path for `migrate`.
 
 ## Docker and Compose
 
@@ -127,17 +127,15 @@ The dev Compose stack includes:
 - `postgres`
 - `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
-The server still uses scaffolded dependency checks; it does not connect to Postgres or object storage yet.
+The server migration command connects to Postgres when `BIOHAZARDFS_DATABASE_URL` is configured. Object storage remains scaffolded and no object/file APIs are implemented yet.
 
 ## Next required server work
 
 Before claiming a real server MVP, implement:
 
 1. TOML-backed shared typed config loading and validation beyond the current env-backed scaffold.
-2. Database connection and migration records.
-3. RustFS/S3-compatible object-store config validation and bucket checks.
-4. Auth/device enrollment endpoints.
-5. Metadata schema migrations.
-6. Server-side operation/idempotency records.
-7. Transfer authorization skeleton.
-8. Integration tests using Postgres and S3-compatible storage.
+2. RustFS/S3-compatible object-store config validation and bucket checks.
+3. Auth/device enrollment endpoints.
+4. Server-side operation/idempotency APIs over the metadata foundation.
+5. Transfer authorization skeleton.
+6. Integration tests using live Postgres and S3-compatible storage.

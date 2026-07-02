@@ -130,7 +130,7 @@ bind = "127.0.0.1:8080"
 public_url = "http://localhost:8080"
 
 [database]
-url = "postgres://user:password@postgres:5432/biohazardfs"
+url = "postgres://user:password@postgres:5432/biohazardfs?sslmode=disable"
 
 [object_store]
 provider = "rustfs"
@@ -171,7 +171,7 @@ The shared config scaffold currently emits warnings for:
 - object-store endpoint set without a bucket (`object_store_bucket_missing`)
 - access key ID set without secret access key (`object_store_secret_missing`)
 
-These are warnings for now because the server scaffold does not yet connect to Postgres or object storage. They should become stricter in install/doctor paths once real dependency checks exist.
+These are warnings for now because routine config display remains non-secret and non-invasive. `biohazardfs-server migrate` now requires `BIOHAZARDFS_DATABASE_URL` and connects to Postgres. The current synchronous Postgres client supports explicit plaintext only, so local/self-hosted URLs must include `sslmode=disable` until TLS support is implemented. Object-storage checks remain scaffolded until object/file APIs exist.
 
 ## Next implementation steps
 

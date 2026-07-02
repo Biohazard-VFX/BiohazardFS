@@ -75,7 +75,7 @@ Current completed foundations:
 - runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC and local-token auth
 - runnable Electron + React + TypeScript + Tailwind/shadcn-compatible Biohazard Workspace shell
 - Linux client smoke path that verifies daemon, CLI, and Electron launch together
-- runnable `biohazardfs-server` scaffold with health/readiness/version/status endpoints
+- runnable `biohazardfs-server` foundation with health/readiness/version/status endpoints and Postgres migration baseline
 - server smoke path plus Docker build and RustFS/Postgres Compose config validation
 - strict cross-platform CI
 - product spec

@@ -18,7 +18,7 @@ enum Command {
     },
     /// Run the worker scaffold once and print status.
     Worker,
-    /// Run migration scaffold once and print status.
+    /// Apply server database migrations and print status.
     Migrate,
     /// Print health envelope and exit.
     Health,
@@ -37,11 +37,23 @@ fn main() -> std::io::Result<()> {
             biohazardfs_server::worker_payload(),
             biohazardfs_api_types::Source::Server,
         )),
-        Command::Migrate => print_json(&biohazardfs_api_types::ServerResponseEnvelope::ok(
-            "server.migrate",
-            biohazardfs_server::migrate_payload(),
-            biohazardfs_api_types::Source::Server,
-        )),
+        Command::Migrate => match biohazardfs_server::migrate_payload() {
+            Ok(payload) => print_json(&biohazardfs_api_types::ServerResponseEnvelope::ok(
+                "server.migrate",
+                payload,
+                biohazardfs_api_types::Source::Server,
+            )),
+            Err(error) => {
+                let envelope =
+                    biohazardfs_api_types::ServerResponseEnvelope::<serde_json::Value>::error(
+                        "server.migrate",
+                        error.into_api_error(),
+                        biohazardfs_api_types::Source::Server,
+                    );
+                print_json(&envelope)?;
+                std::process::exit(2);
+            }
+        },
         Command::Health => print_json(&biohazardfs_api_types::ServerResponseEnvelope::ok(
             "server.health",
             biohazardfs_server::server_health(),

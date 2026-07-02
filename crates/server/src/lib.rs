@@ -8,6 +8,9 @@ use biohazardfs_api_types::{
     ApiError, PRODUCT_VERSION, SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck,
     ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
 };
+use postgres::config::SslMode;
+use postgres::{Client, Config, NoTls};
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BIND_ADDR: &str = biohazardfs_core::config::DEFAULT_SERVER_BIND;
 pub const CONTAINER_BIND_ADDR: &str = "0.0.0.0:8080";
@@ -15,6 +18,87 @@ const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"#;
+const ADVISORY_MIGRATION_LOCK_ID: i64 = 0x0042_6846_534d_5650;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub name: String,
+    pub mode: String,
+    pub status: String,
+    pub database_configured: bool,
+    pub migration_count: usize,
+    pub current_version: Option<String>,
+    pub applied_migrations: Vec<MigrationSummary>,
+    pub already_applied_migrations: Vec<MigrationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationSummary {
+    pub version: String,
+    pub name: String,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationError {
+    code: &'static str,
+    message: &'static str,
+    details: Option<serde_json::Value>,
+}
+
+impl MigrationError {
+    fn new(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            details: None,
+        }
+    }
+
+    fn with_details(code: &'static str, message: &'static str, details: serde_json::Value) -> Self {
+        Self {
+            code,
+            message,
+            details: Some(details),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    pub fn into_api_error(self) -> ApiError {
+        match self.details {
+            Some(details) => ApiError::with_details(self.code, self.message, details),
+            None => ApiError::new(self.code, self.message),
+        }
+    }
+}
+
+struct Migration {
+    version: &'static str,
+    name: &'static str,
+    sql: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppliedMigration {
+    version: String,
+    name: String,
+    checksum: String,
+}
 
 pub fn server_status(mode: impl Into<String>) -> ServerStatus {
     ServerStatus {
@@ -49,9 +133,11 @@ pub fn server_health() -> ServerHealth {
                 name: "database".to_string(),
                 ok: true,
                 message: if config.database.url_set {
-                    "database URL is configured; connection check is scaffolded".to_string()
+                    "database URL is configured; migration verification is readiness-only"
+                        .to_string()
                 } else {
-                    "database URL is not configured; connection check is scaffolded".to_string()
+                    "database URL is not configured; liveness does not require database access"
+                        .to_string()
                 },
             },
             ServerHealthCheck {
@@ -71,13 +157,52 @@ pub fn server_health() -> ServerHealth {
     }
 }
 
-pub fn migrate_payload() -> serde_json::Value {
-    serde_json::json!({
-        "name": "biohazardfs-server",
-        "mode": "migrate",
-        "status": "scaffold_noop",
-        "applied_migrations": []
-    })
+pub fn server_readiness() -> ServerHealth {
+    let config = biohazardfs_core::config::RuntimeConfig::from_env();
+    let database_check = if config.database.url_set {
+        match verify_latest_migration_from_env() {
+            Ok(()) => ServerHealthCheck {
+                name: "database".to_string(),
+                ok: true,
+                message: "database schema migrations are verified".to_string(),
+            },
+            Err(_) => ServerHealthCheck {
+                name: "database".to_string(),
+                ok: false,
+                message:
+                    "database schema migrations are not verified; run biohazardfs-server migrate"
+                        .to_string(),
+            },
+        }
+    } else {
+        ServerHealthCheck {
+            name: "database".to_string(),
+            ok: true,
+            message: "database URL is not configured; readiness is liveness-only".to_string(),
+        }
+    };
+
+    let state = if database_check.ok {
+        ServerState::Ready
+    } else {
+        ServerState::Degraded
+    };
+
+    ServerHealth {
+        state,
+        checks: vec![
+            ServerHealthCheck {
+                name: "process".to_string(),
+                ok: true,
+                message: "server process is running".to_string(),
+            },
+            database_check,
+        ],
+    }
+}
+
+pub fn migrate_payload() -> Result<MigrationReport, MigrationError> {
+    run_migrations_from_env()
 }
 
 pub fn worker_payload() -> serde_json::Value {
@@ -95,10 +220,18 @@ pub fn dispatch_http_path(path: &str) -> (u16, String) {
             200,
             &ServerResponseEnvelope::ok("server.health", server_health(), Source::Server),
         ),
-        "/readyz" | "/ready" => json_response(
-            200,
-            &ServerResponseEnvelope::ok("server.ready", server_health(), Source::Server),
-        ),
+        "/readyz" | "/ready" => {
+            let readiness = server_readiness();
+            let status_code = if readiness.state == ServerState::Ready {
+                200
+            } else {
+                503
+            };
+            json_response(
+                status_code,
+                &ServerResponseEnvelope::ok("server.ready", readiness, Source::Server),
+            )
+        }
         "/version" => json_response(
             200,
             &ServerResponseEnvelope::ok("server.version", server_version(), Source::Server),
@@ -116,6 +249,297 @@ pub fn dispatch_http_path(path: &str) -> (u16, String) {
             ),
         ),
     }
+}
+
+pub fn run_migrations_from_env() -> Result<MigrationReport, MigrationError> {
+    let database_url = database_url_from_env()?;
+    run_migrations(&database_url)
+}
+
+pub fn migrate_with_database_url(
+    database_url: Option<&str>,
+) -> Result<MigrationReport, MigrationError> {
+    let database_url = validate_database_url(database_url)?;
+    run_migrations(database_url)
+}
+
+fn run_migrations(database_url: &str) -> Result<MigrationReport, MigrationError> {
+    let mut client = connect_database(database_url)?;
+
+    acquire_migration_lock(&mut client)?;
+
+    client
+        .batch_execute(SCHEMA_MIGRATIONS_TABLE_SQL)
+        .map_err(|_| {
+            MigrationError::new(
+                "migration_store_unavailable",
+                "Could not verify or update server migration state",
+            )
+        })?;
+
+    let applied_migrations_by_version = applied_migrations_by_version(&mut client)?;
+    verify_no_unknown_applied_migrations(&applied_migrations_by_version)?;
+
+    let mut applied_migrations = Vec::new();
+    let mut already_applied_migrations = Vec::new();
+
+    for migration in migrations() {
+        let summary = migration.summary();
+        if let Some(applied) = applied_migrations_by_version.get(migration.version) {
+            verify_applied_migration_matches(&summary, applied)?;
+            already_applied_migrations.push(summary);
+            continue;
+        }
+
+        apply_migration(&mut client, migration, &summary)?;
+        applied_migrations.push(summary);
+    }
+
+    let status = if applied_migrations.is_empty() {
+        "up_to_date"
+    } else {
+        "applied"
+    };
+
+    Ok(MigrationReport {
+        name: "biohazardfs-server".to_string(),
+        mode: "migrate".to_string(),
+        status: status.to_string(),
+        database_configured: true,
+        migration_count: migrations().len(),
+        current_version: migrations()
+            .last()
+            .map(|migration| migration.version.to_string()),
+        applied_migrations,
+        already_applied_migrations,
+    })
+}
+
+fn acquire_migration_lock(client: &mut Client) -> Result<(), MigrationError> {
+    client
+        .execute(
+            "SELECT pg_advisory_lock($1)",
+            &[&ADVISORY_MIGRATION_LOCK_ID],
+        )
+        .map(|_| ())
+        .map_err(|_| {
+            MigrationError::new(
+                "migration_lock_unavailable",
+                "Could not acquire server database migration lock",
+            )
+        })
+}
+
+fn applied_migrations_by_version(
+    client: &mut Client,
+) -> Result<std::collections::BTreeMap<String, AppliedMigration>, MigrationError> {
+    let rows = client
+        .query(
+            "SELECT version, name, checksum FROM schema_migrations ORDER BY version",
+            &[],
+        )
+        .map_err(|_| {
+            MigrationError::new(
+                "migration_store_unavailable",
+                "Could not verify or update server migration state",
+            )
+        })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let applied = AppliedMigration {
+                version: row.get::<_, String>("version"),
+                name: row.get::<_, String>("name"),
+                checksum: row.get::<_, String>("checksum"),
+            };
+            (applied.version.clone(), applied)
+        })
+        .collect())
+}
+
+fn verify_no_unknown_applied_migrations(
+    applied_migrations_by_version: &std::collections::BTreeMap<String, AppliedMigration>,
+) -> Result<(), MigrationError> {
+    let bundled_versions = migrations()
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if let Some(unknown_version) = applied_migrations_by_version
+        .keys()
+        .find(|version| !bundled_versions.contains(version.as_str()))
+    {
+        return Err(MigrationError::with_details(
+            "migration_version_unsupported",
+            "Database has a server migration version that is newer than this BiohazardFS binary supports",
+            serde_json::json!({
+                "recorded_migration_version": unknown_version,
+            }),
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_applied_migration_matches(
+    expected: &MigrationSummary,
+    applied: &AppliedMigration,
+) -> Result<(), MigrationError> {
+    if applied.name != expected.name || applied.checksum != expected.checksum {
+        return Err(MigrationError::with_details(
+            "migration_checksum_mismatch",
+            "Recorded server database migration does not match the bundled migration",
+            serde_json::json!({
+                "migration_version": expected.version,
+                "expected_name": expected.name,
+                "recorded_name": applied.name,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_migration(
+    client: &mut Client,
+    migration: &Migration,
+    summary: &MigrationSummary,
+) -> Result<(), MigrationError> {
+    let mut transaction = client.transaction().map_err(|_| {
+        migration_error_with_version(migration, "Could not start database migration transaction")
+    })?;
+
+    transaction.batch_execute(migration.sql).map_err(|_| {
+        migration_error_with_version(migration, "Could not apply database migration")
+    })?;
+
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES ($1, $2, $3, now())",
+            &[&summary.version, &summary.name, &summary.checksum],
+        )
+        .map_err(|_| migration_error_with_version(migration, "Could not record database migration"))?;
+
+    transaction.commit().map_err(|_| {
+        migration_error_with_version(migration, "Could not commit database migration")
+    })?;
+
+    Ok(())
+}
+
+fn verify_latest_migration_from_env() -> Result<(), MigrationError> {
+    let database_url = database_url_from_env()?;
+    verify_latest_migration(&database_url)
+}
+
+fn verify_latest_migration(database_url: &str) -> Result<(), MigrationError> {
+    let mut client = connect_database(database_url)?;
+
+    let applied_migrations_by_version = applied_migrations_by_version(&mut client)?;
+    verify_no_unknown_applied_migrations(&applied_migrations_by_version)?;
+    for migration in migrations() {
+        let summary = migration.summary();
+        let Some(applied) = applied_migrations_by_version.get(migration.version) else {
+            return Err(MigrationError::new(
+                "migration_not_verified",
+                "Could not verify server database migrations",
+            ));
+        };
+        verify_applied_migration_matches(&summary, applied)?;
+    }
+
+    Ok(())
+}
+
+fn database_url_from_env() -> Result<String, MigrationError> {
+    let database_url = std::env::var(biohazardfs_core::config::ENV_DATABASE_URL).ok();
+    validate_database_url(database_url.as_deref()).map(ToOwned::to_owned)
+}
+
+fn connect_database(database_url: &str) -> Result<Client, MigrationError> {
+    let mut config = database_url.parse::<Config>().map_err(|_| {
+        MigrationError::new(
+            "database_url_invalid",
+            "BIOHAZARDFS_DATABASE_URL must be a valid PostgreSQL connection URL",
+        )
+    })?;
+    if config.get_ssl_mode() != SslMode::Disable {
+        return Err(MigrationError::new(
+            "database_tls_unsupported",
+            "BIOHAZARDFS_DATABASE_URL must set sslmode=disable until server Postgres TLS support is implemented",
+        ));
+    }
+
+    config.connect_timeout(Duration::from_secs(3));
+    config.connect(NoTls).map_err(|_| {
+        MigrationError::new(
+            "database_unavailable",
+            "Could not connect to the configured PostgreSQL database",
+        )
+    })
+}
+
+fn validate_database_url(database_url: Option<&str>) -> Result<&str, MigrationError> {
+    let database_url = database_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            MigrationError::new(
+                "database_url_missing",
+                "BIOHAZARDFS_DATABASE_URL must be configured to run server migrations",
+            )
+        })?;
+
+    if !(database_url.starts_with("postgres://") || database_url.starts_with("postgresql://")) {
+        return Err(MigrationError::new(
+            "database_url_invalid",
+            "BIOHAZARDFS_DATABASE_URL must be a postgres:// or postgresql:// URL",
+        ));
+    }
+
+    Ok(database_url)
+}
+
+fn migration_error_with_version(migration: &Migration, phase: &'static str) -> MigrationError {
+    MigrationError::with_details(
+        "migration_failed",
+        "Could not apply one or more server database migrations",
+        serde_json::json!({
+            "migration_version": migration.version,
+            "migration_name": migration.name,
+            "phase": phase,
+        }),
+    )
+}
+
+fn migrations() -> &'static [Migration] {
+    &[Migration {
+        version: "001",
+        name: "baseline",
+        sql: include_str!("../migrations/001_baseline.sql"),
+    }]
+}
+
+impl Migration {
+    fn summary(&self) -> MigrationSummary {
+        MigrationSummary {
+            version: self.version.to_string(),
+            name: self.name.to_string(),
+            checksum: checksum_sql(self.sql),
+        }
+    }
+}
+
+fn checksum_sql(sql: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in sql.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 pub fn serve(addr: &str) -> std::io::Result<()> {
@@ -315,11 +739,105 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_readyz_uses_server_envelope() {
+        let (status_code, body) = dispatch_http_path("/readyz");
+        assert!(matches!(status_code, 200 | 503));
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["operation"], "server.ready");
+        assert_eq!(value["meta"]["schema_version"], SERVER_SCHEMA_VERSION);
+    }
+
+    #[test]
     fn dispatch_unknown_path_returns_not_found_envelope() {
         let (status_code, body) = dispatch_http_path("/missing");
         assert_eq!(status_code, 404);
         let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "not_found");
+    }
+
+    #[test]
+    fn migrate_without_database_url_returns_secret_safe_error() {
+        let error = migrate_with_database_url(None).expect_err("database URL is required");
+        assert_eq!(error.code(), "database_url_missing");
+        let envelope = ServerResponseEnvelope::<serde_json::Value>::error(
+            "server.migrate",
+            error.into_api_error(),
+            Source::Server,
+        );
+        let text = serde_json::to_string(&envelope).expect("envelope serializes");
+        assert!(text.contains("database_url_missing"));
+        assert!(!text.contains("postgres://"));
+        assert!(!text.contains("password"));
+    }
+
+    #[test]
+    fn database_url_requires_explicit_plaintext_mode_until_tls_lands() {
+        let error = migrate_with_database_url(Some("postgres://user:password@example/db"))
+            .expect_err("implicit plaintext database URLs are rejected before connect");
+        assert_eq!(error.code(), "database_tls_unsupported");
+        let text = serde_json::to_string(&error.into_api_error()).expect("error serializes");
+        assert!(!text.contains("password"));
+        assert!(!text.contains("example"));
+    }
+
+    #[test]
+    fn invalid_database_url_error_does_not_echo_secret() {
+        let error = migrate_with_database_url(Some("postgresql+secret://user:password@example/db"))
+            .expect_err("invalid database URL is rejected before connect");
+        let text = serde_json::to_string(&error.into_api_error()).expect("error serializes");
+        assert!(text.contains("database_url_invalid"));
+        assert!(!text.contains("postgresql+secret"));
+        assert!(!text.contains("password"));
+    }
+
+    #[test]
+    fn bundled_migration_has_required_mvp_tables() {
+        let sql = migrations()[0].sql;
+        for table in [
+            "organizations",
+            "users",
+            "tokens",
+            "nodes",
+            "content_manifests",
+            "file_versions",
+            "operations",
+            "upload_sessions",
+            "audit_events",
+        ] {
+            let needle = format!("CREATE TABLE {table}");
+            assert!(sql.contains(&needle), "missing {table}");
+        }
+        assert!(
+            SCHEMA_MIGRATIONS_TABLE_SQL.contains("CREATE TABLE IF NOT EXISTS schema_migrations")
+        );
+        assert!(sql.contains("secret_hash TEXT NOT NULL"));
+        assert!(!sql.contains("raw_token"));
+    }
+
+    #[test]
+    fn unknown_applied_migration_versions_are_rejected() {
+        let mut applied = std::collections::BTreeMap::new();
+        applied.insert(
+            "999".to_string(),
+            AppliedMigration {
+                version: "999".to_string(),
+                name: "future".to_string(),
+                checksum: "fnv1a64:future".to_string(),
+            },
+        );
+
+        let error = verify_no_unknown_applied_migrations(&applied)
+            .expect_err("future migration versions should fail");
+        assert_eq!(error.code(), "migration_version_unsupported");
+    }
+
+    #[test]
+    fn migration_summary_reports_current_version_without_database() {
+        let summary = migrations()[0].summary();
+        assert_eq!(summary.version, "001");
+        assert_eq!(summary.name, "baseline");
+        assert!(summary.checksum.starts_with("fnv1a64:"));
     }
 }

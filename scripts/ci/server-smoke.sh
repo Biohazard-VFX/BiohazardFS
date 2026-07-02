@@ -9,7 +9,7 @@ cd "$ROOT_DIR"
 
 cargo build -p biohazardfs-server --all-features
 
-target/debug/biohazardfs-server serve --addr "$ENDPOINT" >"$SERVER_LOG" 2>&1 &
+env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server serve --addr "$ENDPOINT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() {
   kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -85,13 +85,20 @@ assert payload['data']['object_store']['provider'] == 'rustfs', payload
 assert 'do-not-print' not in text, payload
 PY
 
-target/debug/biohazardfs-server migrate >/tmp/biohazardfs-server-migrate.json
+if env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server migrate >/tmp/biohazardfs-server-migrate.json; then
+  echo "migrate without BIOHAZARDFS_DATABASE_URL unexpectedly succeeded" >&2
+  exit 1
+fi
 python3 - <<'PY'
 import json
 from pathlib import Path
-payload = json.loads(Path('/tmp/biohazardfs-server-migrate.json').read_text())
-assert payload['ok'] is True, payload
+text = Path('/tmp/biohazardfs-server-migrate.json').read_text()
+payload = json.loads(text)
+assert payload['ok'] is False, payload
 assert payload['operation'] == 'server.migrate', payload
+assert payload['error']['code'] == 'database_url_missing', payload
+assert 'postgres://' not in text, payload
+assert 'password' not in text.lower(), payload
 PY
 
 target/debug/biohazardfs-server worker >/tmp/biohazardfs-server-worker.json

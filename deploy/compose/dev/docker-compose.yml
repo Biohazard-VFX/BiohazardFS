@@ -7,7 +7,7 @@ services:
     environment:
       BIOHAZARDFS_SERVER_PUBLIC_URL: http://localhost:8080
       BIOHAZARDFS_LOG: debug
-      BIOHAZARDFS_DATABASE_URL: postgres://biohazardfs:biohazardfs-dev-password@postgres:5432/biohazardfs
+      BIOHAZARDFS_DATABASE_URL: postgres://biohazardfs:biohazardfs-dev-password@postgres:5432/biohazardfs?sslmode=disable
       BIOHAZARDFS_OBJECT_STORE_PROVIDER: rustfs
       BIOHAZARDFS_OBJECT_STORE_ENDPOINT: http://object-store:9000
       BIOHAZARDFS_OBJECT_STORE_BUCKET: biohazardfs-dev

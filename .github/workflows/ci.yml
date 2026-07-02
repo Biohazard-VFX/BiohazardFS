@@ -77,6 +77,9 @@ jobs:
       - name: Server smoke
         run: bash scripts/ci/server-smoke.sh
 
+      - name: Server DB smoke
+        run: bash scripts/ci/server-db-smoke.sh
+
       - name: Docker server image build
         run: docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:ci .
 
