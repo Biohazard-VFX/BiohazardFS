@@ -192,6 +192,21 @@ It should support:
 
 Artists should not manually create top-level project folders.
 
+### Filesystem and cache semantics
+
+Filesystem and cache semantics are specified in `docs/FILESYSTEM_SEMANTICS.md` and are product requirements, not implementation details.
+
+- Preserve filename case, but enforce case-insensitive sibling uniqueness by default.
+- Delete in mounted workspace means server/cloud trash; local cache removal is separate dehydrate/uncache behavior.
+- Writes are durable locally before upload/commit, and server versions commit only after content integrity verification.
+- MVP hydrates full files before normal open/edit workflows.
+- Dirty/unuploaded and pinned files are never auto-evicted.
+- Cache-full behavior pauses downloads and blocks/fails new writes safely before data loss.
+- Lock conflicts block writes where possible; otherwise user work is preserved as conflict copies.
+- Offline mutations record base state and divergent reconnects always create conflicts.
+- Symlinks are supported but constrained to authorized roots unless policy allows otherwise.
+- Image sequences are normal files in v1 with listing/prefetch optimization, not special version semantics.
+
 ### Server metadata behavior
 
 The server/control-plane metadata schema is specified in `docs/METADATA_SCHEMA.md` and is a product requirement, not an implementation detail.
@@ -305,14 +320,15 @@ The `crates/` subdirectories intentionally avoid repeating the product name; pac
 3. Agent-first CLI contract implementation: standard JSON envelope, schema registry, TOML config, redacted auth status, doctor/smoke, and `biohazardfs mcp` for implemented commands.
 4. Daemon API foundation: endpoint discovery, IPC transport, local session token auth, SQLite local state DB, standard envelopes, event stream, mock mount/cache/file methods.
 5. Metadata schema foundation: org/users/devices/tokens/projects/worksets/nodes/file versions/grants/operations/audit/locks/conflicts/snapshots/trash.
-6. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
-7. Read-only Linux FUSE prototype with mock namespace.
-8. Hydrate-on-open into local cache from simple HTTP/S3 backend.
-9. Cache pin/dehydrate controls.
-10. Safe writes and conflict preservation.
-11. Electron/shadcn utility shell connected to daemon mock, then real daemon.
-12. Windows placeholder spike: Cloud Files API vs WinFsp.
-13. macOS placeholder spike: File Provider vs FUSE.
+6. Filesystem/cache semantics foundation: path normalization, case-insensitive sibling uniqueness, full-file hydrate, safe dehydrate, durable dirty state, cache-full behavior, lock/conflict mock paths.
+7. JSON-first CLI skeleton modeled after `~/Nextcloud-CLI`.
+8. Read-only Linux FUSE prototype with mock namespace.
+9. Hydrate-on-open into local cache from simple HTTP/S3 backend.
+10. Cache pin/dehydrate controls.
+11. Safe writes and conflict preservation.
+12. Electron/shadcn utility shell connected to daemon mock, then real daemon.
+13. Windows placeholder spike: Cloud Files API vs WinFsp.
+14. macOS placeholder spike: File Provider vs FUSE.
 
 ## 6. Reference project conventions
 

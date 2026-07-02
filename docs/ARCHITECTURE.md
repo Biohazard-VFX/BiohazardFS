@@ -67,6 +67,24 @@ Git/Git LFS may be supported as optional import/export or for code/manifests/tem
 
 Every event should include provenance: actor, device, source (`ui`, `cli`, `agent`, `api`, `server`), timestamp, affected paths/IDs, and request/correlation ID.
 
+## Filesystem/cache semantics boundary
+
+Filesystem and cache semantics are product contracts. See `docs/FILESYSTEM_SEMANTICS.md`.
+
+Key decisions:
+
+- Preserve filename case, but enforce case-insensitive sibling uniqueness by default.
+- Deleting inside the mount means server/cloud trash, not local cache removal.
+- Local cache removal is explicit dehydrate/uncache behavior.
+- Writes are durable locally before upload/commit; server versions commit only after integrity verification.
+- MVP hydrates full files before allowing normal open/edit workflows.
+- Dirty/unuploaded and pinned files are never auto-evicted.
+- Cache-full behavior pauses downloads and blocks/fails new writes safely before data loss.
+- Lock conflicts block writes where possible; otherwise user work is preserved as conflict copies.
+- Full optimistic offline mode records base state and creates conflicts on divergent reconnect.
+- Symlinks are supported but constrained to authorized roots unless policy allows otherwise.
+- Image sequences are normal files in v1 with listing/prefetch optimization, not special version semantics.
+
 ## Server metadata boundary
 
 The server/control-plane metadata schema is a product contract. See `docs/METADATA_SCHEMA.md`.
