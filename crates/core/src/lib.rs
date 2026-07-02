@@ -1,3 +1,5 @@
+pub mod config;
+
 pub const PRODUCT_NAME: &str = "BiohazardFS";
 pub const CLI_BIN: &str = "biohazardfs";
 pub const DAEMON_BIN: &str = "biohazardfsd";

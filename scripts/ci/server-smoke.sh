@@ -72,6 +72,19 @@ assert payload['ok'] is True, payload
 assert payload['operation'] == 'server.version', payload
 PY
 
+BIOHAZARDFS_OBJECT_STORE_SECRET_ACCESS_KEY=do-not-print target/debug/biohazardfs-server config >/tmp/biohazardfs-server-config.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+text = Path('/tmp/biohazardfs-server-config.json').read_text()
+payload = json.loads(text)
+assert payload['ok'] is True, payload
+assert payload['operation'] == 'server.config', payload
+assert payload['data']['schema_version'] == '2026-07-config-v1', payload
+assert payload['data']['object_store']['provider'] == 'rustfs', payload
+assert 'do-not-print' not in text, payload
+PY
+
 target/debug/biohazardfs-server migrate >/tmp/biohazardfs-server-migrate.json
 python3 - <<'PY'
 import json

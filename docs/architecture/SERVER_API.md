@@ -15,7 +15,7 @@ It does establish:
 - distinct server response envelopes
 - a distinct server schema version
 - HTTP health/readiness/version/status endpoints
-- server modes for `serve`, `worker`, `migrate`, `health`, and `version`
+- server modes for `serve`, `worker`, `migrate`, `health`, `version`, and `config`
 - Docker, Compose, Helm, and CI smoke validation
 
 ## Schema version
@@ -69,6 +69,7 @@ biohazardfs-server worker
 biohazardfs-server migrate
 biohazardfs-server health
 biohazardfs-server version
+biohazardfs-server config
 ```
 
 Current non-serve modes are scaffold/no-op modes that print JSON and exit successfully.
@@ -124,7 +125,7 @@ The dev Compose stack includes:
 
 - `server`
 - `postgres`
-- `object-store` using MinIO
+- `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
 The server still uses scaffolded dependency checks; it does not connect to Postgres or object storage yet.
 
@@ -132,9 +133,9 @@ The server still uses scaffolded dependency checks; it does not connect to Postg
 
 Before claiming a real server MVP, implement:
 
-1. Typed config loading and validation.
+1. TOML-backed shared typed config loading and validation beyond the current env-backed scaffold.
 2. Database connection and migration records.
-3. Object-store config validation and bucket checks.
+3. RustFS/S3-compatible object-store config validation and bucket checks.
 4. Auth/device enrollment endpoints.
 5. Metadata schema migrations.
 6. Server-side operation/idempotency records.

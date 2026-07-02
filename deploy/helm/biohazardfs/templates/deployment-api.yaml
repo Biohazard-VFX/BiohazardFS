@@ -38,6 +38,32 @@ spec:
                 secretKeyRef:
                   name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret | quote }}
                   key: {{ .Values.secrets.databaseUrlKey | quote }}
+            - name: BIOHAZARDFS_OBJECT_STORE_PROVIDER
+              value: {{ .Values.config.objectStoreProvider | quote }}
+            {{- if .Values.config.objectStoreRegion }}
+            - name: BIOHAZARDFS_OBJECT_STORE_REGION
+              value: {{ .Values.config.objectStoreRegion | quote }}
+            {{- end }}
+            - name: BIOHAZARDFS_OBJECT_STORE_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.objectStoreEndpointKey | quote }}
+            - name: BIOHAZARDFS_OBJECT_STORE_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.objectStoreBucketKey | quote }}
+            - name: BIOHAZARDFS_OBJECT_STORE_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.objectStoreAccessKeyIdKey | quote }}
+            - name: BIOHAZARDFS_OBJECT_STORE_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "secrets.existingSecret is required" .Values.secrets.existingSecret | quote }}
+                  key: {{ .Values.secrets.objectStoreSecretAccessKeyKey | quote }}
           readinessProbe:
             httpGet:
               path: /readyz

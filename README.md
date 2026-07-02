@@ -45,7 +45,7 @@ BiohazardFS is designed around these rules:
 - Rust core, daemon, CLI, and filesystem adapters
 - Electron desktop app: Biohazard Workspace
 - React + TypeScript + Tailwind + shadcn/ui frontend
-- S3-compatible object storage backend
+- RustFS-first S3-compatible object storage backend
 - PostgreSQL control/metadata database
 - Optional project-tracker integrations for assignments/worksets
 - Agent-native JSON CLI from day one
@@ -76,7 +76,7 @@ Current completed foundations:
 - runnable Electron + React + TypeScript + Tailwind/shadcn-compatible Biohazard Workspace shell
 - Linux client smoke path that verifies daemon, CLI, and Electron launch together
 - runnable `biohazardfs-server` scaffold with health/readiness/version/status endpoints
-- server smoke path plus Docker build and Compose config validation
+- server smoke path plus Docker build and RustFS/Postgres Compose config validation
 - strict cross-platform CI
 - product spec
 - CLI/agent contract
@@ -95,6 +95,7 @@ Start with:
 - [`docs/architecture/SERVER_API.md`](docs/architecture/SERVER_API.md) — current server API scaffold
 - [`docs/architecture/METADATA_SCHEMA.md`](docs/architecture/METADATA_SCHEMA.md) — server/control-plane schema
 - [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md) — filesystem/cache safety rules
+- [`docs/reference/CONFIG.md`](docs/reference/CONFIG.md) — shared typed runtime config contract
 - [`docs/reference/PACKAGING.md`](docs/reference/PACKAGING.md) — installer and release-channel policy
 
 ## Installation
@@ -189,6 +190,12 @@ The current skills are intentionally stubs, not authoritative operational instru
 scripts/ci/static-analysis.sh
 scripts/ci/client-smoke.sh
 scripts/ci/server-smoke.sh
+```
+
+The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-hosted storage direction:
+
+```bash
+docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
 ```
 
 CI runs the full Linux suite, Electron build/smoke, server smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).

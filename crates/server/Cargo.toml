@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 biohazardfs-api-types = { path = "../api-types" }
+biohazardfs-core = { path = "../core" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

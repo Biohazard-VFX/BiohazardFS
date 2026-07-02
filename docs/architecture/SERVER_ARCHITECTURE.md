@@ -296,13 +296,14 @@ Docker image requirements:
 - healthcheck or documented health endpoint
 - explicit environment variables
 - no baked-in secrets
-- supports `serve`, `worker`, and `migrate` modes
+- supports `serve`, `worker`, `migrate`, `health`, `version`, and redacted `config` modes
 - logs to stdout/stderr in structured or parseable form
 
 Expected environment variables include:
 
 ```text
 BIOHAZARDFS_DATABASE_URL
+BIOHAZARDFS_OBJECT_STORE_PROVIDER   # default: rustfs
 BIOHAZARDFS_OBJECT_STORE_ENDPOINT
 BIOHAZARDFS_OBJECT_STORE_BUCKET
 BIOHAZARDFS_OBJECT_STORE_REGION
@@ -333,7 +334,7 @@ Chart responsibilities:
 - resource requests/limits
 - persistence only if needed by server runtime; object data lives in object storage
 
-Chart should support external PostgreSQL and external S3-compatible object storage from the start. Bundled dev dependencies can be optional later, but production should not require in-chart databases/storage.
+Chart should support external PostgreSQL and external S3-compatible object storage from the start. RustFS is the canonical BiohazardFS self-hosted object-store default, while other S3-compatible providers may be supported through the same contract. Bundled dev dependencies can be optional later, but production should not require in-chart databases/storage.
 
 ## Self-hosted deployment modes
 
@@ -379,7 +380,7 @@ Logs must not contain secrets.
 The first server implementation should establish:
 
 1. Server crate/binary skeleton.
-2. Config loading and redacted config display.
+2. Config loading and redacted config display through `biohazardfs-server config`.
 3. Health/readiness endpoints.
 4. Database connection and migration runner stub.
 5. Object-store config validation stub.

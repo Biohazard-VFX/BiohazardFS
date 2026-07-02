@@ -23,6 +23,8 @@ ingress:
 config:
   publicUrl: "http://biohazardfs.local"
   log: "info"
+  objectStoreProvider: "rustfs"
+  objectStoreRegion: ""
 
 secrets:
   existingSecret: ""

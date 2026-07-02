@@ -76,6 +76,8 @@ name = "biohazardfs-core"
 version = "0.1.0"
 dependencies = [
  "biohazardfs-api-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -97,6 +99,7 @@ name = "biohazardfs-server"
 version = "0.1.0"
 dependencies = [
  "biohazardfs-api-types",
+ "biohazardfs-core",
  "clap",
  "serde",
  "serde_json",

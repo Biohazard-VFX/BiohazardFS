@@ -9,7 +9,7 @@ use biohazardfs_api_types::{
     ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
 };
 
-pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_BIND_ADDR: &str = biohazardfs_core::config::DEFAULT_SERVER_BIND;
 pub const CONTAINER_BIND_ADDR: &str = "0.0.0.0:8080";
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
@@ -36,6 +36,7 @@ pub fn server_version() -> ServerVersion {
 }
 
 pub fn server_health() -> ServerHealth {
+    let config = biohazardfs_core::config::RuntimeConfig::from_env();
     ServerHealth {
         state: ServerState::Ready,
         checks: vec![
@@ -47,12 +48,24 @@ pub fn server_health() -> ServerHealth {
             ServerHealthCheck {
                 name: "database".to_string(),
                 ok: true,
-                message: "database check is scaffolded".to_string(),
+                message: if config.database.url_set {
+                    "database URL is configured; connection check is scaffolded".to_string()
+                } else {
+                    "database URL is not configured; connection check is scaffolded".to_string()
+                },
             },
             ServerHealthCheck {
                 name: "object_store".to_string(),
                 ok: true,
-                message: "object-store check is scaffolded".to_string(),
+                message: format!(
+                    "{} object-store config is {}; bucket check is scaffolded",
+                    config.object_store.provider,
+                    if config.object_store.endpoint.is_some() {
+                        "present"
+                    } else {
+                        "missing"
+                    }
+                ),
             },
         ],
     }
