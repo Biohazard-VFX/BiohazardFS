@@ -66,3 +66,19 @@ Git/Git LFS may be supported as optional import/export or for code/manifests/tem
 - `Conflict`: preserved divergent versions with clear user-visible state.
 
 Every event should include provenance: actor, device, source (`ui`, `cli`, `agent`, `api`, `server`), timestamp, affected paths/IDs, and request/correlation ID.
+
+## Server metadata boundary
+
+The server/control-plane metadata schema is a product contract. See `docs/METADATA_SCHEMA.md`.
+
+Key decisions:
+
+- Include an org/studio boundary from day one.
+- Use stable `node_id` identity for filesystem nodes; paths are derived from mutable parent/name.
+- File versions point to content manifest references; individual chunks do not need DB rows in v1.
+- Snapshots support org, project, workset, and subtree scopes.
+- Grants can attach to projects, worksets, nodes, and shares.
+- Locks attach to node IDs where possible, with path snapshots and provisional IDs for offline-created files.
+- Offline operations are first-class server records for replay/reconciliation.
+- Deletes use trash records, soft-deleted nodes, and retention/purge policy.
+- Audit events use indexed envelope columns plus typed schema-versioned JSON payloads.
