@@ -8,6 +8,7 @@ use biohazardfs_api_types::{
     ApiError, PRODUCT_VERSION, SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck,
     ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
 };
+use biohazardfs_core::config::RuntimeConfig;
 use postgres::config::SslMode;
 use postgres::{Client, Config, NoTls};
 use serde::{Deserialize, Serialize};
@@ -120,7 +121,11 @@ pub fn server_version() -> ServerVersion {
 }
 
 pub fn server_health() -> ServerHealth {
-    let config = biohazardfs_core::config::RuntimeConfig::from_env();
+    let config = RuntimeConfig::from_env();
+    server_health_with_config(&config)
+}
+
+pub fn server_health_with_config(config: &RuntimeConfig) -> ServerHealth {
     ServerHealth {
         state: ServerState::Ready,
         checks: vec![
@@ -158,9 +163,13 @@ pub fn server_health() -> ServerHealth {
 }
 
 pub fn server_readiness() -> ServerHealth {
-    let config = biohazardfs_core::config::RuntimeConfig::from_env();
+    let config = RuntimeConfig::from_env();
+    server_readiness_with_config(&config)
+}
+
+pub fn server_readiness_with_config(config: &RuntimeConfig) -> ServerHealth {
     let database_check = if config.database.url_set {
-        match verify_latest_migration_from_env() {
+        match verify_latest_migration_from_config(config) {
             Ok(()) => ServerHealthCheck {
                 name: "database".to_string(),
                 ok: true,
@@ -202,7 +211,14 @@ pub fn server_readiness() -> ServerHealth {
 }
 
 pub fn migrate_payload() -> Result<MigrationReport, MigrationError> {
-    run_migrations_from_env()
+    let config = RuntimeConfig::from_env();
+    migrate_payload_with_config(&config)
+}
+
+pub fn migrate_payload_with_config(
+    config: &RuntimeConfig,
+) -> Result<MigrationReport, MigrationError> {
+    run_migrations_from_config(config)
 }
 
 pub fn worker_payload() -> serde_json::Value {
@@ -215,13 +231,22 @@ pub fn worker_payload() -> serde_json::Value {
 }
 
 pub fn dispatch_http_path(path: &str) -> (u16, String) {
+    let config = RuntimeConfig::from_env();
+    dispatch_http_path_with_config(path, &config)
+}
+
+pub fn dispatch_http_path_with_config(path: &str, config: &RuntimeConfig) -> (u16, String) {
     match path {
         "/healthz" | "/health" => json_response(
             200,
-            &ServerResponseEnvelope::ok("server.health", server_health(), Source::Server),
+            &ServerResponseEnvelope::ok(
+                "server.health",
+                server_health_with_config(config),
+                Source::Server,
+            ),
         ),
         "/readyz" | "/ready" => {
-            let readiness = server_readiness();
+            let readiness = server_readiness_with_config(config);
             let status_code = if readiness.state == ServerState::Ready {
                 200
             } else {
@@ -252,8 +277,15 @@ pub fn dispatch_http_path(path: &str) -> (u16, String) {
 }
 
 pub fn run_migrations_from_env() -> Result<MigrationReport, MigrationError> {
-    let database_url = database_url_from_env()?;
-    run_migrations(&database_url)
+    let config = RuntimeConfig::from_env();
+    run_migrations_from_config(&config)
+}
+
+pub fn run_migrations_from_config(
+    config: &RuntimeConfig,
+) -> Result<MigrationReport, MigrationError> {
+    let database_url = database_url_from_config(config)?;
+    run_migrations(database_url)
 }
 
 pub fn migrate_with_database_url(
@@ -427,9 +459,9 @@ fn apply_migration(
     Ok(())
 }
 
-fn verify_latest_migration_from_env() -> Result<(), MigrationError> {
-    let database_url = database_url_from_env()?;
-    verify_latest_migration(&database_url)
+fn verify_latest_migration_from_config(config: &RuntimeConfig) -> Result<(), MigrationError> {
+    let database_url = database_url_from_config(config)?;
+    verify_latest_migration(database_url)
 }
 
 fn verify_latest_migration(database_url: &str) -> Result<(), MigrationError> {
@@ -451,9 +483,12 @@ fn verify_latest_migration(database_url: &str) -> Result<(), MigrationError> {
     Ok(())
 }
 
-fn database_url_from_env() -> Result<String, MigrationError> {
-    let database_url = std::env::var(biohazardfs_core::config::ENV_DATABASE_URL).ok();
-    validate_database_url(database_url.as_deref()).map(ToOwned::to_owned)
+fn database_url_from_config(config: &RuntimeConfig) -> Result<&str, MigrationError> {
+    let database_url = config
+        .database
+        .url_for_process_boundary()
+        .map(|url| url.expose_for_process_boundary());
+    validate_database_url(database_url)
 }
 
 fn connect_database(database_url: &str) -> Result<Client, MigrationError> {
@@ -543,8 +578,13 @@ fn checksum_sql(sql: &str) -> String {
 }
 
 pub fn serve(addr: &str) -> std::io::Result<()> {
+    serve_with_config(addr, RuntimeConfig::from_env())
+}
+
+pub fn serve_with_config(addr: &str, config: RuntimeConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let config = Arc::new(config);
     eprintln!("biohazardfs-server listening on http://{addr}");
 
     for stream in listener.incoming() {
@@ -560,10 +600,11 @@ pub fn serve(addr: &str) -> std::io::Result<()> {
 
                 active_connections.fetch_add(1, Ordering::Relaxed);
                 let active_connections_for_thread = Arc::clone(&active_connections);
+                let config_for_thread = Arc::clone(&config);
                 let spawn_result = std::thread::Builder::new()
                     .name("biohazardfs-server-http".to_string())
                     .spawn(move || {
-                        if let Err(error) = handle_stream(stream) {
+                        if let Err(error) = handle_stream(stream, &config_for_thread) {
                             eprintln!("biohazardfs-server request error: {error}");
                         }
                         active_connections_for_thread.fetch_sub(1, Ordering::Relaxed);
@@ -593,7 +634,7 @@ fn write_unavailable_response(stream: &mut TcpStream) -> std::io::Result<()> {
     write_http_response(stream, 503, &body)
 }
 
-fn handle_stream(mut stream: TcpStream) -> std::io::Result<()> {
+fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(1200)))?;
     stream.set_write_timeout(Some(Duration::from_millis(1200)))?;
 
@@ -636,7 +677,7 @@ fn handle_stream(mut stream: TcpStream) -> std::io::Result<()> {
         return write_http_response(&mut stream, 405, &body);
     }
 
-    let (status_code, body) = dispatch_http_path(path);
+    let (status_code, body) = dispatch_http_path_with_config(path, config);
     write_http_response(&mut stream, status_code, &body)
 }
 

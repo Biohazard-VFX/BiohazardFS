@@ -7,6 +7,7 @@ POSTGRES_PASSWORD="biohazardfs-db-smoke-password"
 SERVER_ENDPOINT="127.0.0.1:48081"
 SERVER_LOG="${TMPDIR:-/tmp}/biohazardfs-server-db-smoke.log"
 SERVER_PID=""
+CONFIG_FILE=""
 
 cd "$ROOT_DIR"
 
@@ -23,6 +24,9 @@ CONTAINER_ID="$(docker run --rm -d \
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$CONFIG_FILE" ]]; then
+    rm -f "$CONFIG_FILE"
   fi
   docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
 }
@@ -56,13 +60,22 @@ PY
   sleep 1
 done
 
-export BIOHAZARDFS_DATABASE_URL="postgres://biohazardfs:${POSTGRES_PASSWORD}@127.0.0.1:${HOST_PORT}/biohazardfs?sslmode=disable"
+DATABASE_URL="postgres://biohazardfs:${POSTGRES_PASSWORD}@127.0.0.1:${HOST_PORT}/biohazardfs?sslmode=disable"
+CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/biohazardfs-server-db-smoke.XXXXXX.toml")"
+cat >"$CONFIG_FILE" <<EOF_CONFIG
+schema_version = "2026-07-config-v1"
+profile = "ci"
+
+[profiles.ci.database]
+url = "$DATABASE_URL"
+EOF_CONFIG
 
 run_migrate_with_retries() {
   local output_path="$1"
+  shift
   local attempt
   for attempt in $(seq 1 10); do
-    if target/debug/biohazardfs-server migrate >"$output_path"; then
+    if "$@" >"$output_path"; then
       return 0
     fi
     if [[ "$attempt" == "10" ]]; then
@@ -79,16 +92,26 @@ PY
   done
 }
 
-run_migrate_with_retries /tmp/biohazardfs-server-db-migrate-1.json
-run_migrate_with_retries /tmp/biohazardfs-server-db-migrate-2.json
+run_migrate_with_retries \
+  /tmp/biohazardfs-server-db-migrate-1.json \
+  env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server --config "$CONFIG_FILE" --profile ci migrate
+
+BIOHAZARDFS_DATABASE_URL="$DATABASE_URL" run_migrate_with_retries \
+  /tmp/biohazardfs-server-db-migrate-2.json \
+  target/debug/biohazardfs-server --config "$CONFIG_FILE" --profile ci migrate
+
+env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server --config "$CONFIG_FILE" --profile ci config \
+  >/tmp/biohazardfs-server-db-config.json
 
 python3 - <<'PY'
 import json
 from pathlib import Path
 first_text = Path('/tmp/biohazardfs-server-db-migrate-1.json').read_text()
 second_text = Path('/tmp/biohazardfs-server-db-migrate-2.json').read_text()
+config_text = Path('/tmp/biohazardfs-server-db-config.json').read_text()
 first = json.loads(first_text)
 second = json.loads(second_text)
+config = json.loads(config_text)
 assert first['ok'] is True, first
 assert second['ok'] is True, second
 assert first['operation'] == 'server.migrate', first
@@ -98,8 +121,12 @@ assert first['data']['current_version'] == '001', first
 assert len(first['data']['applied_migrations']) == 1, first
 assert second['data']['status'] == 'up_to_date', second
 assert len(second['data']['already_applied_migrations']) == 1, second
-for text in (first_text, second_text):
+assert config['ok'] is True, config
+assert config['operation'] == 'server.config', config
+assert config['data']['database']['url_set'] is True, config
+for text in (first_text, second_text, config_text):
     assert 'biohazardfs-db-smoke-password' not in text, text
+    assert 'postgres://' not in text, text
 PY
 
 TABLES="$(docker exec "$CONTAINER_ID" psql -U biohazardfs -d biohazardfs -Atc "
@@ -138,7 +165,7 @@ missing = expected - actual
 assert not missing, f"missing migration tables: {sorted(missing)}"
 PY
 
-target/debug/biohazardfs-server serve --addr "$SERVER_ENDPOINT" >"$SERVER_LOG" 2>&1 &
+env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server --config "$CONFIG_FILE" --profile ci serve --addr "$SERVER_ENDPOINT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 50); do

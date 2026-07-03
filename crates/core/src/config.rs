@@ -179,7 +179,10 @@ impl RuntimeConfig {
                 bind: DEFAULT_SERVER_BIND.to_string(),
                 public_url: DEFAULT_SERVER_PUBLIC_URL.to_string(),
             },
-            database: DatabaseConfig { url_set: false },
+            database: DatabaseConfig {
+                url_set: false,
+                url: None,
+            },
             object_store: ObjectStoreConfig {
                 provider: DEFAULT_OBJECT_STORE_PROVIDER.to_string(),
                 endpoint: None,
@@ -250,6 +253,14 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatabaseConfig {
     pub url_set: bool,
+    #[serde(skip)]
+    url: Option<RedactedSecret>,
+}
+
+impl DatabaseConfig {
+    pub fn url_for_process_boundary(&self) -> Option<&RedactedSecret> {
+        self.url.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -557,8 +568,9 @@ fn apply_server(config: &mut RuntimeConfig, server: &ServerDocument) {
 }
 
 fn apply_database(config: &mut RuntimeConfig, database: &DatabaseDocument) {
-    if database.url.as_deref().and_then(non_empty_str).is_some() {
+    if let Some(url) = database.url.as_deref().and_then(non_empty_str) {
         config.database.url_set = true;
+        config.database.url = Some(RedactedSecret::new(url));
     }
 }
 
@@ -614,8 +626,9 @@ fn apply_env_overrides(config: &mut RuntimeConfig, mut lookup: impl FnMut(&str) 
     if let Some(public_url) = non_empty(lookup(ENV_SERVER_PUBLIC_URL)) {
         config.server.public_url = public_url;
     }
-    if non_empty(lookup(ENV_DATABASE_URL)).is_some() {
+    if let Some(database_url) = non_empty(lookup(ENV_DATABASE_URL)) {
         config.database.url_set = true;
+        config.database.url = Some(RedactedSecret::new(database_url));
     }
     if let Some(provider) = non_empty(lookup(ENV_OBJECT_STORE_PROVIDER)) {
         config.object_store.provider = provider;
@@ -701,6 +714,13 @@ mod tests {
         assert_eq!(config.server.bind, "0.0.0.0:8080");
         assert_eq!(config.server.public_url, "https://biohazardfs.example");
         assert!(config.database.url_set);
+        assert_eq!(
+            config
+                .database
+                .url_for_process_boundary()
+                .map(RedactedSecret::expose_for_process_boundary),
+            Some("postgres://example")
+        );
         assert_eq!(config.object_store.provider, "rustfs");
         assert_eq!(
             config.object_store.endpoint.as_deref(),
@@ -764,6 +784,14 @@ secret_access_key = "do-not-print"
             Some("studio-bucket")
         );
         assert!(loaded.config.database.url_set);
+        assert_eq!(
+            loaded
+                .config
+                .database
+                .url_for_process_boundary()
+                .map(RedactedSecret::expose_for_process_boundary),
+            Some("postgres://secret")
+        );
         let json = serde_json::to_string(&loaded).expect("config serializes");
         assert!(json.contains("***REDACTED***"));
         assert!(!json.contains("do-not-print"));
@@ -802,18 +830,38 @@ profile = "dev"
 
 [profiles.dev.server]
 bind = "127.0.0.1:1111"
+
+[profiles.dev.database]
+url = "postgres://toml-secret"
 "#;
         let loaded = RuntimeConfig::load_with_lookup(
             ConfigLoadOptions {
                 config_file: Some(PathBuf::from("/tmp/biohazardfs-test.toml")),
                 profile: None,
             },
-            lookup(&[(ENV_SERVER_BIND, "127.0.0.1:2222")]),
+            lookup(&[
+                (ENV_SERVER_BIND, "127.0.0.1:2222"),
+                (ENV_DATABASE_URL, "postgres://env-secret"),
+            ]),
             |_| Ok(toml.to_string()),
         )
         .expect("config loads");
 
         assert_eq!(loaded.config.server.bind, "127.0.0.1:2222");
+        assert_eq!(
+            loaded
+                .config
+                .database
+                .url_for_process_boundary()
+                .map(RedactedSecret::expose_for_process_boundary),
+            Some("postgres://env-secret")
+        );
+        let json = serde_json::to_string(&loaded).expect("config serializes");
+        let debug = format!("{loaded:?}");
+        assert!(!json.contains("postgres://env-secret"));
+        assert!(!json.contains("postgres://toml-secret"));
+        assert!(!debug.contains("postgres://env-secret"));
+        assert!(!debug.contains("postgres://toml-secret"));
     }
 
     #[test]

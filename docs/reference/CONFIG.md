@@ -56,7 +56,7 @@ Overrides:
 | `BIOHAZARDFS_CONFIG_DIR` | explicit config directory for tests/agents/headless installs |
 | `BIOHAZARDFS_PROFILE` | profile name, default `dev` |
 
-The Rust scaffold now parses TOML config files. Missing default config files are allowed and produce built-in defaults. Invalid TOML or unreadable explicit config files return `config_parse_error` / `config_read_error` through the CLI command envelope.
+The Rust scaffold now parses TOML config files. Missing default config files are allowed and produce built-in defaults. Invalid TOML or unreadable explicit config files return `config_parse_error` / `config_read_error` through CLI/server JSON envelopes.
 
 ## Shared environment variables
 
@@ -69,7 +69,7 @@ The Rust scaffold now parses TOML config files. Missing default config files are
 | `BIOHAZARDFS_LOCAL_TOKEN` | string | yes | daemon/CLI/desktop | local owner token; never pass via argv |
 | `BIOHAZARDFS_SERVER_BIND` | host:port | no | server | default `127.0.0.1:8080`; containers set `0.0.0.0:8080` |
 | `BIOHAZARDFS_SERVER_PUBLIC_URL` | URL | no | server/clients | externally visible server URL |
-| `BIOHAZARDFS_DATABASE_URL` | URL | yes-ish | server | Postgres connection URL; redact in output |
+| `BIOHAZARDFS_DATABASE_URL` | URL | yes | server | Postgres connection URL; overrides `[database].url`; redact in output |
 | `BIOHAZARDFS_OBJECT_STORE_PROVIDER` | enum/string | no | server | default `rustfs` |
 | `BIOHAZARDFS_OBJECT_STORE_ENDPOINT` | URL | no | server | S3-compatible endpoint |
 | `BIOHAZARDFS_OBJECT_STORE_BUCKET` | string | no | server | content bucket |
@@ -161,7 +161,7 @@ The redacted runtime shape reports secret-bearing values as booleans or `***REDA
 }
 ```
 
-`biohazardfs config show --redacted` and `biohazardfs-server config` print safe JSON envelopes. It is safe for CI logs as long as new secret-bearing fields use the redaction type or boolean `*_set` convention.
+`biohazardfs config show --redacted` and `biohazardfs-server --config <PATH> config` print safe JSON envelopes. It is safe for CI logs as long as new secret-bearing fields use the redaction type or boolean `*_set` convention. `biohazardfs-server --config <PATH> migrate` and `serve` use the same resolved config internally, but never print the raw database URL.
 
 ## Validation warnings
 
@@ -171,7 +171,7 @@ The shared config scaffold currently emits warnings for:
 - object-store endpoint set without a bucket (`object_store_bucket_missing`)
 - access key ID set without secret access key (`object_store_secret_missing`)
 
-These are warnings for now because routine config display remains non-secret and non-invasive. `biohazardfs-server migrate` now requires `BIOHAZARDFS_DATABASE_URL` and connects to Postgres. The current synchronous Postgres client supports explicit plaintext only, so local/self-hosted URLs must include `sslmode=disable` until TLS support is implemented. Object-storage checks remain scaffolded until object/file APIs exist.
+These are warnings for now because routine config display remains non-secret and non-invasive. `biohazardfs-server migrate` now requires a database URL from the resolved shared config (`[database].url` or `BIOHAZARDFS_DATABASE_URL`) and connects to Postgres. The current synchronous Postgres client supports explicit plaintext only, so local/self-hosted URLs must include `sslmode=disable` until TLS support is implemented. Object-storage checks remain scaffolded until object/file APIs exist.
 
 ## Next implementation steps
 
@@ -179,5 +179,5 @@ These are warnings for now because routine config display remains non-secret and
 2. Generate a JSON schema for `2026-07-config-v1` under `generated/schemas/`.
 3. Mirror the shared config shape in the Electron TypeScript preload/renderer boundary.
 4. Add secure credential lookup: OS keyring first, owner-only fallback for headless/dev.
-5. Add server dependency checks that validate Postgres connectivity and RustFS bucket access.
+5. Add RustFS bucket dependency checks.
 6. Add Compose integration smoke that boots RustFS and creates/checks the dev bucket.

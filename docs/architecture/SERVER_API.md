@@ -64,15 +64,15 @@ Rules:
 ## Current binary modes
 
 ```bash
-biohazardfs-server serve --addr 127.0.0.1:8080
-biohazardfs-server worker
-biohazardfs-server migrate
-biohazardfs-server health
+biohazardfs-server --config /path/to/config.toml serve --addr 127.0.0.1:8080
+biohazardfs-server --config /path/to/config.toml worker
+biohazardfs-server --config /path/to/config.toml migrate
+biohazardfs-server --config /path/to/config.toml health
 biohazardfs-server version
-biohazardfs-server config
+biohazardfs-server --config /path/to/config.toml config
 ```
 
-`worker` remains a scaffold mode. `migrate` requires `BIOHAZARDFS_DATABASE_URL`, applies bundled Postgres migrations, prints a server JSON envelope, and exits nonzero with a redacted JSON error envelope when the database URL is missing or unusable.
+`worker` remains a scaffold mode. `migrate` resolves the shared config via `--config`, `--profile`, `BIOHAZARDFS_CONFIG_FILE`, `BIOHAZARDFS_CONFIG_DIR`, and environment overrides. It requires a database URL from `[database].url` or `BIOHAZARDFS_DATABASE_URL`, applies bundled Postgres migrations, prints a server JSON envelope, and exits nonzero with a redacted JSON error envelope when the database URL is missing or unusable. The database URL is never accepted directly through argv.
 
 ## Current HTTP endpoints
 
@@ -81,7 +81,7 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 | Endpoint | Operation | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | `server.health` | Liveness check |
-| `GET /readyz` | `server.ready` | Readiness check; returns degraded/not-ready when a configured database cannot verify the latest migration |
+| `GET /readyz` | `server.ready` | Readiness check; returns degraded/not-ready when the resolved shared config contains a database URL and the server cannot verify the latest migration |
 | `GET /version` | `server.version` | Version and schema info |
 | `GET /api/v1/status` | `server.status` | Server/control-plane status |
 
@@ -127,15 +127,14 @@ The dev Compose stack includes:
 - `postgres`
 - `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
-The server migration command connects to Postgres when `BIOHAZARDFS_DATABASE_URL` is configured. Object storage remains scaffolded and no object/file APIs are implemented yet.
+The server migration command connects to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. Object storage remains scaffolded and no object/file APIs are implemented yet.
 
 ## Next required server work
 
 Before claiming a real server MVP, implement:
 
-1. TOML-backed shared typed config loading and validation beyond the current env-backed scaffold.
-2. RustFS/S3-compatible object-store config validation and bucket checks.
-3. Auth/device enrollment endpoints.
-4. Server-side operation/idempotency APIs over the metadata foundation.
-5. Transfer authorization skeleton.
-6. Integration tests using live Postgres and S3-compatible storage.
+1. RustFS/S3-compatible object-store config validation and bucket checks.
+2. Auth/device enrollment endpoints.
+3. Server-side operation/idempotency APIs over the metadata foundation.
+4. Transfer authorization skeleton.
+5. Integration tests using live Postgres and S3-compatible storage.
