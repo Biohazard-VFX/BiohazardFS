@@ -369,6 +369,21 @@ Rules:
 - `object.get` downloads through the server content-object API, verifies/writes the requested object to `--output`, removes the server `content_hex` payload from CLI output, and returns metadata plus `output_path`.
 - These commands are content-object primitives, not final user-facing file-version mutation commands.
 
+## Daemon workspace commands
+
+Local daemon workspace runtime commands:
+
+```bash
+BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs daemon workspace-status
+BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs daemon workspace-list --path plates
+```
+
+Rules:
+
+- The daemon reads `BIOHAZARDFS_WORKSPACE_ROOT` from its own environment; clients do not pass workspace roots through argv.
+- `workspace-list` accepts only relative paths that stay inside the configured workspace root.
+- These methods are local runtime inspection primitives for the daemon/Electron/CLI path, not server file APIs.
+
 ## File workflow commands
 
 First metadata-backed file commands:

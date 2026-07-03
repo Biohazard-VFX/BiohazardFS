@@ -55,6 +55,7 @@ biohazardfsd
 
 Normal clients use the daemon for:
 
+- local workspace status and safe directory inspection
 - mount attach/detach/status
 - placeholder/hydration state
 - cache pin/dehydrate/evict/move/verify
@@ -159,7 +160,7 @@ Rules:
 
 - IPC and optional loopback HTTP use the same `method` + `params` request shape.
 - HTTP does not expose a separate REST surface for daemon methods.
-- Method names are stable dotted strings such as `cache.pin`, `file.history`, and `snapshot.create`.
+- Method names are stable dotted strings such as `workspace.status`, `workspace.list`, `cache.pin`, `file.history`, and `snapshot.create`.
 - This method registry is the source of truth for CLI command mapping, MCP tool generation, schema introspection, and tests.
 
 ## Request envelope
@@ -247,6 +248,15 @@ Error responses use the same envelope:
   }
 }
 ```
+
+## Current workspace runtime methods
+
+The current scaffold exposes two local workspace runtime methods over the owner-token daemon transport:
+
+- `workspace.status`: reports whether `BIOHAZARDFS_WORKSPACE_ROOT` is configured, exists, and is writable.
+- `workspace.list`: lists up to 500 entries under a relative workspace path while rejecting absolute paths, parent traversal, and control characters.
+
+The workspace root is configured in the daemon process environment, not passed by clients through argv. These methods are the first smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine.
 
 ## Event stream
 

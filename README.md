@@ -154,6 +154,8 @@ Currently runnable:
 biohazardfs status
 biohazardfs daemon status
 biohazardfs daemon methods
+biohazardfs daemon workspace-status
+biohazardfs daemon workspace-list --path plates
 biohazardfs config path
 biohazardfs config show --redacted
 biohazardfs config validate

@@ -5,15 +5,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENDPOINT="${BIOHAZARDFS_DAEMON_ENDPOINT:-127.0.0.1:47666}"
 LOCAL_TOKEN="${BIOHAZARDFS_LOCAL_TOKEN:-local_scaffold_smoke_token}"
 DAEMON_LOG="${TMPDIR:-/tmp}/biohazardfsd-smoke.log"
+WORKSPACE_ROOT="$(mktemp -d)"
 
 cd "$ROOT_DIR"
 
 cargo build --workspace --all-features
 
-BIOHAZARDFS_LOCAL_TOKEN="$LOCAL_TOKEN" target/debug/biohazardfsd --dev-loopback-http --addr "$ENDPOINT" >"$DAEMON_LOG" 2>&1 &
+mkdir -p "$WORKSPACE_ROOT/plates"
+printf 'workspace smoke\n' >"$WORKSPACE_ROOT/plates/shot001.txt"
+
+BIOHAZARDFS_LOCAL_TOKEN="$LOCAL_TOKEN" BIOHAZARDFS_WORKSPACE_ROOT="$WORKSPACE_ROOT" target/debug/biohazardfsd --dev-loopback-http --addr "$ENDPOINT" >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 cleanup() {
   kill "$DAEMON_PID" >/dev/null 2>&1 || true
+  rm -rf "$WORKSPACE_ROOT"
 }
 trap cleanup EXIT
 
@@ -39,6 +44,24 @@ status = json.loads(Path('/tmp/biohazardfs-daemon-status.json').read_text())
 assert status['ok'] is True, status
 assert status['data']['state'] == 'ready', status
 print('daemon-cli-smoke-ok')
+PY
+
+BIOHAZARDFS_LOCAL_TOKEN="$LOCAL_TOKEN" target/debug/biohazardfs --daemon-endpoint "$ENDPOINT" daemon workspace-status >/tmp/biohazardfs-workspace-status.json
+BIOHAZARDFS_LOCAL_TOKEN="$LOCAL_TOKEN" target/debug/biohazardfs --daemon-endpoint "$ENDPOINT" daemon workspace-list --path plates >/tmp/biohazardfs-workspace-list.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+status = json.loads(Path('/tmp/biohazardfs-workspace-status.json').read_text())
+listing = json.loads(Path('/tmp/biohazardfs-workspace-list.json').read_text())
+assert status['ok'] is True, status
+assert status['command'] == 'daemon.workspace.status', status
+assert status['data']['root_configured'] is True, status
+assert status['data']['root_exists'] is True, status
+assert listing['ok'] is True, listing
+assert listing['command'] == 'daemon.workspace.list', listing
+names = [entry['name'] for entry in listing['data']['entries']]
+assert 'shot001.txt' in names, listing
+print('daemon-workspace-smoke-ok')
 PY
 
 CONFIG_SMOKE_DIR="$(mktemp -d)"

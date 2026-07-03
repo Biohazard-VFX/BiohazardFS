@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use biohazardfs_api_types::{
@@ -8,6 +10,7 @@ use biohazardfs_api_types::{
 };
 
 pub const LOCAL_TOKEN_ENV: &str = "BIOHAZARDFS_LOCAL_TOKEN";
+pub const WORKSPACE_ROOT_ENV: &str = "BIOHAZARDFS_WORKSPACE_ROOT";
 const MAX_RPC_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
@@ -160,11 +163,31 @@ pub fn dispatch_rpc(
             method,
             request_id,
             serde_json::json!({
-                "methods": ["daemon.status", "daemon.health", "daemon.methods"],
+                "methods": [
+                    "daemon.status",
+                    "daemon.health",
+                    "daemon.methods",
+                    "workspace.status",
+                    "workspace.list"
+                ],
                 "transport": "dev_loopback_http_json_rpc"
             }),
             source,
         ),
+        "workspace.status" => ResponseEnvelope::ok_with_request_id(
+            method,
+            request_id,
+            workspace_status_payload(endpoint),
+            source,
+        ),
+        "workspace.list" => match workspace_list_payload(&request.params) {
+            Ok(payload) => {
+                ResponseEnvelope::ok_with_request_id(method, request_id, payload, source)
+            }
+            Err(error) => {
+                ResponseEnvelope::error_with_request_id(method, request_id, error, source)
+            }
+        },
         _ => ResponseEnvelope::error_with_request_id(
             method,
             request_id,
@@ -172,6 +195,144 @@ pub fn dispatch_rpc(
             source,
         ),
     }
+}
+
+fn workspace_status_payload(endpoint: impl Into<String>) -> serde_json::Value {
+    let root = workspace_root_from_env();
+    let root_display = root.as_ref().map(|path| path.to_string_lossy().to_string());
+    let exists = root.as_ref().is_some_and(|path| path.is_dir());
+    let writable = root.as_ref().is_some_and(|path| {
+        fs::metadata(path)
+            .map(|metadata| metadata.is_dir() && !metadata.permissions().readonly())
+            .unwrap_or(false)
+    });
+    serde_json::json!({
+        "state": if root.is_some() && exists && writable { "ready" } else { "unconfigured" },
+        "transport": "dev_loopback_http_json_rpc",
+        "endpoint": endpoint.into(),
+        "root_configured": root.is_some(),
+        "root": root_display,
+        "root_exists": exists,
+        "root_writable": writable,
+    })
+}
+
+fn workspace_list_payload(params: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    let root = workspace_root_from_env().ok_or_else(|| {
+        ApiError::new(
+            "workspace_root_missing",
+            format!("set {WORKSPACE_ROOT_ENV} to enable local workspace methods"),
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(ApiError::new(
+            "workspace_unavailable",
+            "workspace root does not exist or is not a directory",
+        ));
+    }
+    let relative = params
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let relative_path = validate_workspace_relative_path(relative)?;
+    let canonical_root = fs::canonicalize(&root)
+        .map_err(|_| ApiError::new("workspace_unavailable", "could not resolve workspace root"))?;
+    let target = root.join(relative_path);
+    let canonical_target = fs::canonicalize(&target)
+        .map_err(|_| ApiError::new("workspace_path_not_found", "workspace path was not found"))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(ApiError::new(
+            "workspace_path_invalid",
+            "workspace path must stay inside the workspace root",
+        ));
+    }
+    let target_metadata = fs::metadata(&canonical_target)
+        .map_err(|_| ApiError::new("workspace_path_not_found", "workspace path was not found"))?;
+    if !target_metadata.is_dir() {
+        return Err(ApiError::new(
+            "workspace_path_not_directory",
+            "workspace path is not a directory",
+        ));
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&canonical_target).map_err(|_| {
+        ApiError::new(
+            "workspace_unavailable",
+            "could not list workspace directory",
+        )
+    })? {
+        if entries.len() >= 500 {
+            break;
+        }
+        let entry = entry.map_err(|_| {
+            ApiError::new(
+                "workspace_unavailable",
+                "could not read workspace directory entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| {
+            ApiError::new("workspace_unavailable", "could not inspect workspace entry")
+        })?;
+        let file_type = entry.file_type().map_err(|_| {
+            ApiError::new("workspace_unavailable", "could not inspect workspace entry")
+        })?;
+        let kind = if file_type.is_symlink() {
+            "symlink"
+        } else if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        entries.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "kind": kind,
+            "size_bytes": if file_type.is_file() { Some(metadata.len()) } else { None },
+        }));
+    }
+    entries.sort_by(|left, right| {
+        left.get("name")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("name").and_then(|value| value.as_str()))
+    });
+    Ok(serde_json::json!({
+        "root": canonical_root.to_string_lossy(),
+        "path": relative,
+        "entries": entries,
+    }))
+}
+
+fn workspace_root_from_env() -> Option<PathBuf> {
+    std::env::var(WORKSPACE_ROOT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn validate_workspace_relative_path(value: &str) -> Result<&Path, ApiError> {
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ApiError::new(
+            "workspace_path_invalid",
+            "workspace path contains invalid characters",
+        ));
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ApiError::new(
+            "workspace_path_invalid",
+            "workspace path must stay inside the workspace root",
+        ));
+    }
+    Ok(path)
 }
 
 pub fn run_dev_loopback_http(config: DevLoopbackConfig) -> std::io::Result<()> {

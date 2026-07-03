@@ -92,6 +92,14 @@ enum DaemonCommand {
     Status,
     /// List daemon RPC methods exposed by the scaffold daemon.
     Methods,
+    /// Show local workspace runtime status from the daemon.
+    WorkspaceStatus,
+    /// List a local workspace directory through the daemon.
+    WorkspaceList {
+        /// Relative workspace path. Must stay inside the workspace root.
+        #[arg(long, default_value = "")]
+        path: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,6 +190,22 @@ fn main() -> ExitCode {
         Command::Daemon {
             command: DaemonCommand::Methods,
         } => daemon_methods_json(&cli),
+        Command::Daemon {
+            command: DaemonCommand::WorkspaceStatus,
+        } => daemon_rpc_json(
+            &cli,
+            "daemon.workspace.status",
+            "workspace.status",
+            serde_json::json!({}),
+        ),
+        Command::Daemon {
+            command: DaemonCommand::WorkspaceList { path },
+        } => daemon_rpc_json(
+            &cli,
+            "daemon.workspace.list",
+            "workspace.list",
+            serde_json::json!({ "path": path }),
+        ),
         Command::Config { command } => config_json(&cli, command),
         Command::Namespace { command } => namespace_json(&cli, command),
         Command::Object { command } => object_json(&cli, command),
@@ -312,6 +336,80 @@ fn daemon_methods_json(cli: &Cli) -> (String, u8) {
             let code = daemon_error_code(&error);
             let output: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
                 "daemon.methods",
+                ApiError::new(code, error.to_string()),
+                Source::Cli,
+            );
+            (
+                serde_json::to_string_pretty(&output).expect("daemon error serializes"),
+                daemon_exit_code(code),
+            )
+        }
+    }
+}
+
+fn daemon_rpc_json(
+    cli: &Cli,
+    command_name: &'static str,
+    method: &'static str,
+    params: serde_json::Value,
+) -> (String, u8) {
+    let Some(token) = local_token() else {
+        let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+            command_name,
+            ApiError::new(
+                "auth_required",
+                format!("set {LOCAL_TOKEN_ENV} to call the local daemon"),
+            ),
+            Source::Cli,
+        );
+        return (
+            serde_json::to_string_pretty(&envelope).expect("daemon error serializes"),
+            EXIT_AUTH,
+        );
+    };
+
+    let client = DaemonHttpClient::new(&cli.daemon_endpoint, token);
+    let mut request = DaemonRequest::new(method, Source::Cli);
+    request.params = params;
+    match client.call::<serde_json::Value>(&request) {
+        Ok(envelope) if envelope.ok => {
+            let output = CommandResponseEnvelope::ok(
+                command_name,
+                envelope.data.unwrap_or_else(|| serde_json::json!({})),
+                Source::Cli,
+            );
+            (
+                serde_json::to_string_pretty(&output).expect("daemon rpc serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok(envelope) => {
+            let error = envelope
+                .error
+                .unwrap_or_else(|| ApiError::new("daemon_error", "daemon returned an error"));
+            let normalized_error = if error.code == "unauthorized" {
+                ApiError::new("auth_required", "daemon rejected the local auth token")
+            } else {
+                error
+            };
+            let exit_code = if normalized_error.code == "auth_required" {
+                EXIT_AUTH
+            } else if normalized_error.code.ends_with("not_found") {
+                EXIT_NOT_FOUND
+            } else {
+                EXIT_DAEMON_UNAVAILABLE
+            };
+            let output: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error(command_name, normalized_error, Source::Cli);
+            (
+                serde_json::to_string_pretty(&output).expect("daemon error serializes"),
+                exit_code,
+            )
+        }
+        Err(error) => {
+            let code = daemon_error_code(&error);
+            let output: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+                command_name,
                 ApiError::new(code, error.to_string()),
                 Source::Cli,
             );
@@ -1508,6 +1606,8 @@ fn schema_json(command: SchemaCommand) -> String {
         "client.status".to_string(),
         "daemon.status".to_string(),
         "daemon.methods".to_string(),
+        "daemon.workspace.status".to_string(),
+        "daemon.workspace.list".to_string(),
         "config.path".to_string(),
         "config.show".to_string(),
         "config.validate".to_string(),
