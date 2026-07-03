@@ -18,3 +18,4 @@ biohazardfs-core = { path = "../core" }
 biohazardfs-daemon = { path = "../daemon" }
 clap.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"

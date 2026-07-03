@@ -352,6 +352,23 @@ Rules:
 - Secrets from the server token and database config must not be printed in success or error envelopes.
 - The server endpoint returns only live nodes visible to the token's organization.
 
+## Content object commands
+
+Currently implemented server-backed content-object transfer commands:
+
+```bash
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object put ./plate.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <content-hash> --output ./plate.exr
+```
+
+Rules:
+
+- `BIOHAZARDFS_SERVER_TOKEN` is the only current server bearer-token source; do not pass server tokens through argv.
+- The commands read `server.public_url` from resolved shared config and currently send bearer tokens only to resolved loopback HTTP server URLs.
+- `object.put` reads a bounded local file, uploads it through the server content-object API, and returns `content_hash`, `size_bytes`, `storage_provider`, and `object_key` in the CLI command envelope.
+- `object.get` downloads through the server content-object API, verifies/writes the requested object to `--output`, removes the server `content_hex` payload from CLI output, and returns metadata plus `output_path`.
+- These commands are content-object primitives, not final user-facing file-version mutation commands.
+
 ## Schema introspection commands
 
 Agents must be able to discover the command surface without reading Markdown docs.

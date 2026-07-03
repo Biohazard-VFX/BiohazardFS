@@ -87,6 +87,7 @@ dependencies = [
  "biohazardfs-daemon",
  "clap",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

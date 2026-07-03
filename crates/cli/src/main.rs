@@ -1,8 +1,9 @@
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use biohazardfs_api_types::{
     ApiError, ClientStatus, CommandResponseEnvelope, CommandSchemaSummary,
@@ -14,14 +15,18 @@ use biohazardfs_core::config::{
 };
 use biohazardfs_daemon::{DaemonClientError, DaemonHttpClient, LOCAL_TOKEN_ENV};
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 const EXIT_OK: u8 = 0;
 const EXIT_USAGE: u8 = 2;
 const EXIT_AUTH: u8 = 3;
+const EXIT_NOT_FOUND: u8 = 4;
 const EXIT_DAEMON_UNAVAILABLE: u8 = 6;
 const EXIT_SERVER_UNAVAILABLE: u8 = 6;
 const SERVER_TOKEN_ENV: &str = "BIOHAZARDFS_SERVER_TOKEN";
 const MAX_NAMESPACE_LIMIT: u32 = 500;
+const MAX_CONTENT_OBJECT_BYTES: usize = 1024 * 1024;
+const MAX_SERVER_JSON_RESPONSE_BYTES: u64 = 3 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "biohazardfs")]
@@ -62,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         command: NamespaceCommand,
     },
+    /// Server-backed content object transfer commands.
+    Object {
+        #[command(subcommand)]
+        command: ObjectCommand,
+    },
     /// Schema-introspection scaffold.
     Schema {
         #[command(subcommand)]
@@ -89,6 +99,24 @@ enum NamespaceCommand {
         /// Maximum number of children to return.
         #[arg(long, default_value_t = 100)]
         limit: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ObjectCommand {
+    /// Upload a local file as a content-addressed object.
+    Put {
+        /// Local file path to upload. Secrets should not be embedded in paths.
+        path: PathBuf,
+    },
+    /// Download a content-addressed object to a local file.
+    Get {
+        /// SHA-256 content hash returned by object put.
+        #[arg(long)]
+        sha256: String,
+        /// Local output file path to write.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -127,6 +155,7 @@ fn main() -> ExitCode {
         } => daemon_methods_json(&cli),
         Command::Config { command } => config_json(&cli, command),
         Command::Namespace { command } => namespace_json(&cli, command),
+        Command::Object { command } => object_json(&cli, command),
         Command::Schema { command } => (schema_json(command), EXIT_OK),
         Command::Commands => (schema_json(SchemaCommand::List), EXIT_OK),
     };
@@ -373,6 +402,274 @@ fn namespace_children_json(cli: &Cli, parent: Option<String>, limit: u32) -> (St
     }
 }
 
+fn object_json(cli: &Cli, command: ObjectCommand) -> (String, u8) {
+    match command {
+        ObjectCommand::Put { path } => object_put_json(cli, path),
+        ObjectCommand::Get { sha256, output } => object_get_json(cli, sha256, output),
+    }
+}
+
+fn object_put_json(cli: &Cli, path: PathBuf) -> (String, u8) {
+    let Some(token) = server_token() else {
+        return auth_required_json("object.put", "content object APIs");
+    };
+    let loaded = match load_config(cli) {
+        Ok(loaded) => loaded,
+        Err(error) => return config_error_json("object.put", error),
+    };
+    let content = match read_bounded_input_file(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("object.put", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("object put read error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+
+    let local_hash = sha256_hex(&content);
+    let local_size = content.len() as u64;
+    match server_request_json(
+        "PUT",
+        &loaded.config.server.public_url,
+        "/api/v1/objects/content",
+        Some(&token),
+        &content,
+    ) {
+        Ok((_status, payload)) if payload.get("ok").and_then(|ok| ok.as_bool()) == Some(true) => {
+            let mut data = payload
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let server_hash = data.get("content_hash").and_then(|value| value.as_str());
+            let server_size = data.get("size_bytes").and_then(|value| value.as_u64());
+            if server_hash != Some(local_hash.as_str()) || server_size != Some(local_size) {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "object.put",
+                        ApiError::new(
+                            "server_protocol_error",
+                            "server response did not match uploaded content hash and size",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("object put protocol error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            }
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "input_path".to_string(),
+                    serde_json::Value::String(path.to_string_lossy().to_string()),
+                );
+            }
+            let envelope = CommandResponseEnvelope::ok("object.put", data, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("object put serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok((status, payload)) => server_error_json("object.put", status, payload),
+        Err(error) => server_client_error_json("object.put", error),
+    }
+}
+
+fn object_get_json(cli: &Cli, sha256: String, output: PathBuf) -> (String, u8) {
+    let Some(token) = server_token() else {
+        return auth_required_json("object.get", "content object APIs");
+    };
+    let sha256 = match validate_content_hash(&sha256) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("object.get", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("object get hash error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+    if fs::symlink_metadata(&output).is_ok() {
+        let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+            "object.get",
+            ApiError::new(
+                "output_exists",
+                "output path already exists; refusing to overwrite without an explicit overwrite command",
+            ),
+            Source::Cli,
+        );
+        return (
+            serde_json::to_string_pretty(&envelope).expect("object get exists error serializes"),
+            EXIT_USAGE,
+        );
+    }
+    let loaded = match load_config(cli) {
+        Ok(loaded) => loaded,
+        Err(error) => return config_error_json("object.get", error),
+    };
+
+    let path = format!("/api/v1/objects/content?sha256={sha256}");
+    match server_request_json(
+        "GET",
+        &loaded.config.server.public_url,
+        &path,
+        Some(&token),
+        &[],
+    ) {
+        Ok((_status, payload)) if payload.get("ok").and_then(|ok| ok.as_bool()) == Some(true) => {
+            let mut data = payload
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let Some(content_hex) = data.get("content_hex").and_then(|value| value.as_str()) else {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "object.get",
+                        ApiError::new(
+                            "server_protocol_error",
+                            "server response did not include content_hex",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("object get protocol error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            };
+            let content = match hex_to_bytes(content_hex) {
+                Ok(content) => content,
+                Err(error) => {
+                    let envelope: CommandResponseEnvelope<serde_json::Value> =
+                        CommandResponseEnvelope::error("object.get", error, Source::Cli);
+                    return (
+                        serde_json::to_string_pretty(&envelope)
+                            .expect("object get decode error serializes"),
+                        EXIT_SERVER_UNAVAILABLE,
+                    );
+                }
+            };
+            if sha256_hex(&content) != sha256 {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "object.get",
+                        ApiError::new(
+                            "content_hash_mismatch",
+                            "downloaded content did not match requested hash",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("object get hash error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            }
+            if let Err(error) = write_file_atomically(&output, &content) {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "object.get",
+                        ApiError::new(
+                            "file_write_failed",
+                            format!("could not write output file: {error}"),
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("object get write error serializes"),
+                    EXIT_USAGE,
+                );
+            }
+            if let Some(object) = data.as_object_mut() {
+                object.remove("content_hex");
+                object.insert(
+                    "output_path".to_string(),
+                    serde_json::Value::String(output.to_string_lossy().to_string()),
+                );
+            }
+            let envelope = CommandResponseEnvelope::ok("object.get", data, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("object get serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok((status, payload)) => server_error_json("object.get", status, payload),
+        Err(error) => server_client_error_json("object.get", error),
+    }
+}
+
+fn auth_required_json(command: &'static str, api_name: &str) -> (String, u8) {
+    let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+        command,
+        ApiError::new(
+            "auth_required",
+            format!("set {SERVER_TOKEN_ENV} to call BiohazardFS server {api_name}"),
+        ),
+        Source::Cli,
+    );
+    (
+        serde_json::to_string_pretty(&envelope).expect("auth error serializes"),
+        EXIT_AUTH,
+    )
+}
+
+fn server_error_json(
+    command: &'static str,
+    status: u16,
+    payload: serde_json::Value,
+) -> (String, u8) {
+    let error = payload
+        .get("error")
+        .cloned()
+        .and_then(|error| serde_json::from_value::<ApiError>(error).ok())
+        .unwrap_or_else(|| ApiError::new("server_error", "server returned an error"));
+    let exit_code = if status == 401
+        || status == 403
+        || matches!(error.code.as_str(), "auth_required" | "auth_scope_missing")
+    {
+        EXIT_AUTH
+    } else if status == 404
+        || matches!(
+            error.code.as_str(),
+            "not_found" | "content_object_not_found"
+        )
+    {
+        EXIT_NOT_FOUND
+    } else if status == 400 || status == 413 {
+        EXIT_USAGE
+    } else {
+        EXIT_SERVER_UNAVAILABLE
+    };
+    let envelope: CommandResponseEnvelope<serde_json::Value> =
+        CommandResponseEnvelope::error(command, error, Source::Cli);
+    (
+        serde_json::to_string_pretty(&envelope).expect("server error serializes"),
+        exit_code,
+    )
+}
+
+fn server_client_error_json(command: &'static str, error: ServerClientError) -> (String, u8) {
+    let exit_code = if matches!(error.code, "invalid_server_url" | "insecure_server_url") {
+        EXIT_USAGE
+    } else {
+        EXIT_SERVER_UNAVAILABLE
+    };
+    let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+        command,
+        ApiError::new(error.code, error.message),
+        Source::Cli,
+    );
+    (
+        serde_json::to_string_pretty(&envelope).expect("server client error serializes"),
+        exit_code,
+    )
+}
+
 fn config_json(cli: &Cli, command: ConfigCommand) -> (String, u8) {
     match command {
         ConfigCommand::Path => config_path_json(cli),
@@ -517,6 +814,130 @@ fn validate_namespace_limit(limit: u32) -> Result<(), ApiError> {
     }
 }
 
+fn read_bounded_input_file(path: &Path) -> Result<Vec<u8>, ApiError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        ApiError::new(
+            "file_read_failed",
+            format!("could not inspect input file: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::new(
+            "file_type_unsupported",
+            "input path must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_CONTENT_OBJECT_BYTES as u64 {
+        return Err(ApiError::new(
+            "content_too_large",
+            "input file exceeds the MVP content upload limit",
+        ));
+    }
+    let file = File::open(path).map_err(|error| {
+        ApiError::new(
+            "file_read_failed",
+            format!("could not read input file: {error}"),
+        )
+    })?;
+    let mut content = Vec::new();
+    file.take(MAX_CONTENT_OBJECT_BYTES as u64 + 1)
+        .read_to_end(&mut content)
+        .map_err(|error| {
+            ApiError::new(
+                "file_read_failed",
+                format!("could not read input file: {error}"),
+            )
+        })?;
+    if content.len() > MAX_CONTENT_OBJECT_BYTES {
+        return Err(ApiError::new(
+            "content_too_large",
+            "input file exceeds the MVP content upload limit",
+        ));
+    }
+    Ok(content)
+}
+
+fn write_file_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("biohazardfs-output");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = parent.join(format!(
+        ".{file_name}.biohazardfs-tmp-{}-{nonce}",
+        std::process::id()
+    ));
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp_path, path)?;
+        fs::remove_file(&temp_path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn validate_content_hash(value: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_ascii_lowercase();
+    let is_valid = value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if is_valid {
+        Ok(value)
+    } else {
+        Err(ApiError::new(
+            "invalid_content_hash",
+            "content hash must be a 64-character SHA-256 hex digest",
+        ))
+    }
+}
+
+fn hex_to_bytes(value: &str) -> Result<Vec<u8>, ApiError> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::new(
+            "invalid_content_encoding",
+            "server returned invalid content hex",
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| {
+                ApiError::new(
+                    "invalid_content_encoding",
+                    "server returned invalid content hex",
+                )
+            })
+        })
+        .collect()
+}
+
 fn validate_node_id_query_value(value: &str) -> Result<&str, ApiError> {
     let value = value.trim();
     let is_valid = !value.is_empty()
@@ -537,6 +958,16 @@ fn server_get_json(
     server_url: &str,
     path: &str,
     bearer_token: Option<&str>,
+) -> Result<(u16, serde_json::Value), ServerClientError> {
+    server_request_json("GET", server_url, path, bearer_token, &[])
+}
+
+fn server_request_json(
+    method: &'static str,
+    server_url: &str,
+    path: &str,
+    bearer_token: Option<&str>,
+    body: &[u8],
 ) -> Result<(u16, serde_json::Value), ServerClientError> {
     let endpoint = parse_http_endpoint(server_url, path)?;
     if bearer_token.is_some() && !is_loopback_http_host(&endpoint.host) {
@@ -600,16 +1031,30 @@ fn server_get_json(
         .unwrap_or_default();
     write!(
         stream,
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\n{}Connection: close\r\n\r\n",
-        endpoint.path, endpoint.host_header, auth_header
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        method,
+        endpoint.path,
+        endpoint.host_header,
+        auth_header,
+        body.len()
     )
     .map_err(server_io_error)?;
+    if !body.is_empty() {
+        stream.write_all(body).map_err(server_io_error)?;
+    }
     stream.flush().map_err(server_io_error)?;
 
     let mut response = String::new();
     stream
+        .take(MAX_SERVER_JSON_RESPONSE_BYTES + 1)
         .read_to_string(&mut response)
         .map_err(server_io_error)?;
+    if response.len() as u64 > MAX_SERVER_JSON_RESPONSE_BYTES {
+        return Err(ServerClientError {
+            code: "server_protocol_error",
+            message: "server JSON response exceeded the MVP client limit".to_string(),
+        });
+    }
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| ServerClientError {
@@ -746,6 +1191,8 @@ fn schema_json(command: SchemaCommand) -> String {
         "config.show".to_string(),
         "config.validate".to_string(),
         "namespace.children".to_string(),
+        "object.put".to_string(),
+        "object.get".to_string(),
         "schema.list".to_string(),
         "schema.command".to_string(),
     ];
