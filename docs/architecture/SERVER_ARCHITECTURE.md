@@ -285,7 +285,7 @@ Rules:
 - Destructive migrations require extra review and backup/rollback notes.
 - Self-hosted operators need clear migration instructions.
 
-Current MVP foundation: `biohazardfs-server migrate` uses the resolved shared config (`[database].url` or `BIOHAZARDFS_DATABASE_URL`) to apply bundled Postgres migrations and records applied versions in `schema_migrations`. `/readyz` uses the same resolved config to verify migration compatibility when a database URL is configured. Both paths fail closed with redacted JSON error envelopes when the database URL is missing/unusable or migrations cannot be verified. The current synchronous Postgres client supports explicit plaintext only, so self-hosted/local URLs must include `sslmode=disable` until TLS support is implemented. The baseline creates only metadata tables/indexes; object-store/file APIs are intentionally out of scope.
+Current MVP foundation: `biohazardfs-server migrate` uses the resolved shared config (`[database].url` or `BIOHAZARDFS_DATABASE_URL`) to apply bundled Postgres migrations and records applied versions in `schema_migrations`. `/readyz` uses the same resolved config to verify migration compatibility when a database URL is configured. Both paths fail closed with redacted JSON error envelopes when the database URL is missing/unusable or migrations cannot be verified. The current synchronous Postgres client supports explicit plaintext only, so self-hosted/local URLs must include `sslmode=disable` until TLS support is implemented. The baseline creates metadata tables/indexes, and `GET /api/v1/namespace/children` is the first authenticated read-only metadata API over that schema. Object-store/file transfer APIs are intentionally out of scope for this foundation.
 
 ## Docker packaging
 

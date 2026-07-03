@@ -5,13 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use biohazardfs_api_types::{
-    ApiError, PRODUCT_VERSION, SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck,
-    ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
+    ApiError, NamespaceChildrenResponse, NamespaceNodeSummary, PRODUCT_VERSION,
+    SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck, ServerResponseEnvelope, ServerState,
+    ServerStatus, ServerVersion, Source,
 };
 use biohazardfs_core::config::RuntimeConfig;
 use postgres::config::SslMode;
 use postgres::{Client, Config, NoTls};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_BIND_ADDR: &str = biohazardfs_core::config::DEFAULT_SERVER_BIND;
 pub const CONTAINER_BIND_ADDR: &str = "0.0.0.0:8080";
@@ -19,6 +21,8 @@ const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const DEFAULT_NAMESPACE_LIMIT: u32 = 100;
+const MAX_NAMESPACE_LIMIT: u32 = 500;
 const SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version TEXT PRIMARY KEY,
@@ -99,6 +103,17 @@ struct AppliedMigration {
     version: String,
     name: String,
     checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedSubject {
+    org_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamespaceChildrenQuery {
+    parent_node_id: Option<String>,
+    limit: u32,
 }
 
 pub fn server_status(mode: impl Into<String>) -> ServerStatus {
@@ -236,7 +251,16 @@ pub fn dispatch_http_path(path: &str) -> (u16, String) {
 }
 
 pub fn dispatch_http_path_with_config(path: &str, config: &RuntimeConfig) -> (u16, String) {
-    match path {
+    dispatch_http_request_with_config(path, &[], config)
+}
+
+fn dispatch_http_request_with_config(
+    path: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let (route_path, query) = split_path_and_query(path);
+    match route_path {
         "/healthz" | "/health" => json_response(
             200,
             &ServerResponseEnvelope::ok(
@@ -265,6 +289,7 @@ pub fn dispatch_http_path_with_config(path: &str, config: &RuntimeConfig) -> (u1
             200,
             &ServerResponseEnvelope::ok("server.status", server_status("serve"), Source::Server),
         ),
+        "/api/v1/namespace/children" => namespace_children_response(query, headers, config),
         _ => json_response(
             404,
             &ServerResponseEnvelope::<serde_json::Value>::error(
@@ -274,6 +299,248 @@ pub fn dispatch_http_path_with_config(path: &str, config: &RuntimeConfig) -> (u1
             ),
         ),
     }
+}
+
+fn namespace_children_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match namespace_children_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.namespace.children", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.namespace.children",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
+fn namespace_children_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<NamespaceChildrenResponse, (u16, ApiError)> {
+    let query = parse_namespace_children_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            ApiError::new(
+                error.code(),
+                "database is not configured for namespace requests",
+            ),
+        )
+    })?;
+    let mut client = connect_database(database_url).map_err(|error| {
+        (
+            503,
+            ApiError::new(
+                error.code(),
+                "database is unavailable for namespace requests",
+            ),
+        )
+    })?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    list_namespace_children(&mut client, &subject, query)
+}
+
+fn parse_namespace_children_query(query: &str) -> Result<NamespaceChildrenQuery, (u16, ApiError)> {
+    let mut parent_node_id = None;
+    let mut limit = DEFAULT_NAMESPACE_LIMIT;
+
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "parent" | "parent_node_id" if !value.trim().is_empty() => {
+                parent_node_id = Some(value.trim().to_string());
+            }
+            "limit" if !value.trim().is_empty() => {
+                let parsed = value.trim().parse::<u32>().map_err(|_| {
+                    (
+                        400,
+                        ApiError::new("invalid_limit", "limit must be a positive integer"),
+                    )
+                })?;
+                if parsed == 0 || parsed > MAX_NAMESPACE_LIMIT {
+                    return Err((
+                        400,
+                        ApiError::new(
+                            "invalid_limit",
+                            format!("limit must be between 1 and {MAX_NAMESPACE_LIMIT}"),
+                        ),
+                    ));
+                }
+                limit = parsed;
+            }
+            "parent" | "parent_node_id" | "limit" => {}
+            _ => {}
+        }
+    }
+
+    Ok(NamespaceChildrenQuery {
+        parent_node_id,
+        limit,
+    })
+}
+
+fn bearer_token(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| {
+            let value = value.trim();
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+        })
+}
+
+fn authenticate_subject(
+    client: &mut Client,
+    bearer: &str,
+) -> Result<AuthenticatedSubject, (u16, ApiError)> {
+    let secret_hash = secret_hash_for_token(bearer);
+    let rows = client
+        .query(
+            "SELECT t.org_id, t.user_id, t.scopes::text AS scopes_json
+             FROM tokens t
+             JOIN users u ON u.org_id = t.org_id AND u.user_id = t.user_id
+             JOIN organizations o ON o.org_id = t.org_id
+             WHERE t.secret_hash = $1
+               AND t.status = 'active'
+               AND (t.expires_at IS NULL OR t.expires_at > now())
+               AND t.revoked_at IS NULL
+               AND u.status = 'active'
+               AND o.status = 'active'
+             LIMIT 2",
+            &[&secret_hash],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("auth_store_unavailable", "could not verify bearer token"),
+            )
+        })?;
+
+    let Some(row) = rows.first() else {
+        return Err((
+            401,
+            ApiError::new("auth_invalid", "bearer token is not valid for this server"),
+        ));
+    };
+    if rows.len() > 1 {
+        return Err((
+            401,
+            ApiError::new(
+                "auth_ambiguous",
+                "bearer token is not valid for this server",
+            ),
+        ));
+    }
+
+    let scopes_json = row.get::<_, String>("scopes_json");
+    if !scopes_allow_namespace_read(&scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot read namespace metadata",
+            ),
+        ));
+    }
+
+    Ok(AuthenticatedSubject {
+        org_id: row.get("org_id"),
+    })
+}
+
+fn scopes_allow_namespace_read(scopes_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(scopes_json) else {
+        return false;
+    };
+    value.as_array().is_some_and(|scopes| {
+        scopes
+            .iter()
+            .filter_map(|scope| scope.as_str())
+            .any(|scope| {
+                matches!(
+                    scope,
+                    "*" | "namespace:read" | "namespace:*" | "server:read"
+                )
+            })
+    })
+}
+
+fn list_namespace_children(
+    client: &mut Client,
+    subject: &AuthenticatedSubject,
+    query: NamespaceChildrenQuery,
+) -> Result<NamespaceChildrenResponse, (u16, ApiError)> {
+    let parent = query.parent_node_id.as_deref();
+    let limit = i64::from(query.limit);
+    let rows = client
+        .query(
+            "SELECT node_id, parent_node_id, name, kind, current_version_id
+             FROM nodes
+             WHERE org_id = $1
+               AND deleted_at IS NULL
+               AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
+             ORDER BY lower(name), node_id
+             LIMIT $3",
+            &[&subject.org_id, &parent, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new(
+                    "namespace_store_unavailable",
+                    "could not list namespace children",
+                ),
+            )
+        })?;
+
+    Ok(NamespaceChildrenResponse {
+        parent_node_id: query.parent_node_id,
+        limit: query.limit,
+        nodes: rows
+            .into_iter()
+            .map(|row| NamespaceNodeSummary {
+                node_id: row.get("node_id"),
+                parent_node_id: row.get("parent_node_id"),
+                name: row.get("name"),
+                kind: row.get("kind"),
+                current_version_id: row.get("current_version_id"),
+            })
+            .collect(),
+    })
+}
+
+fn secret_hash_for_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("sha256:{hex}")
+}
+
+fn split_path_and_query(path: &str) -> (&str, &str) {
+    path.split_once('?').unwrap_or((path, ""))
 }
 
 pub fn run_migrations_from_env() -> Result<MigrationReport, MigrationError> {
@@ -548,11 +815,18 @@ fn migration_error_with_version(migration: &Migration, phase: &'static str) -> M
 }
 
 fn migrations() -> &'static [Migration] {
-    &[Migration {
-        version: "001",
-        name: "baseline",
-        sql: include_str!("../migrations/001_baseline.sql"),
-    }]
+    &[
+        Migration {
+            version: "001",
+            name: "baseline",
+            sql: include_str!("../migrations/001_baseline.sql"),
+        },
+        Migration {
+            version: "002",
+            name: "token_secret_hash_unique",
+            sql: include_str!("../migrations/002_token_secret_hash_unique.sql"),
+        },
+    ]
 }
 
 impl Migration {
@@ -641,12 +915,17 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
     let mut reader = BufReader::new(stream.try_clone()?);
     let request_line = read_limited_line(&mut reader, MAX_REQUEST_LINE_BYTES)?;
     let mut saw_end_headers = false;
+    let mut headers = Vec::new();
 
     for _ in 0..MAX_HEADERS {
         let header = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES)?;
-        if header.trim_end().is_empty() {
+        let header = header.trim_end();
+        if header.is_empty() {
             saw_end_headers = true;
             break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
 
@@ -677,7 +956,7 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
         return write_http_response(&mut stream, 405, &body);
     }
 
-    let (status_code, body) = dispatch_http_path_with_config(path, config);
+    let (status_code, body) = dispatch_http_request_with_config(path, &headers, config);
     write_http_response(&mut stream, status_code, &body)
 }
 
@@ -717,6 +996,9 @@ fn write_http_response(
 fn reason_phrase(status_code: u16) -> &'static str {
     match status_code {
         200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
@@ -834,6 +1116,31 @@ mod tests {
     }
 
     #[test]
+    fn bearer_token_hash_is_stable_and_secret_safe() {
+        let hash = secret_hash_for_token("smoke-token");
+        assert_eq!(
+            hash,
+            "sha256:811fc2dd0a6d4649f89e06cdf61ec8633f709140bcda5a1f56d724cbd548e014"
+        );
+        assert!(!hash.contains("smoke-token"));
+    }
+
+    #[test]
+    fn namespace_scope_parser_requires_read_scope() {
+        assert!(scopes_allow_namespace_read(r#"["namespace:read"]"#));
+        assert!(scopes_allow_namespace_read(r#"["*"]"#));
+        assert!(!scopes_allow_namespace_read(r#"["file:write"]"#));
+        assert!(!scopes_allow_namespace_read("not-json"));
+    }
+
+    #[test]
+    fn namespace_query_parses_parent_and_limit() {
+        let query = parse_namespace_children_query("parent=root&limit=3").expect("valid query");
+        assert_eq!(query.parent_node_id.as_deref(), Some("root"));
+        assert_eq!(query.limit, 3);
+    }
+
+    #[test]
     fn bundled_migration_has_required_mvp_tables() {
         let sql = migrations()[0].sql;
         for table in [
@@ -854,6 +1161,11 @@ mod tests {
             SCHEMA_MIGRATIONS_TABLE_SQL.contains("CREATE TABLE IF NOT EXISTS schema_migrations")
         );
         assert!(sql.contains("secret_hash TEXT NOT NULL"));
+        assert!(
+            migrations()[1]
+                .sql
+                .contains("CREATE UNIQUE INDEX tokens_secret_hash_unique")
+        );
         assert!(!sql.contains("raw_token"));
     }
 

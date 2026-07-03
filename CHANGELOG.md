@@ -25,6 +25,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Runnable `biohazardfs-server` scaffold with `serve`, `worker`, `migrate`, `health`, and `version` modes.
 - Postgres migration foundation for `biohazardfs-server migrate`, including the MVP metadata baseline tables and `schema_migrations` records.
 - TOML-backed database config for `biohazardfs-server migrate` and DB-backed `/readyz`, while keeping database URLs redacted and out of argv.
+- First authenticated Postgres-backed namespace read endpoint: `GET /api/v1/namespace/children`, backed by unique token hashes and org-scoped live-node filtering.
 - Server HTTP scaffold endpoints for `/healthz`, `/readyz`, `/version`, and `/api/v1/status`.
 - Server API scaffold reference documentation.
 - Linux client smoke script that verifies daemon, CLI, and Electron launch together over authenticated dev-loopback JSON-RPC.

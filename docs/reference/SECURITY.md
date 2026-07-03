@@ -33,6 +33,8 @@ Normal clients should not use:
 Token rules:
 
 - Store token hashes server-side where possible.
+- Current MVP server bearer tokens are stored as globally unique `sha256:<hex>` hashes in `tokens.secret_hash`; raw tokens must never be stored, logged, returned in JSON, or passed through argv.
+- Server metadata endpoints must check active token, active user, active organization, expiry, revocation, and scoped access before returning data.
 - Store local secrets in OS keyring when available.
 - Use owner-only fallback files only for dev/headless contexts.
 - Redact all secrets by default.

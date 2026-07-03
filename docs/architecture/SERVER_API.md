@@ -7,7 +7,7 @@ This document captures the currently runnable server API scaffold. It is intenti
 
 ## Scope
 
-The current server is a running foundation only. It does not yet implement auth, metadata persistence APIs, transfer authorization, workers, or object-storage operations. It does include the first Postgres migration foundation for MVP metadata tables.
+The current server is a running foundation only. It does not yet implement transfer authorization, workers, object-storage operations, or mutation APIs. It does include the first Postgres migration foundation for MVP metadata tables plus a read-only authenticated namespace listing endpoint over Postgres.
 
 It does establish:
 
@@ -15,6 +15,7 @@ It does establish:
 - distinct server response envelopes
 - a distinct server schema version
 - HTTP health/readiness/version/status endpoints
+- first authenticated read-only namespace metadata endpoint
 - server modes for `serve`, `worker`, `migrate`, `health`, `version`, and `config`
 - Docker, Compose, Helm, and CI smoke validation
 
@@ -84,6 +85,12 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 | `GET /readyz` | `server.ready` | Readiness check; returns degraded/not-ready when the resolved shared config contains a database URL and the server cannot verify the latest migration |
 | `GET /version` | `server.version` | Version and schema info |
 | `GET /api/v1/status` | `server.status` | Server/control-plane status |
+| `GET /api/v1/namespace/children` | `server.namespace.children` | Authenticated live child-node listing for the caller's organization |
+
+`GET /api/v1/namespace/children` requires `Authorization: Bearer <token>`. The server stores and compares token hashes in the globally unique `tokens.secret_hash` column using the current `sha256:<hex>` MVP format. The token must be active, unexpired, unrevoked, attached to an active user and organization, and include one of `namespace:read`, `namespace:*`, `server:read`, or `*` in its JSON `scopes` array. The endpoint returns only live nodes in that authenticated org and accepts optional query params:
+
+- `parent=<node_id>` or `parent_node_id=<node_id>`; omitted means root children where `parent_node_id IS NULL`
+- `limit=<n>`; default `100`, max `500`
 
 Compatibility aliases currently exist for early chart probes:
 
@@ -107,6 +114,12 @@ This script:
 3. Validates `/healthz`, `/readyz`, `/version`, and `/api/v1/status`.
 4. Validates `health`, `version`, `worker`, and the redacted missing-database error path for `migrate`.
 
+```bash
+scripts/ci/server-db-smoke.sh
+```
+
+This script uses live Postgres to validate migrations, TOML-only DB config, DB-backed readiness, smoke-seeded bearer-token auth, and `GET /api/v1/namespace/children` org/deleted-node filtering.
+
 ## Docker and Compose
 
 Docker image build:
@@ -127,14 +140,14 @@ The dev Compose stack includes:
 - `postgres`
 - `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
-The server migration command connects to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. Object storage remains scaffolded and no object/file APIs are implemented yet.
+The server migration and namespace-read paths connect to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. Object storage remains scaffolded and no object/file APIs are implemented yet.
 
 ## Next required server work
 
 Before claiming a real server MVP, implement:
 
 1. RustFS/S3-compatible object-store config validation and bucket checks.
-2. Auth/device enrollment endpoints.
-3. Server-side operation/idempotency APIs over the metadata foundation.
+2. Auth/device enrollment and bootstrap endpoints.
+3. Server-side metadata mutation and operation/idempotency APIs over the metadata foundation.
 4. Transfer authorization skeleton.
 5. Integration tests using live Postgres and S3-compatible storage.

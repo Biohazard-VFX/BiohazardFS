@@ -239,6 +239,22 @@ pub struct ServerVersion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceChildrenResponse {
+    pub parent_node_id: Option<String>,
+    pub limit: u32,
+    pub nodes: Vec<NamespaceNodeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceNodeSummary {
+    pub node_id: String,
+    pub parent_node_id: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub current_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerHealth {
     pub state: ServerState,
     pub checks: Vec<ServerHealthCheck>,
