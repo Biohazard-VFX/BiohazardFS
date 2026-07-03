@@ -272,6 +272,31 @@ pub struct ContentObjectGetResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileContentPutResponse {
+    pub node_id: String,
+    pub parent_node_id: Option<String>,
+    pub name: String,
+    pub version_id: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub storage_provider: String,
+    pub object_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileContentGetResponse {
+    pub node_id: String,
+    pub parent_node_id: Option<String>,
+    pub name: String,
+    pub version_id: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub storage_provider: String,
+    pub object_key: String,
+    pub content_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerHealth {
     pub state: ServerState,
     pub checks: Vec<ServerHealthCheck>,

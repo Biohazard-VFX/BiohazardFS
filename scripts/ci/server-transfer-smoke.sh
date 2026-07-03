@@ -24,7 +24,11 @@ cleanup() {
   docker rm -f "$RUSTFS_CONTAINER" >/dev/null 2>&1 || true
   rm -f /tmp/biohazardfs-transfer-put.json /tmp/biohazardfs-transfer-get.json \
     /tmp/biohazardfs-transfer-cli-put.json /tmp/biohazardfs-transfer-cli-get.json \
-    /tmp/biohazardfs-transfer-cli-input.txt /tmp/biohazardfs-transfer-cli-output.txt
+    /tmp/biohazardfs-transfer-cli-input.txt /tmp/biohazardfs-transfer-cli-output.txt \
+    /tmp/biohazardfs-transfer-file-put.json /tmp/biohazardfs-transfer-file-get.json \
+    /tmp/biohazardfs-transfer-file-output.txt /tmp/biohazardfs-transfer-cli-file-put.json \
+    /tmp/biohazardfs-transfer-cli-file-get.json /tmp/biohazardfs-transfer-cli-file-input.txt \
+    /tmp/biohazardfs-transfer-cli-file-output.txt
 }
 trap cleanup EXIT
 
@@ -133,7 +137,7 @@ INSERT INTO users (org_id, user_id, display_name, email, status)
 VALUES ('org_transfer', 'user_transfer', 'Transfer User', 'transfer@example.invalid', 'active');
 
 INSERT INTO tokens (org_id, token_id, user_id, kind, scopes, status, secret_hash)
-VALUES ('org_transfer', 'token_transfer', 'user_transfer', 'api', '["object:read", "object:write"]'::jsonb, 'active', :'token_hash');
+VALUES ('org_transfer', 'token_transfer', 'user_transfer', 'api', '["object:read", "object:write", "file:read", "file:write", "namespace:read"]'::jsonb, 'active', :'token_hash');
 SQL
 
 env -u BIOHAZARDFS_DATABASE_URL target/debug/biohazardfs-server --config "$CONFIG_FILE" --profile ci serve --addr "$SERVER_ENDPOINT" >"$SERVER_LOG" 2>&1 &
@@ -161,6 +165,7 @@ import hashlib
 import json
 from pathlib import Path
 import urllib.error
+import urllib.parse
 import urllib.request
 
 base = 'http://$SERVER_ENDPOINT'
@@ -199,7 +204,51 @@ assert get_payload['data']['content_hash'] == expected_hash, get_payload
 assert get_payload['data']['size_bytes'] == len(content), get_payload
 assert bytes.fromhex(get_payload['data']['content_hex']) == content, get_payload
 
-for text in (put_text, get_text):
+file_content = b'BiohazardFS metadata file smoke payload\nframe=0003\n'
+file_hash = hashlib.sha256(file_content).hexdigest()
+file_name = urllib.parse.quote('shot001_plate.txt')
+file_put_request = urllib.request.Request(
+    base + f'/api/v1/files/content?name={file_name}&source=cli',
+    data=file_content,
+    method='PUT',
+    headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/octet-stream'},
+)
+try:
+    with urllib.request.urlopen(file_put_request, timeout=5) as response:
+        file_put_text = response.read().decode()
+except urllib.error.HTTPError as error:
+    file_put_text = error.read().decode()
+    Path('/tmp/biohazardfs-transfer-file-put.json').write_text(file_put_text)
+    raise AssertionError(file_put_text) from error
+file_put_payload = json.loads(file_put_text)
+Path('/tmp/biohazardfs-transfer-file-put.json').write_text(file_put_text)
+assert file_put_payload['ok'] is True, file_put_payload
+assert file_put_payload['operation'] == 'server.files.content.put', file_put_payload
+assert file_put_payload['data']['name'] == 'shot001_plate.txt', file_put_payload
+assert file_put_payload['data']['content_hash'] == file_hash, file_put_payload
+assert file_put_payload['data']['size_bytes'] == len(file_content), file_put_payload
+node_id = file_put_payload['data']['node_id']
+
+file_get_request = urllib.request.Request(
+    base + '/api/v1/files/content?node_id=' + urllib.parse.quote(node_id),
+    headers={'Authorization': f'Bearer {token}'},
+)
+try:
+    with urllib.request.urlopen(file_get_request, timeout=5) as response:
+        file_get_text = response.read().decode()
+except urllib.error.HTTPError as error:
+    file_get_text = error.read().decode()
+    Path('/tmp/biohazardfs-transfer-file-get.json').write_text(file_get_text)
+    raise AssertionError(file_get_text) from error
+file_get_payload = json.loads(file_get_text)
+Path('/tmp/biohazardfs-transfer-file-get.json').write_text(file_get_text)
+assert file_get_payload['ok'] is True, file_get_payload
+assert file_get_payload['operation'] == 'server.files.content.get', file_get_payload
+assert file_get_payload['data']['node_id'] == node_id, file_get_payload
+assert file_get_payload['data']['content_hash'] == file_hash, file_get_payload
+assert bytes.fromhex(file_get_payload['data']['content_hex']) == file_content, file_get_payload
+
+for text in (put_text, get_text, file_put_text, file_get_text):
     assert token not in text, text
     assert '$POSTGRES_PASSWORD' not in text, text
     assert '$RUSTFS_ACCESS_KEY' not in text, text
@@ -241,22 +290,59 @@ BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
   target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci object get --sha256 "$CLI_HASH" --output /tmp/biohazardfs-transfer-cli-output.txt \
   >/tmp/biohazardfs-transfer-cli-get.json
 
+cat >/tmp/biohazardfs-transfer-cli-file-input.txt <<'EOF_CLI_FILE_INPUT'
+BiohazardFS CLI file workflow smoke payload
+frame=0004
+EOF_CLI_FILE_INPUT
+
+BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
+  env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci file put /tmp/biohazardfs-transfer-cli-file-input.txt --name cli-shot.txt \
+  >/tmp/biohazardfs-transfer-cli-file-put.json
+
+CLI_NODE_ID="$(python3 - <<'PY'
+import json
+from pathlib import Path
+payload = json.loads(Path('/tmp/biohazardfs-transfer-cli-file-put.json').read_text())
+assert payload['ok'] is True, payload
+assert payload['command'] == 'file.put', payload
+assert payload['data']['name'] == 'cli-shot.txt', payload
+print(payload['data']['node_id'])
+PY
+)"
+
+BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
+  env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci file get --node "$CLI_NODE_ID" --output /tmp/biohazardfs-transfer-cli-file-output.txt \
+  >/tmp/biohazardfs-transfer-cli-file-get.json
+
 python3 - <<PY
 import json
 from pathlib import Path
 put_text = Path('/tmp/biohazardfs-transfer-cli-put.json').read_text()
 get_text = Path('/tmp/biohazardfs-transfer-cli-get.json').read_text()
+file_put_text = Path('/tmp/biohazardfs-transfer-cli-file-put.json').read_text()
+file_get_text = Path('/tmp/biohazardfs-transfer-cli-file-get.json').read_text()
 put_payload = json.loads(put_text)
 get_payload = json.loads(get_text)
+file_put_payload = json.loads(file_put_text)
+file_get_payload = json.loads(file_get_text)
 assert put_payload['ok'] is True, put_payload
 assert get_payload['ok'] is True, get_payload
+assert file_put_payload['ok'] is True, file_put_payload
+assert file_get_payload['ok'] is True, file_get_payload
 assert put_payload['command'] == 'object.put', put_payload
 assert get_payload['command'] == 'object.get', get_payload
+assert file_put_payload['command'] == 'file.put', file_put_payload
+assert file_get_payload['command'] == 'file.get', file_get_payload
 assert put_payload['data']['content_hash'] == '$CLI_HASH', put_payload
 assert get_payload['data']['content_hash'] == '$CLI_HASH', get_payload
+assert file_get_payload['data']['node_id'] == '$CLI_NODE_ID', file_get_payload
 assert 'content_hex' not in get_text, get_text
+assert 'content_hex' not in file_get_text, file_get_text
 assert Path('/tmp/biohazardfs-transfer-cli-output.txt').read_bytes() == Path('/tmp/biohazardfs-transfer-cli-input.txt').read_bytes()
-for text in (put_text, get_text):
+assert Path('/tmp/biohazardfs-transfer-cli-file-output.txt').read_bytes() == Path('/tmp/biohazardfs-transfer-cli-file-input.txt').read_bytes()
+for text in (put_text, get_text, file_put_text, file_get_text):
     assert '$SMOKE_TOKEN' not in text, text
     assert '$POSTGRES_PASSWORD' not in text, text
     assert '$RUSTFS_ACCESS_KEY' not in text, text

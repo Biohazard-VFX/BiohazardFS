@@ -72,6 +72,11 @@ enum Command {
         #[command(subcommand)]
         command: ObjectCommand,
     },
+    /// Server-backed file workflow commands.
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
     /// Schema-introspection scaffold.
     Schema {
         #[command(subcommand)]
@@ -99,6 +104,30 @@ enum NamespaceCommand {
         /// Maximum number of children to return.
         #[arg(long, default_value_t = 100)]
         limit: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FileCommand {
+    /// Upload a local file and record/update a metadata file node.
+    Put {
+        /// Local file path to upload.
+        path: PathBuf,
+        /// Optional parent directory node ID. Omitted writes a root file.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Optional BiohazardFS file name. Defaults to the local file name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Download the current content of a metadata file node.
+    Get {
+        /// File node ID returned by file put or namespace children.
+        #[arg(long, alias = "node-id")]
+        node: String,
+        /// Local output file path to write; existing paths are not overwritten.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -156,6 +185,7 @@ fn main() -> ExitCode {
         Command::Config { command } => config_json(&cli, command),
         Command::Namespace { command } => namespace_json(&cli, command),
         Command::Object { command } => object_json(&cli, command),
+        Command::File { command } => file_json(&cli, command),
         Command::Schema { command } => (schema_json(command), EXIT_OK),
         Command::Commands => (schema_json(SchemaCommand::List), EXIT_OK),
     };
@@ -402,6 +432,253 @@ fn namespace_children_json(cli: &Cli, parent: Option<String>, limit: u32) -> (St
     }
 }
 
+fn file_json(cli: &Cli, command: FileCommand) -> (String, u8) {
+    match command {
+        FileCommand::Put { path, parent, name } => file_put_json(cli, path, parent, name),
+        FileCommand::Get { node, output } => file_get_json(cli, node, output),
+    }
+}
+
+fn file_put_json(
+    cli: &Cli,
+    path: PathBuf,
+    parent: Option<String>,
+    name: Option<String>,
+) -> (String, u8) {
+    let Some(token) = server_token() else {
+        return auth_required_json("file.put", "file APIs");
+    };
+    let file_name = match resolve_file_name(&path, name.as_deref()) {
+        Ok(name) => name,
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("file.put", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("file put name error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let parent = match parent
+        .as_deref()
+        .map(validate_node_id_query_value)
+        .transpose()
+    {
+        Ok(parent) => parent.map(str::to_string),
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("file.put", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("file put parent error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let loaded = match load_config(cli) {
+        Ok(loaded) => loaded,
+        Err(error) => return config_error_json("file.put", error),
+    };
+    let content = match read_bounded_input_file(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("file.put", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("file put read error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let local_hash = sha256_hex(&content);
+    let local_size = content.len() as u64;
+    let mut request_path = format!(
+        "/api/v1/files/content?name={}",
+        percent_encode_query_value(&file_name)
+    );
+    if let Some(parent) = parent.as_deref() {
+        request_path.push_str("&parent_node_id=");
+        request_path.push_str(&percent_encode_query_value(parent));
+    }
+    request_path.push_str("&source=cli");
+
+    match server_request_json(
+        "PUT",
+        &loaded.config.server.public_url,
+        &request_path,
+        Some(&token),
+        &content,
+    ) {
+        Ok((_status, payload)) if payload.get("ok").and_then(|ok| ok.as_bool()) == Some(true) => {
+            let mut data = payload
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let server_hash = data.get("content_hash").and_then(|value| value.as_str());
+            let server_size = data.get("size_bytes").and_then(|value| value.as_u64());
+            if server_hash != Some(local_hash.as_str()) || server_size != Some(local_size) {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "file.put",
+                        ApiError::new(
+                            "server_protocol_error",
+                            "server response did not match uploaded file hash and size",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("file put protocol error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            }
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "input_path".to_string(),
+                    serde_json::Value::String(path.to_string_lossy().to_string()),
+                );
+            }
+            let envelope = CommandResponseEnvelope::ok("file.put", data, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("file put serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok((status, payload)) => server_error_json("file.put", status, payload),
+        Err(error) => server_client_error_json("file.put", error),
+    }
+}
+
+fn file_get_json(cli: &Cli, node: String, output: PathBuf) -> (String, u8) {
+    let Some(token) = server_token() else {
+        return auth_required_json("file.get", "file APIs");
+    };
+    let node = match validate_node_id_query_value(&node) {
+        Ok(node) => node.to_string(),
+        Err(error) => {
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("file.get", error, Source::Cli);
+            return (
+                serde_json::to_string_pretty(&envelope).expect("file get node error serializes"),
+                EXIT_USAGE,
+            );
+        }
+    };
+    if fs::symlink_metadata(&output).is_ok() {
+        let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+            "file.get",
+            ApiError::new(
+                "output_exists",
+                "output path already exists; refusing to overwrite without an explicit overwrite command",
+            ),
+            Source::Cli,
+        );
+        return (
+            serde_json::to_string_pretty(&envelope).expect("file get exists error serializes"),
+            EXIT_USAGE,
+        );
+    }
+    let loaded = match load_config(cli) {
+        Ok(loaded) => loaded,
+        Err(error) => return config_error_json("file.get", error),
+    };
+    let request_path = format!(
+        "/api/v1/files/content?node_id={}",
+        percent_encode_query_value(&node)
+    );
+    match server_request_json(
+        "GET",
+        &loaded.config.server.public_url,
+        &request_path,
+        Some(&token),
+        &[],
+    ) {
+        Ok((_status, payload)) if payload.get("ok").and_then(|ok| ok.as_bool()) == Some(true) => {
+            let mut data = payload
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let Some(content_hex) = data.get("content_hex").and_then(|value| value.as_str()) else {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "file.get",
+                        ApiError::new(
+                            "server_protocol_error",
+                            "server response did not include content_hex",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("file get protocol error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            };
+            let content = match hex_to_bytes(content_hex) {
+                Ok(content) => content,
+                Err(error) => {
+                    let envelope: CommandResponseEnvelope<serde_json::Value> =
+                        CommandResponseEnvelope::error("file.get", error, Source::Cli);
+                    return (
+                        serde_json::to_string_pretty(&envelope)
+                            .expect("file get decode error serializes"),
+                        EXIT_SERVER_UNAVAILABLE,
+                    );
+                }
+            };
+            let server_hash = data
+                .get("content_hash")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if sha256_hex(&content) != server_hash {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "file.get",
+                        ApiError::new(
+                            "content_hash_mismatch",
+                            "downloaded file did not match server hash",
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("file get hash error serializes"),
+                    EXIT_SERVER_UNAVAILABLE,
+                );
+            }
+            if let Err(error) = write_file_atomically(&output, &content) {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error(
+                        "file.get",
+                        ApiError::new(
+                            "file_write_failed",
+                            format!("could not write output file: {error}"),
+                        ),
+                        Source::Cli,
+                    );
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("file get write error serializes"),
+                    EXIT_USAGE,
+                );
+            }
+            if let Some(object) = data.as_object_mut() {
+                object.remove("content_hex");
+                object.insert(
+                    "output_path".to_string(),
+                    serde_json::Value::String(output.to_string_lossy().to_string()),
+                );
+            }
+            let envelope = CommandResponseEnvelope::ok("file.get", data, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("file get serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok((status, payload)) => server_error_json("file.get", status, payload),
+        Err(error) => server_client_error_json("file.get", error),
+    }
+}
+
 fn object_json(cli: &Cli, command: ObjectCommand) -> (String, u8) {
     match command {
         ObjectCommand::Put { path } => object_put_json(cli, path),
@@ -636,7 +913,7 @@ fn server_error_json(
     } else if status == 404
         || matches!(
             error.code.as_str(),
-            "not_found" | "content_object_not_found"
+            "not_found" | "content_object_not_found" | "file_not_found" | "parent_not_found"
         )
     {
         EXIT_NOT_FOUND
@@ -812,6 +1089,50 @@ fn validate_namespace_limit(limit: u32) -> Result<(), ApiError> {
             format!("limit must be between 1 and {MAX_NAMESPACE_LIMIT}"),
         ))
     }
+}
+
+fn resolve_file_name(path: &Path, explicit_name: Option<&str>) -> Result<String, ApiError> {
+    let name = explicit_name
+        .map(str::to_string)
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| {
+            ApiError::new("file_name_required", "could not infer file name from path")
+        })?;
+    validate_file_name(&name)?;
+    Ok(name)
+}
+
+fn validate_file_name(name: &str) -> Result<(), ApiError> {
+    let is_valid = !name.trim().is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.bytes().any(|byte| byte.is_ascii_control());
+    if is_valid {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "invalid_file_name",
+            "file name is not valid for the MVP file API",
+        ))
+    }
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            output.push(char::from(byte));
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
 }
 
 fn read_bounded_input_file(path: &Path) -> Result<Vec<u8>, ApiError> {
@@ -1193,6 +1514,8 @@ fn schema_json(command: SchemaCommand) -> String {
         "namespace.children".to_string(),
         "object.put".to_string(),
         "object.get".to_string(),
+        "file.put".to_string(),
+        "file.get".to_string(),
         "schema.list".to_string(),
         "schema.command".to_string(),
     ];

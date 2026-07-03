@@ -31,6 +31,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Live RustFS object-store smoke coverage for signed bucket check/ensure behavior with credential redaction assertions.
 - First authenticated server content-object transfer endpoints: `PUT /api/v1/objects/content` and `GET /api/v1/objects/content?sha256=<hash>` backed by RustFS.
 - CLI content-object transfer commands: `biohazardfs object put <path>` and `biohazardfs object get --sha256 <hash> --output <path>`.
+- First metadata-backed file workflow: `PUT`/`GET /api/v1/files/content` plus `biohazardfs file put/get`, recording file nodes and current versions in Postgres while storing content in RustFS.
 - Server HTTP scaffold endpoints for `/healthz`, `/readyz`, `/version`, and `/api/v1/status`.
 - Server API scaffold reference documentation.
 - Linux client smoke script that verifies daemon, CLI, and Electron launch together over authenticated dev-loopback JSON-RPC.

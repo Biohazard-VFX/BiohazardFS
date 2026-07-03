@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use biohazardfs_api_types::{
-    ApiError, ContentObjectGetResponse, ContentObjectPutResponse, NamespaceChildrenResponse,
-    NamespaceNodeSummary, PRODUCT_VERSION, SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck,
-    ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
+    ApiError, ContentObjectGetResponse, ContentObjectPutResponse, FileContentGetResponse,
+    FileContentPutResponse, NamespaceChildrenResponse, NamespaceNodeSummary, PRODUCT_VERSION,
+    SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck, ServerResponseEnvelope, ServerState,
+    ServerStatus, ServerVersion, Source,
 };
 use biohazardfs_core::config::RuntimeConfig;
 use hmac::{Hmac, KeyInit, Mac};
@@ -160,7 +161,32 @@ struct AppliedMigration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedSubject {
     org_id: String,
+    user_id: String,
     scopes_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileContentPutQuery {
+    parent_node_id: Option<String>,
+    name: String,
+    source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileContentGetQuery {
+    node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRecord {
+    node_id: String,
+    parent_node_id: Option<String>,
+    name: String,
+    version_id: String,
+    content_hash: String,
+    size_bytes: u64,
+    storage_provider: String,
+    object_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +403,13 @@ fn dispatch_http_request_with_config(
     config: &RuntimeConfig,
 ) -> (u16, String) {
     let (route_path, query) = split_path_and_query(path);
-    if method != "GET" && !(method == "PUT" && route_path == "/api/v1/objects/content") {
+    if method != "GET"
+        && !(method == "PUT"
+            && matches!(
+                route_path,
+                "/api/v1/objects/content" | "/api/v1/files/content"
+            ))
+    {
         return json_response(
             405,
             &ServerResponseEnvelope::<serde_json::Value>::error(
@@ -429,17 +461,25 @@ fn dispatch_http_request_with_config(
         "/api/v1/objects/content" if method == "GET" => {
             content_object_get_response(query, headers, config)
         }
-        "/api/v1/namespace/children" | "/api/v1/objects/content" => json_response(
-            405,
-            &ServerResponseEnvelope::<serde_json::Value>::error(
-                "server.request",
-                ApiError::new(
-                    "method_not_allowed",
-                    "server endpoint does not support this method",
+        "/api/v1/files/content" if method == "PUT" => {
+            file_content_put_response(query, headers, body, config)
+        }
+        "/api/v1/files/content" if method == "GET" => {
+            file_content_get_response(query, headers, config)
+        }
+        "/api/v1/namespace/children" | "/api/v1/objects/content" | "/api/v1/files/content" => {
+            json_response(
+                405,
+                &ServerResponseEnvelope::<serde_json::Value>::error(
+                    "server.request",
+                    ApiError::new(
+                        "method_not_allowed",
+                        "server endpoint does not support this method",
+                    ),
+                    Source::Server,
                 ),
-                Source::Server,
-            ),
-        ),
+            )
+        }
         _ => json_response(
             404,
             &ServerResponseEnvelope::<serde_json::Value>::error(
@@ -506,6 +546,49 @@ fn namespace_children_payload(
     list_namespace_children(&mut client, &subject, query)
 }
 
+fn file_content_put_response(
+    query: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match file_content_put_payload(query, headers, body, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.files.content.put", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.files.content.put",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
+fn file_content_get_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match file_content_get_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.files.content.get", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.files.content.get",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
 fn content_object_put_response(
     headers: &[(String, String)],
     body: &[u8],
@@ -548,6 +631,111 @@ fn content_object_get_response(
     }
 }
 
+fn file_content_put_payload(
+    query: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> Result<FileContentPutResponse, (u16, ApiError)> {
+    let query = parse_file_content_put_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is not configured for file requests"),
+        )
+    })?;
+    let mut client = connect_database(database_url).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is unavailable for file requests"),
+        )
+    })?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_file_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot write file metadata",
+            ),
+        ));
+    }
+    preflight_file_content_write(&mut client, &subject, &query)?;
+
+    let stored = store_content_object(config, &subject.org_id, body)?;
+    let record = record_file_content(&mut client, &subject, query, &stored)?;
+    Ok(FileContentPutResponse {
+        node_id: record.node_id,
+        parent_node_id: record.parent_node_id,
+        name: record.name,
+        version_id: record.version_id,
+        content_hash: record.content_hash,
+        size_bytes: record.size_bytes,
+        storage_provider: record.storage_provider,
+        object_key: record.object_key,
+    })
+}
+
+fn file_content_get_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<FileContentGetResponse, (u16, ApiError)> {
+    let query = parse_file_content_get_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is not configured for file requests"),
+        )
+    })?;
+    let mut client = connect_database(database_url).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is unavailable for file requests"),
+        )
+    })?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_file_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot read file metadata",
+            ),
+        ));
+    }
+    let record = load_file_record(&mut client, &subject, &query.node_id)?;
+    let content = fetch_content_object(
+        config,
+        &subject.org_id,
+        &record.content_hash,
+        &record.object_key,
+    )?;
+    Ok(FileContentGetResponse {
+        node_id: record.node_id,
+        parent_node_id: record.parent_node_id,
+        name: record.name,
+        version_id: record.version_id,
+        content_hash: record.content_hash,
+        size_bytes: record.size_bytes,
+        storage_provider: record.storage_provider,
+        object_key: record.object_key,
+        content_hex: hex_lower(&content),
+    })
+}
+
 fn content_object_put_payload(
     headers: &[(String, String)],
     body: &[u8],
@@ -570,11 +758,410 @@ fn content_object_put_payload(
         ));
     }
 
+    store_content_object(config, &subject.org_id, body)
+}
+
+fn preflight_file_content_write(
+    client: &mut Client,
+    subject: &AuthenticatedSubject,
+    query: &FileContentPutQuery,
+) -> Result<(), (u16, ApiError)> {
+    if let Some(parent_node_id) = query.parent_node_id.as_deref() {
+        let parent_rows = client
+            .query(
+                "SELECT kind FROM nodes WHERE org_id = $1 AND node_id = $2 AND deleted_at IS NULL",
+                &[&subject.org_id, &parent_node_id],
+            )
+            .map_err(|_| {
+                (
+                    503,
+                    ApiError::new("file_store_unavailable", "could not verify parent node"),
+                )
+            })?;
+        let Some(parent) = parent_rows.first() else {
+            return Err((
+                404,
+                ApiError::new("parent_not_found", "parent directory was not found"),
+            ));
+        };
+        let kind: String = parent.get("kind");
+        if kind != "directory" {
+            return Err((
+                409,
+                ApiError::new("parent_not_directory", "parent node is not a directory"),
+            ));
+        }
+    }
+
+    let existing_rows = client
+        .query(
+            "SELECT kind FROM nodes
+             WHERE org_id = $1
+               AND deleted_at IS NULL
+               AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
+               AND lower(name) = lower($3)
+             LIMIT 1",
+            &[
+                &subject.org_id,
+                &query.parent_node_id.as_deref(),
+                &query.name,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("file_store_unavailable", "could not inspect file node"),
+            )
+        })?;
+    if let Some(existing) = existing_rows.first() {
+        let kind: String = existing.get("kind");
+        if kind != "file" {
+            return Err((
+                409,
+                ApiError::new("node_kind_conflict", "existing node is not a file"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn record_file_content(
+    client: &mut Client,
+    subject: &AuthenticatedSubject,
+    query: FileContentPutQuery,
+    stored: &ContentObjectPutResponse,
+) -> Result<FileRecord, (u16, ApiError)> {
+    let mut transaction = client.transaction().map_err(|_| {
+        (
+            503,
+            ApiError::new(
+                "file_store_unavailable",
+                "could not start file metadata update",
+            ),
+        )
+    })?;
+
+    if let Some(parent_node_id) = query.parent_node_id.as_deref() {
+        let parent_rows = transaction
+            .query(
+                "SELECT kind FROM nodes WHERE org_id = $1 AND node_id = $2 AND deleted_at IS NULL",
+                &[&subject.org_id, &parent_node_id],
+            )
+            .map_err(|_| {
+                (
+                    503,
+                    ApiError::new("file_store_unavailable", "could not verify parent node"),
+                )
+            })?;
+        let Some(parent) = parent_rows.first() else {
+            return Err((
+                404,
+                ApiError::new("parent_not_found", "parent directory was not found"),
+            ));
+        };
+        let kind: String = parent.get("kind");
+        if kind != "directory" {
+            return Err((
+                409,
+                ApiError::new("parent_not_directory", "parent node is not a directory"),
+            ));
+        }
+    }
+
+    let existing_rows = transaction
+        .query(
+            "SELECT node_id, kind FROM nodes
+             WHERE org_id = $1
+               AND deleted_at IS NULL
+               AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
+               AND lower(name) = lower($3)
+             LIMIT 1",
+            &[
+                &subject.org_id,
+                &query.parent_node_id.as_deref(),
+                &query.name,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("file_store_unavailable", "could not inspect file node"),
+            )
+        })?;
+    let node_id = if let Some(existing) = existing_rows.first() {
+        let kind: String = existing.get("kind");
+        if kind != "file" {
+            return Err((
+                409,
+                ApiError::new("node_kind_conflict", "existing node is not a file"),
+            ));
+        }
+        existing.get("node_id")
+    } else {
+        let node_id = stable_node_id(
+            &subject.org_id,
+            query.parent_node_id.as_deref(),
+            &query.name,
+        );
+        transaction
+            .execute(
+                "INSERT INTO nodes (org_id, node_id, parent_node_id, name, kind, owner_user_id, created_by, updated_by)
+                 VALUES ($1, $2, $3, $4, 'file', $5, $5, $5)",
+                &[
+                    &subject.org_id,
+                    &node_id,
+                    &query.parent_node_id.as_deref(),
+                    &query.name,
+                    &subject.user_id,
+                ],
+            )
+            .map_err(|_| {
+                (
+                    503,
+                    ApiError::new("file_store_unavailable", "could not create file node"),
+                )
+            })?;
+        node_id
+    };
+
+    let content_manifest_id = format!("cm_{}", stored.content_hash);
+    let size_bytes_i64 = i64::try_from(stored.size_bytes).map_err(|_| {
+        (
+            400,
+            ApiError::new("content_too_large", "content size exceeds database limits"),
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO content_manifests
+               (org_id, content_manifest_id, content_hash, size_bytes, storage_provider, object_key, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (org_id, content_manifest_id) DO NOTHING",
+            &[
+                &subject.org_id,
+                &content_manifest_id,
+                &stored.content_hash,
+                &size_bytes_i64,
+                &stored.storage_provider,
+                &stored.object_key,
+                &subject.user_id,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("file_store_unavailable", "could not record content manifest"),
+            )
+        })?;
+
+    let version_id = generated_id("ver");
+    let operation_id: Option<String> = None;
+    let parent_version_id: Option<String> = transaction
+        .query_opt(
+            "SELECT current_version_id FROM nodes WHERE org_id = $1 AND node_id = $2",
+            &[&subject.org_id, &node_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new(
+                    "file_store_unavailable",
+                    "could not inspect current file version",
+                ),
+            )
+        })?
+        .and_then(|row| row.get("current_version_id"));
+    transaction
+        .execute(
+            "INSERT INTO file_versions
+               (org_id, version_id, node_id, parent_version_id, content_manifest_id, content_hash, size_bytes, created_by, source, operation_id, metadata_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '{}'::jsonb)",
+            &[
+                &subject.org_id,
+                &version_id,
+                &node_id,
+                &parent_version_id,
+                &content_manifest_id,
+                &stored.content_hash,
+                &size_bytes_i64,
+                &subject.user_id,
+                &query.source,
+                &operation_id,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("file_store_unavailable", "could not record file version"),
+            )
+        })?;
+    transaction
+        .execute(
+            "UPDATE nodes
+             SET current_version_id = $3, updated_at = now(), updated_by = $4
+             WHERE org_id = $1 AND node_id = $2",
+            &[&subject.org_id, &node_id, &version_id, &subject.user_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new(
+                    "file_store_unavailable",
+                    "could not update current file version",
+                ),
+            )
+        })?;
+    transaction.commit().map_err(|_| {
+        (
+            503,
+            ApiError::new(
+                "file_store_unavailable",
+                "could not commit file metadata update",
+            ),
+        )
+    })?;
+
+    Ok(FileRecord {
+        node_id,
+        parent_node_id: query.parent_node_id,
+        name: query.name,
+        version_id,
+        content_hash: stored.content_hash.clone(),
+        size_bytes: stored.size_bytes,
+        storage_provider: stored.storage_provider.clone(),
+        object_key: stored.object_key.clone(),
+    })
+}
+
+fn load_file_record(
+    client: &mut Client,
+    subject: &AuthenticatedSubject,
+    node_id: &str,
+) -> Result<FileRecord, (u16, ApiError)> {
+    let rows = client
+        .query(
+            "SELECT n.node_id, n.parent_node_id, n.name, fv.version_id, fv.content_hash, fv.size_bytes, cm.storage_provider, cm.object_key
+             FROM nodes n
+             JOIN file_versions fv ON fv.org_id = n.org_id AND fv.version_id = n.current_version_id
+             JOIN content_manifests cm ON cm.org_id = fv.org_id AND cm.content_manifest_id = fv.content_manifest_id
+             WHERE n.org_id = $1 AND n.node_id = $2 AND n.kind = 'file' AND n.deleted_at IS NULL
+             LIMIT 1",
+            &[&subject.org_id, &node_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("file_store_unavailable", "could not read file metadata"),
+            )
+        })?;
+    let Some(row) = rows.first() else {
+        return Err((
+            404,
+            ApiError::new("file_not_found", "file node was not found"),
+        ));
+    };
+    let size_bytes: i64 = row.get("size_bytes");
+    Ok(FileRecord {
+        node_id: row.get("node_id"),
+        parent_node_id: row.get("parent_node_id"),
+        name: row.get("name"),
+        version_id: row.get("version_id"),
+        content_hash: row.get("content_hash"),
+        size_bytes: size_bytes as u64,
+        storage_provider: row.get("storage_provider"),
+        object_key: row.get("object_key"),
+    })
+}
+
+fn fetch_content_object(
+    config: &RuntimeConfig,
+    org_id: &str,
+    content_hash: &str,
+    object_key: &str,
+) -> Result<Vec<u8>, (u16, ApiError)> {
+    object_store_check_payload_with_config(config)
+        .map_err(|error| object_store_api_error(error, "object-store bucket is unavailable"))?;
+    validate_sha256_hex(content_hash).map_err(|error| (400, error))?;
+    let deterministic_key = content_object_key(org_id, content_hash);
+    if object_key != deterministic_key {
+        return Err((
+            502,
+            ApiError::new(
+                "content_object_key_mismatch",
+                "file metadata does not match object key",
+            ),
+        ));
+    }
+    let request = ObjectStoreRequest::from_config(config, "GET")
+        .and_then(|request| {
+            request.with_object_payload(object_key.to_string(), EMPTY_PAYLOAD_SHA256.to_string(), 0)
+        })
+        .map_err(|error| {
+            object_store_api_error(error, "object-store get request could not be built")
+        })?;
+    let (response, body) = send_signed_object_store_request_for_body(&request)
+        .map_err(|error| object_store_api_error(error, "object-store get request failed"))?;
+    if response.status == 404 {
+        return Err((
+            404,
+            ApiError::new("content_object_not_found", "content object was not found"),
+        ));
+    }
+    if response.status == 401 || response.status == 403 {
+        return Err((
+            403,
+            ApiError::new(
+                "object_store_auth_failed",
+                "object-store rejected configured credentials",
+            ),
+        ));
+    }
+    if response.status != 200 {
+        return Err((
+            503,
+            ApiError::new(
+                "object_store_get_failed",
+                "object-store could not read content object",
+            ),
+        ));
+    }
+    if sha256_hex(&body) != content_hash {
+        return Err((
+            502,
+            ApiError::new(
+                "content_hash_mismatch",
+                "downloaded content did not match file metadata hash",
+            ),
+        ));
+    }
+    Ok(body)
+}
+
+fn stable_node_id(org_id: &str, parent_node_id: Option<&str>, name: &str) -> String {
+    let seed = format!(
+        "{org_id}\n{}\n{}",
+        parent_node_id.unwrap_or(""),
+        name.to_ascii_lowercase()
+    );
+    format!("node_{}", &sha256_hex(seed.as_bytes())[..32])
+}
+
+fn generated_id(prefix: &str) -> String {
+    let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let seed = format!("{prefix}:{now}:{}", std::process::id());
+    format!("{prefix}_{}", &sha256_hex(seed.as_bytes())[..32])
+}
+
+fn store_content_object(
+    config: &RuntimeConfig,
+    org_id: &str,
+    body: &[u8],
+) -> Result<ContentObjectPutResponse, (u16, ApiError)> {
     object_store_check_payload_with_config(config)
         .map_err(|error| object_store_api_error(error, "object-store bucket is unavailable"))?;
 
     let content_hash = sha256_hex(body);
-    let object_key = content_object_key(&subject.org_id, &content_hash);
+    let object_key = content_object_key(org_id, &content_hash);
     let request = ObjectStoreRequest::from_config(config, "PUT")
         .and_then(|request| {
             request.with_object_payload(object_key.clone(), content_hash.clone(), body.len())
@@ -757,6 +1344,171 @@ fn parse_content_hash_query(query: &str) -> Result<String, (u16, ApiError)> {
     ))
 }
 
+fn parse_file_content_put_query(query: &str) -> Result<FileContentPutQuery, (u16, ApiError)> {
+    let mut parent_node_id = None;
+    let mut name = None;
+    let mut source = "cli".to_string();
+
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "parent" | "parent_node_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_node_id_value(&decoded)?;
+                parent_node_id = Some(decoded);
+            }
+            "name" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_file_name(&decoded)?;
+                name = Some(decoded);
+            }
+            "source" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_file_source(&decoded)?;
+                source = decoded;
+            }
+            "parent" | "parent_node_id" | "name" | "source" => {}
+            _ => {}
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        (
+            400,
+            ApiError::new("file_name_required", "name query parameter is required"),
+        )
+    })?;
+    Ok(FileContentPutQuery {
+        parent_node_id,
+        name,
+        source,
+    })
+}
+
+fn parse_file_content_get_query(query: &str) -> Result<FileContentGetQuery, (u16, ApiError)> {
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if (key == "node" || key == "node_id") && !value.trim().is_empty() {
+            let node_id = percent_decode_query_value(value)?;
+            validate_node_id_value(&node_id)?;
+            return Ok(FileContentGetQuery { node_id });
+        }
+    }
+    Err((
+        400,
+        ApiError::new("node_id_required", "node_id query parameter is required"),
+    ))
+}
+
+fn percent_decode_query_value(value: &str) -> Result<String, (u16, ApiError)> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err((
+                        400,
+                        ApiError::new(
+                            "invalid_query_encoding",
+                            "query parameter is not valid percent encoding",
+                        ),
+                    ));
+                }
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| {
+                    (
+                        400,
+                        ApiError::new(
+                            "invalid_query_encoding",
+                            "query parameter is not valid percent encoding",
+                        ),
+                    )
+                })?;
+                let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                    (
+                        400,
+                        ApiError::new(
+                            "invalid_query_encoding",
+                            "query parameter is not valid percent encoding",
+                        ),
+                    )
+                })?;
+                output.push(byte);
+                index += 3;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).map_err(|_| {
+        (
+            400,
+            ApiError::new(
+                "invalid_query_encoding",
+                "query parameter is not valid UTF-8",
+            ),
+        )
+    })
+}
+
+fn validate_file_name(name: &str) -> Result<(), (u16, ApiError)> {
+    let is_valid = !name.trim().is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.bytes().any(|byte| byte.is_ascii_control());
+    if is_valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new(
+                "invalid_file_name",
+                "file name is not valid for the MVP file API",
+            ),
+        ))
+    }
+}
+
+fn validate_node_id_value(node_id: &str) -> Result<(), (u16, ApiError)> {
+    let is_valid = !node_id.trim().is_empty()
+        && node_id.len() <= 128
+        && node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'));
+    if is_valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new(
+                "invalid_node_id",
+                "node_id is not valid for the MVP file API",
+            ),
+        ))
+    }
+}
+
+fn validate_file_source(source: &str) -> Result<(), (u16, ApiError)> {
+    if matches!(source, "ui" | "cli" | "agent" | "api" | "server" | "test") {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new("invalid_source", "source is not valid for file operations"),
+        ))
+    }
+}
+
 fn parse_namespace_children_query(query: &str) -> Result<NamespaceChildrenQuery, (u16, ApiError)> {
     let mut parent_node_id = None;
     let mut limit = DEFAULT_NAMESPACE_LIMIT;
@@ -855,6 +1607,7 @@ fn authenticate_subject(
 
     Ok(AuthenticatedSubject {
         org_id: row.get("org_id"),
+        user_id: row.get("user_id"),
         scopes_json: row.get("scopes_json"),
     })
 }
@@ -869,15 +1622,35 @@ fn scopes_allow_namespace_read(scopes_json: &str) -> bool {
 fn scopes_allow_object_read(scopes_json: &str) -> bool {
     scopes_allow_any(
         scopes_json,
-        &["object:read", "object:*", "file:read", "server:read"],
+        &[
+            "object:read",
+            "object:*",
+            "file:read",
+            "file:*",
+            "server:read",
+        ],
     )
 }
 
 fn scopes_allow_object_write(scopes_json: &str) -> bool {
     scopes_allow_any(
         scopes_json,
-        &["object:write", "object:*", "file:write", "server:write"],
+        &[
+            "object:write",
+            "object:*",
+            "file:write",
+            "file:*",
+            "server:write",
+        ],
     )
+}
+
+fn scopes_allow_file_read(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["file:read", "file:*", "server:read"])
+}
+
+fn scopes_allow_file_write(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["file:write", "file:*", "server:write"])
 }
 
 fn scopes_allow_any(scopes_json: &str, allowed_scopes: &[&str]) -> bool {
@@ -1970,7 +2743,11 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
     }
 
     let (route_path, _) = split_path_and_query(path);
-    let should_read_body = method == "PUT" && route_path == "/api/v1/objects/content";
+    let should_read_body = method == "PUT"
+        && matches!(
+            route_path,
+            "/api/v1/objects/content" | "/api/v1/files/content"
+        );
     let body_bytes = if should_read_body {
         reader
             .get_mut()

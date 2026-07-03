@@ -160,6 +160,8 @@ biohazardfs config validate
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object put ./file.bin
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <hash> --output ./file.bin
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot001.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --output ./shot001.exr
 biohazardfs schema list
 biohazardfs schema command daemon.status
 ```

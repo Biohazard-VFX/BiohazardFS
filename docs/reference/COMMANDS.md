@@ -369,6 +369,22 @@ Rules:
 - `object.get` downloads through the server content-object API, verifies/writes the requested object to `--output`, removes the server `content_hex` payload from CLI output, and returns metadata plus `output_path`.
 - These commands are content-object primitives, not final user-facing file-version mutation commands.
 
+## File workflow commands
+
+First metadata-backed file commands:
+
+```bash
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot001.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --output ./shot001.exr
+```
+
+Rules:
+
+- `file put` uploads bounded local content through the server, stores the object in RustFS, and records/updates a Postgres file node plus current file version.
+- `file get` resolves the current file version by node ID, downloads the server-verified object, verifies the decoded content hash locally, strips `content_hex` from CLI output, and refuses to overwrite existing output paths.
+- Server bearer tokens still come only from `BIOHAZARDFS_SERVER_TOKEN`; the MVP HTTP client still sends bearer tokens only to resolved loopback HTTP URLs until HTTPS lands.
+- This is a smokeable current-version workflow, not the final conflict-resolution/sync protocol.
+
 ## Schema introspection commands
 
 Agents must be able to discover the command surface without reading Markdown docs.
