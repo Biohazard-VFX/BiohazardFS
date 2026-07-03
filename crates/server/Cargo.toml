@@ -16,7 +16,9 @@ path = "src/main.rs"
 biohazardfs-api-types = { path = "../api-types" }
 biohazardfs-core = { path = "../core" }
 clap.workspace = true
+hmac = "0.13"
 postgres = "0.19"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
+time = { version = "0.3", features = ["formatting", "macros"] }

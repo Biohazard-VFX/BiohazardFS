@@ -194,6 +194,8 @@ The current skills are intentionally stubs, not authoritative operational instru
 scripts/ci/static-analysis.sh
 scripts/ci/client-smoke.sh
 scripts/ci/server-smoke.sh
+scripts/ci/server-db-smoke.sh
+scripts/ci/object-store-smoke.sh
 ```
 
 The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-hosted storage direction:
@@ -202,7 +204,7 @@ The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-
 docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
 ```
 
-CI runs the full Linux suite, Electron build/smoke, server smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
+CI runs the full Linux suite, Electron build/smoke, server smoke, Postgres DB smoke, RustFS object-store smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 

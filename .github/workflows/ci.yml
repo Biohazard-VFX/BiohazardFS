@@ -80,6 +80,9 @@ jobs:
       - name: Server DB smoke
         run: bash scripts/ci/server-db-smoke.sh
 
+      - name: Object store smoke
+        run: bash scripts/ci/object-store-smoke.sh
+
       - name: Docker server image build
         run: docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:ci .
 

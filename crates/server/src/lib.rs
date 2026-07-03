@@ -1,5 +1,5 @@
 use std::io::{BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -10,10 +10,14 @@ use biohazardfs_api_types::{
     ServerStatus, ServerVersion, Source,
 };
 use biohazardfs_core::config::RuntimeConfig;
+use hmac::{Hmac, KeyInit, Mac};
 use postgres::config::SslMode;
 use postgres::{Client, Config, NoTls};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::FormatItem;
+use time::macros::format_description;
 
 pub const DEFAULT_BIND_ADDR: &str = biohazardfs_core::config::DEFAULT_SERVER_BIND;
 pub const CONTAINER_BIND_ADDR: &str = "0.0.0.0:8080";
@@ -23,6 +27,16 @@ const MAX_HEADERS: usize = 64;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const DEFAULT_NAMESPACE_LIMIT: u32 = 100;
 const MAX_NAMESPACE_LIMIT: u32 = 500;
+const DEFAULT_OBJECT_STORE_REGION: &str = "us-east-1";
+const EMPTY_PAYLOAD_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const AWS4_REQUEST: &str = "aws4_request";
+const S3_SERVICE: &str = "s3";
+const AWS_DATE_FORMAT: &[FormatItem<'_>] = format_description!("[year][month][day]");
+const AWS_DATETIME_FORMAT: &[FormatItem<'_>] =
+    format_description!("[year][month][day]T[hour][minute][second]Z");
+type HmacSha256 = Hmac<Sha256>;
+
 const SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version TEXT PRIMARY KEY,
@@ -50,6 +64,42 @@ pub struct MigrationSummary {
     pub version: String,
     pub name: String,
     pub checksum: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectStoreCheckReport {
+    pub name: String,
+    pub provider: String,
+    pub endpoint_configured: bool,
+    pub bucket: String,
+    pub region: String,
+    pub credentials_configured: bool,
+    pub status: String,
+    pub http_status: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStoreError {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl ObjectStoreError {
+    fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    pub fn into_api_error(self) -> ApiError {
+        ApiError::new(self.code, self.message)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +293,68 @@ pub fn worker_payload() -> serde_json::Value {
         "status": "scaffold_ready",
         "queues": []
     })
+}
+
+pub fn object_store_check_payload_with_config(
+    config: &RuntimeConfig,
+) -> Result<ObjectStoreCheckReport, ObjectStoreError> {
+    let request = ObjectStoreRequest::from_config(config, "HEAD")?;
+    let response = send_signed_object_store_request(&request)?;
+    if response.status == 200 {
+        Ok(request.report("bucket_available", response.status))
+    } else if response.status == 404 {
+        Err(ObjectStoreError::new(
+            "object_store_bucket_missing",
+            "configured object-store bucket does not exist",
+        ))
+    } else if response.status == 403 || response.status == 401 {
+        Err(ObjectStoreError::new(
+            "object_store_auth_failed",
+            "object-store rejected configured credentials",
+        ))
+    } else {
+        Err(ObjectStoreError::new(
+            "object_store_unavailable",
+            "object-store bucket check failed",
+        ))
+    }
+}
+
+pub fn object_store_ensure_bucket_payload_with_config(
+    config: &RuntimeConfig,
+) -> Result<ObjectStoreCheckReport, ObjectStoreError> {
+    match object_store_check_payload_with_config(config) {
+        Ok(report) => Ok(report),
+        Err(error) if error.code == "object_store_bucket_missing" => {
+            let request = ObjectStoreRequest::from_config(config, "PUT")?;
+            let response = send_signed_object_store_request(&request)?;
+            if response.status == 200 {
+                Ok(request.report("bucket_available", response.status))
+            } else if response.status == 409 {
+                let check_request = ObjectStoreRequest::from_config(config, "HEAD")?;
+                let check_response = send_signed_object_store_request(&check_request)?;
+                if check_response.status == 200 {
+                    Ok(check_request.report("bucket_available", check_response.status))
+                } else {
+                    Err(ObjectStoreError::new(
+                        "object_store_bucket_conflict",
+                        "object-store bucket name is not usable by the configured credentials",
+                    ))
+                }
+            } else if response.status == 403 || response.status == 401 {
+                Err(ObjectStoreError::new(
+                    "object_store_auth_failed",
+                    "object-store rejected configured credentials",
+                ))
+            } else {
+                Err(ObjectStoreError::new(
+                    "object_store_unavailable",
+                    "object-store bucket creation failed",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn dispatch_http_path(path: &str) -> (u16, String) {
@@ -537,6 +649,449 @@ fn secret_hash_for_token(token: &str) -> String {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     format!("sha256:{hex}")
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ObjectStoreRequest {
+    method: &'static str,
+    provider: String,
+    endpoint: ObjectStoreEndpoint,
+    bucket: String,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl ObjectStoreRequest {
+    fn from_config(config: &RuntimeConfig, method: &'static str) -> Result<Self, ObjectStoreError> {
+        let endpoint = config
+            .object_store
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| {
+                ObjectStoreError::new(
+                    "object_store_endpoint_missing",
+                    "object-store endpoint is not configured",
+                )
+            })
+            .and_then(parse_object_store_endpoint)?;
+        let bucket = config
+            .object_store
+            .bucket
+            .as_deref()
+            .ok_or_else(|| {
+                ObjectStoreError::new(
+                    "object_store_bucket_missing_config",
+                    "object-store bucket is not configured",
+                )
+            })?
+            .trim();
+        validate_bucket_name(bucket)?;
+        let access_key_id = config
+            .object_store
+            .access_key_id_for_process_boundary()
+            .ok_or_else(|| {
+                ObjectStoreError::new(
+                    "object_store_access_key_missing",
+                    "object-store access key ID is not configured",
+                )
+            })?
+            .expose_for_process_boundary()
+            .to_string();
+        validate_access_key_id(&access_key_id)?;
+        let secret_access_key = config
+            .object_store
+            .secret_access_key
+            .as_ref()
+            .ok_or_else(|| {
+                ObjectStoreError::new(
+                    "object_store_secret_missing",
+                    "object-store secret access key is not configured",
+                )
+            })?
+            .expose_for_process_boundary()
+            .to_string();
+        let region = config
+            .object_store
+            .region
+            .as_deref()
+            .filter(|region| !region.trim().is_empty())
+            .unwrap_or(DEFAULT_OBJECT_STORE_REGION)
+            .trim()
+            .to_string();
+        validate_region(&region)?;
+
+        Ok(Self {
+            method,
+            provider: config.object_store.provider.clone(),
+            endpoint,
+            bucket: bucket.to_string(),
+            region,
+            access_key_id,
+            secret_access_key,
+        })
+    }
+
+    fn report(&self, status: impl Into<String>, http_status: u16) -> ObjectStoreCheckReport {
+        ObjectStoreCheckReport {
+            name: "object_store".to_string(),
+            provider: self.provider.clone(),
+            endpoint_configured: true,
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            credentials_configured: true,
+            status: status.into(),
+            http_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectStoreEndpoint {
+    host: String,
+    host_header: String,
+    port: u16,
+    canonical_bucket_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectStoreHttpResponse {
+    status: u16,
+}
+
+fn parse_object_store_endpoint(endpoint: &str) -> Result<ObjectStoreEndpoint, ObjectStoreError> {
+    let rest = endpoint.trim().strip_prefix("http://").ok_or_else(|| {
+        ObjectStoreError::new(
+            "object_store_endpoint_unsupported",
+            "object-store endpoint must start with http:// until server TLS support lands",
+        )
+    })?;
+    if rest
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b' ')
+        || rest.contains('@')
+    {
+        return Err(ObjectStoreError::new(
+            "object_store_endpoint_invalid",
+            "object-store endpoint authority or path contains invalid characters",
+        ));
+    }
+    let (authority, base_path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port, host_header) = parse_object_store_authority(authority)?;
+    if host.trim().is_empty() {
+        return Err(ObjectStoreError::new(
+            "object_store_endpoint_invalid",
+            "object-store endpoint host is empty",
+        ));
+    }
+    if !is_internal_http_object_store_host(&host) {
+        return Err(ObjectStoreError::new(
+            "object_store_endpoint_insecure",
+            "http object-store endpoints must use loopback, private IPs, or internal service names until TLS support lands",
+        ));
+    }
+    let base_path = base_path.trim_matches('/');
+    let valid_base_path = base_path.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~')
+    });
+    if !valid_base_path
+        || base_path.contains('?')
+        || base_path.contains('#')
+        || base_path.contains("..")
+    {
+        return Err(ObjectStoreError::new(
+            "object_store_endpoint_invalid",
+            "object-store endpoint path is invalid",
+        ));
+    }
+    Ok(ObjectStoreEndpoint {
+        host,
+        host_header,
+        port,
+        canonical_bucket_prefix: base_path.to_string(),
+    })
+}
+
+fn parse_object_store_authority(
+    authority: &str,
+) -> Result<(String, u16, String), ObjectStoreError> {
+    if let Some(without_opening_bracket) = authority.strip_prefix('[') {
+        let (host, after_host) = without_opening_bracket.split_once(']').ok_or_else(|| {
+            ObjectStoreError::new(
+                "object_store_endpoint_invalid",
+                "object-store IPv6 endpoint is missing a closing bracket",
+            )
+        })?;
+        let port = match after_host.strip_prefix(':') {
+            Some(port) => parse_object_store_port(port)?,
+            None if after_host.is_empty() => 80,
+            None => {
+                return Err(ObjectStoreError::new(
+                    "object_store_endpoint_invalid",
+                    "object-store IPv6 endpoint has invalid authority syntax",
+                ));
+            }
+        };
+        return Ok((host.to_string(), port, authority.to_string()));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Ok((
+            host.to_string(),
+            parse_object_store_port(port)?,
+            authority.to_string(),
+        )),
+        None => Ok((authority.to_string(), 80, authority.to_string())),
+    }
+}
+
+fn is_internal_http_object_store_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_internal_object_store_ip(ip);
+    }
+    let is_safe_dns_char = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.');
+    let is_safe_name = !host.is_empty() && host.bytes().all(is_safe_dns_char);
+    is_safe_name
+        && (!host.contains('.')
+            || host.ends_with(".local")
+            || host.ends_with(".svc")
+            || host.ends_with(".svc.cluster.local"))
+}
+
+fn is_internal_object_store_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    }
+}
+
+fn parse_object_store_port(port: &str) -> Result<u16, ObjectStoreError> {
+    port.parse::<u16>().map_err(|_| {
+        ObjectStoreError::new(
+            "object_store_endpoint_invalid",
+            "object-store endpoint port is not valid",
+        )
+    })
+}
+
+fn validate_access_key_id(access_key_id: &str) -> Result<(), ObjectStoreError> {
+    let is_valid = !access_key_id.trim().is_empty()
+        && access_key_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'=' | b',' | b'@')
+        });
+    if is_valid {
+        Ok(())
+    } else {
+        Err(ObjectStoreError::new(
+            "object_store_access_key_invalid",
+            "object-store access key ID contains invalid characters",
+        ))
+    }
+}
+
+fn validate_region(region: &str) -> Result<(), ObjectStoreError> {
+    let is_valid = !region.trim().is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if is_valid {
+        Ok(())
+    } else {
+        Err(ObjectStoreError::new(
+            "object_store_region_invalid",
+            "object-store region contains invalid characters",
+        ))
+    }
+}
+
+fn validate_bucket_name(bucket: &str) -> Result<(), ObjectStoreError> {
+    let valid_length = (3..=63).contains(&bucket.len());
+    let valid_chars = bucket.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+    });
+    let valid_edges = !bucket.starts_with(['.', '-']) && !bucket.ends_with(['.', '-']);
+    let valid_sequences =
+        !bucket.contains("..") && !bucket.contains(".-") && !bucket.contains("-.");
+    if valid_length && valid_chars && valid_edges && valid_sequences {
+        Ok(())
+    } else {
+        Err(ObjectStoreError::new(
+            "object_store_bucket_invalid",
+            "object-store bucket name is not valid",
+        ))
+    }
+}
+
+fn send_signed_object_store_request(
+    request: &ObjectStoreRequest,
+) -> Result<ObjectStoreHttpResponse, ObjectStoreError> {
+    let now = OffsetDateTime::now_utc();
+    let amz_date = now.format(AWS_DATETIME_FORMAT).map_err(|_| {
+        ObjectStoreError::new(
+            "object_store_signing_failed",
+            "object-store request signing failed",
+        )
+    })?;
+    let date = now.format(AWS_DATE_FORMAT).map_err(|_| {
+        ObjectStoreError::new(
+            "object_store_signing_failed",
+            "object-store request signing failed",
+        )
+    })?;
+    let canonical_uri = object_store_bucket_uri(&request.endpoint, &request.bucket);
+    let credential_scope = format!("{date}/{}/{}/{}", request.region, S3_SERVICE, AWS4_REQUEST);
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "{}\n{}\n\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n\n{}\n{}",
+        request.method,
+        canonical_uri,
+        request.endpoint.host_header,
+        EMPTY_PAYLOAD_SHA256,
+        amz_date,
+        signed_headers,
+        EMPTY_PAYLOAD_SHA256
+    );
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign =
+        format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
+    let signing_key = aws_v4_signing_key(&request.secret_access_key, &date, &request.region)?;
+    let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes())?;
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+        request.access_key_id, credential_scope, signed_headers, signature
+    );
+
+    let addresses = (request.endpoint.host.as_str(), request.endpoint.port)
+        .to_socket_addrs()
+        .map_err(|_| {
+            ObjectStoreError::new(
+                "object_store_unavailable",
+                "object-store endpoint could not be resolved",
+            )
+        })?;
+    let mut saw_address = false;
+    let mut saw_internal_address = false;
+    let mut stream = None;
+    for address in addresses {
+        saw_address = true;
+        if !is_internal_object_store_ip(address.ip()) {
+            continue;
+        }
+        saw_internal_address = true;
+        if let Ok(connected) = TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            stream = Some(connected);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        if saw_address && !saw_internal_address {
+            ObjectStoreError::new(
+                "object_store_endpoint_insecure",
+                "object-store endpoint did not resolve to a loopback or private address",
+            )
+        } else {
+            ObjectStoreError::new(
+                "object_store_unavailable",
+                "object-store endpoint could not be reached",
+            )
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| {
+            ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| {
+            ObjectStoreError::new("object_store_unavailable", "object-store write failed")
+        })?;
+
+    write!(
+        stream,
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nx-amz-content-sha256: {}\r\nx-amz-date: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        request.method,
+        canonical_uri,
+        request.endpoint.host_header,
+        authorization,
+        EMPTY_PAYLOAD_SHA256,
+        amz_date
+    )
+    .map_err(|_| ObjectStoreError::new("object_store_unavailable", "object-store write failed"))?;
+    stream.flush().map_err(|_| {
+        ObjectStoreError::new("object_store_unavailable", "object-store write failed")
+    })?;
+
+    let mut reader = BufReader::new(stream);
+    let status_line = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES).map_err(|_| {
+        ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+    })?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| {
+            ObjectStoreError::new(
+                "object_store_protocol_error",
+                "object-store response did not include a valid HTTP status",
+            )
+        })?;
+    Ok(ObjectStoreHttpResponse { status })
+}
+
+fn object_store_bucket_uri(endpoint: &ObjectStoreEndpoint, bucket: &str) -> String {
+    if endpoint.canonical_bucket_prefix.is_empty() {
+        format!("/{bucket}")
+    } else {
+        format!("/{}/{bucket}", endpoint.canonical_bucket_prefix)
+    }
+}
+
+fn aws_v4_signing_key(
+    secret_access_key: &str,
+    date: &str,
+    region: &str,
+) -> Result<Vec<u8>, ObjectStoreError> {
+    let date_key = hmac_sha256_bytes(
+        format!("AWS4{secret_access_key}").as_bytes(),
+        date.as_bytes(),
+    )?;
+    let region_key = hmac_sha256_bytes(&date_key, region.as_bytes())?;
+    let service_key = hmac_sha256_bytes(&region_key, S3_SERVICE.as_bytes())?;
+    hmac_sha256_bytes(&service_key, AWS4_REQUEST.as_bytes())
+}
+
+fn hmac_sha256_bytes(key: &[u8], payload: &[u8]) -> Result<Vec<u8>, ObjectStoreError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| {
+        ObjectStoreError::new(
+            "object_store_signing_failed",
+            "object-store request signing failed",
+        )
+    })?;
+    mac.update(payload);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn hmac_sha256_hex(key: &[u8], payload: &[u8]) -> Result<String, ObjectStoreError> {
+    hmac_sha256_bytes(key, payload).map(|bytes| hex_lower(&bytes))
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    hex_lower(&hasher.finalize())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 fn split_path_and_query(path: &str) -> (&str, &str) {
@@ -1138,6 +1693,112 @@ mod tests {
         let query = parse_namespace_children_query("parent=root&limit=3").expect("valid query");
         assert_eq!(query.parent_node_id.as_deref(), Some("root"));
         assert_eq!(query.limit, 3);
+    }
+
+    #[test]
+    fn object_store_endpoint_parses_path_style_rustfs_url() {
+        let endpoint =
+            parse_object_store_endpoint("http://object-store:9000").expect("valid endpoint");
+        assert_eq!(endpoint.host, "object-store");
+        assert_eq!(endpoint.host_header, "object-store:9000");
+        assert_eq!(endpoint.port, 9000);
+        assert_eq!(
+            object_store_bucket_uri(&endpoint, "biohazardfs-dev"),
+            "/biohazardfs-dev"
+        );
+    }
+
+    #[test]
+    fn object_store_endpoint_rejects_https_until_tls_lands() {
+        let error = parse_object_store_endpoint("https://object-store.example")
+            .expect_err("TLS object-store client is not implemented yet");
+        assert_eq!(error.code(), "object_store_endpoint_unsupported");
+    }
+
+    #[test]
+    fn object_store_endpoint_rejects_public_cleartext_hosts() {
+        let error = parse_object_store_endpoint("http://object-store.example.com:9000")
+            .expect_err("public cleartext object-store endpoints are unsafe");
+        assert_eq!(error.code(), "object_store_endpoint_insecure");
+        assert!(parse_object_store_endpoint("http://192.168.1.128:9000").is_ok());
+        assert_eq!(
+            parse_object_store_endpoint("http://169.254.169.254:9000")
+                .expect_err("link-local metadata endpoints are not safe object-store targets")
+                .code(),
+            "object_store_endpoint_insecure"
+        );
+        assert!(parse_object_store_endpoint("http://object-store:9000").is_ok());
+        assert!(
+            parse_object_store_endpoint("http://rustfs.storage.svc.cluster.local:9000").is_ok()
+        );
+    }
+
+    #[test]
+    fn object_store_bucket_validation_blocks_path_injection() {
+        assert!(validate_bucket_name("biohazardfs-dev").is_ok());
+        assert_eq!(
+            validate_bucket_name("../biohazardfs-dev")
+                .expect_err("path-like bucket name is invalid")
+                .code(),
+            "object_store_bucket_invalid"
+        );
+        assert_eq!(
+            validate_bucket_name("BiohazardFS")
+                .expect_err("uppercase bucket name is invalid")
+                .code(),
+            "object_store_bucket_invalid"
+        );
+    }
+
+    #[test]
+    fn object_store_endpoint_rejects_header_injection() {
+        let error = parse_object_store_endpoint("http://object-store:9000/good\nInjected: nope")
+            .expect_err("control characters are invalid");
+        assert_eq!(error.code(), "object_store_endpoint_invalid");
+    }
+
+    #[test]
+    fn object_store_signing_fields_reject_header_injection() {
+        assert!(validate_access_key_id("BHFSOBJECTSMOKE_123").is_ok());
+        assert!(validate_region("us-east-1").is_ok());
+        assert_eq!(
+            validate_access_key_id("key\nInjected: nope")
+                .expect_err("control characters are invalid")
+                .code(),
+            "object_store_access_key_invalid"
+        );
+        assert_eq!(
+            validate_region("us-east-1\r\nInjected")
+                .expect_err("control characters are invalid")
+                .code(),
+            "object_store_region_invalid"
+        );
+    }
+
+    #[test]
+    fn object_store_request_uses_redacted_config_secrets_internally() {
+        let config = RuntimeConfig::from_lookup(|key| match key {
+            biohazardfs_core::config::ENV_OBJECT_STORE_ENDPOINT => {
+                Some("http://object-store:9000".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_BUCKET => {
+                Some("biohazardfs-dev".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_ACCESS_KEY_ID => {
+                Some("biohazardfs".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_SECRET_ACCESS_KEY => {
+                Some("dev-secret".to_string())
+            }
+            _ => None,
+        });
+        let serialized = serde_json::to_string(&config).expect("config serializes");
+        assert!(serialized.contains("access_key_id_set"));
+        assert!(!serialized.contains("biohazardfs\""));
+        assert!(!serialized.contains("dev-secret"));
+        let request = ObjectStoreRequest::from_config(&config, "HEAD").expect("request builds");
+        assert_eq!(request.access_key_id, "biohazardfs");
+        assert_eq!(request.secret_access_key, "dev-secret");
     }
 
     #[test]

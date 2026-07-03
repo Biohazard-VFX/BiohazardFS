@@ -7,7 +7,7 @@ This document captures the currently runnable server API scaffold. It is intenti
 
 ## Scope
 
-The current server is a running foundation only. It does not yet implement transfer authorization, workers, object-storage operations, or mutation APIs. It does include the first Postgres migration foundation for MVP metadata tables plus a read-only authenticated namespace listing endpoint over Postgres.
+The current server is a running foundation only. It does not yet implement transfer authorization, workers, file mutation APIs, or client-facing object transfers. It does include the first Postgres migration foundation for MVP metadata tables, a read-only authenticated namespace listing endpoint over Postgres, and server-side RustFS/S3-compatible bucket check/ensure admin commands.
 
 It does establish:
 
@@ -16,7 +16,8 @@ It does establish:
 - a distinct server schema version
 - HTTP health/readiness/version/status endpoints
 - first authenticated read-only namespace metadata endpoint
-- server modes for `serve`, `worker`, `migrate`, `health`, `version`, and `config`
+- server-side RustFS/S3-compatible signed bucket check/ensure commands
+- server modes for `serve`, `worker`, `migrate`, `health`, `version`, `object-store`, and `config`
 - Docker, Compose, Helm, and CI smoke validation
 
 ## Schema version
@@ -70,10 +71,14 @@ biohazardfs-server --config /path/to/config.toml worker
 biohazardfs-server --config /path/to/config.toml migrate
 biohazardfs-server --config /path/to/config.toml health
 biohazardfs-server version
+biohazardfs-server --config /path/to/config.toml object-store check
+biohazardfs-server --config /path/to/config.toml object-store ensure-bucket
 biohazardfs-server --config /path/to/config.toml config
 ```
 
 `worker` remains a scaffold mode. `migrate` resolves the shared config via `--config`, `--profile`, `BIOHAZARDFS_CONFIG_FILE`, `BIOHAZARDFS_CONFIG_DIR`, and environment overrides. It requires a database URL from `[database].url` or `BIOHAZARDFS_DATABASE_URL`, applies bundled Postgres migrations, prints a server JSON envelope, and exits nonzero with a redacted JSON error envelope when the database URL is missing or unusable. The database URL is never accepted directly through argv.
+
+`object-store check` and `object-store ensure-bucket` resolve `[object_store]` / `BIOHAZARDFS_OBJECT_STORE_*` config, sign path-style S3-compatible requests server-side, and print redacted server envelopes. They require endpoint, bucket, access key ID, and secret access key from config/env rather than argv. The current MVP object-store client supports `http://` endpoints for internal/self-hosted RustFS paths only; TLS support is still future work.
 
 ## Current HTTP endpoints
 
@@ -118,7 +123,13 @@ This script:
 scripts/ci/server-db-smoke.sh
 ```
 
-This script uses live Postgres to validate migrations, TOML-only DB config, DB-backed readiness, smoke-seeded bearer-token auth, and `GET /api/v1/namespace/children` org/deleted-node filtering.
+This script uses live Postgres to validate migrations, TOML-only DB config, DB-backed readiness, smoke-seeded bearer-token auth, `GET /api/v1/namespace/children` org/deleted-node filtering, and `biohazardfs namespace children` CLI behavior.
+
+```bash
+scripts/ci/object-store-smoke.sh
+```
+
+This script uses live RustFS to validate signed server-side object-store bucket check/ensure behavior and verifies access key material is not printed.
 
 ## Docker and Compose
 
@@ -140,14 +151,14 @@ The dev Compose stack includes:
 - `postgres`
 - `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
-The server migration and namespace-read paths connect to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. Object storage remains scaffolded and no object/file APIs are implemented yet.
+The server migration and namespace-read paths connect to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. The object-store admin check path signs S3-compatible requests against RustFS through `scripts/ci/object-store-smoke.sh`; client-facing object/file APIs are not implemented yet.
 
 ## Next required server work
 
 Before claiming a real server MVP, implement:
 
-1. RustFS/S3-compatible object-store config validation and bucket checks.
-2. Auth/device enrollment and bootstrap endpoints.
-3. Server-side metadata mutation and operation/idempotency APIs over the metadata foundation.
-4. Transfer authorization skeleton.
-5. Integration tests using live Postgres and S3-compatible storage.
+1. Auth/device enrollment and bootstrap endpoints.
+2. Server-side metadata mutation and operation/idempotency APIs over the metadata foundation.
+3. Transfer authorization skeleton.
+4. Client-facing upload/download primitives backed by RustFS/S3-compatible object storage.
+5. End-to-end integration tests using live Postgres and S3-compatible storage.

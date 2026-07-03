@@ -35,8 +35,21 @@ enum Command {
     Health,
     /// Print version envelope and exit.
     Version,
+    /// Check or initialize the configured RustFS/S3-compatible object-store bucket.
+    ObjectStore {
+        #[command(subcommand)]
+        command: ObjectStoreCommand,
+    },
     /// Print the resolved redacted shared runtime config and exit.
     Config,
+}
+
+#[derive(Debug, Subcommand)]
+enum ObjectStoreCommand {
+    /// Check that the configured bucket exists and credentials work.
+    Check,
+    /// Idempotently create the configured bucket when it is missing, then report status.
+    EnsureBucket,
 }
 
 fn main() -> std::io::Result<()> {
@@ -86,6 +99,36 @@ fn main() -> std::io::Result<()> {
             biohazardfs_server::server_version(),
             biohazardfs_api_types::Source::Server,
         )),
+        Command::ObjectStore { command } => {
+            let loaded = load_runtime_config_or_exit(&cli, "server.object_store")?;
+            let result = match command {
+                ObjectStoreCommand::Check => {
+                    biohazardfs_server::object_store_check_payload_with_config(&loaded.config)
+                }
+                ObjectStoreCommand::EnsureBucket => {
+                    biohazardfs_server::object_store_ensure_bucket_payload_with_config(
+                        &loaded.config,
+                    )
+                }
+            };
+            match result {
+                Ok(payload) => print_json(&biohazardfs_api_types::ServerResponseEnvelope::ok(
+                    "server.object_store",
+                    payload,
+                    biohazardfs_api_types::Source::Server,
+                )),
+                Err(error) => {
+                    let envelope =
+                        biohazardfs_api_types::ServerResponseEnvelope::<serde_json::Value>::error(
+                            "server.object_store",
+                            error.into_api_error(),
+                            biohazardfs_api_types::Source::Server,
+                        );
+                    print_json(&envelope)?;
+                    std::process::exit(2);
+                }
+            }
+        }
         Command::Config => match RuntimeConfig::load(config_load_options(&cli)) {
             Ok(loaded) => {
                 let mut envelope = biohazardfs_api_types::ServerResponseEnvelope::ok(

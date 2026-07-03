@@ -189,6 +189,7 @@ impl RuntimeConfig {
                 bucket: None,
                 region: None,
                 access_key_id_set: false,
+                access_key_id: None,
                 secret_access_key: None,
             },
         }
@@ -270,7 +271,15 @@ pub struct ObjectStoreConfig {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub access_key_id_set: bool,
+    #[serde(skip)]
+    access_key_id: Option<RedactedSecret>,
     pub secret_access_key: Option<RedactedSecret>,
+}
+
+impl ObjectStoreConfig {
+    pub fn access_key_id_for_process_boundary(&self) -> Option<&RedactedSecret> {
+        self.access_key_id.as_ref()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -595,6 +604,14 @@ fn apply_object_store(config: &mut RuntimeConfig, object_store: &ObjectStoreDocu
     {
         config.object_store.access_key_id_set = true;
     }
+    if let Some(access_key_id) = object_store
+        .access_key_id
+        .as_deref()
+        .and_then(non_empty_str)
+    {
+        config.object_store.access_key_id_set = true;
+        config.object_store.access_key_id = Some(RedactedSecret::new(access_key_id));
+    }
     if let Some(secret) = object_store
         .secret_access_key
         .as_deref()
@@ -642,8 +659,9 @@ fn apply_env_overrides(config: &mut RuntimeConfig, mut lookup: impl FnMut(&str) 
     if let Some(region) = non_empty(lookup(ENV_OBJECT_STORE_REGION)) {
         config.object_store.region = Some(region);
     }
-    if non_empty(lookup(ENV_OBJECT_STORE_ACCESS_KEY_ID)).is_some() {
+    if let Some(access_key_id) = non_empty(lookup(ENV_OBJECT_STORE_ACCESS_KEY_ID)) {
         config.object_store.access_key_id_set = true;
+        config.object_store.access_key_id = Some(RedactedSecret::new(access_key_id));
     }
     if let Some(secret) = non_empty(lookup(ENV_OBJECT_STORE_SECRET_ACCESS_KEY)) {
         config.object_store.secret_access_key = Some(RedactedSecret::new(secret));

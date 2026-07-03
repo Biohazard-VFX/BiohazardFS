@@ -161,6 +161,8 @@ The redacted runtime shape reports secret-bearing values as booleans or `***REDA
 }
 ```
 
+The server retains both object-store credential fields internally only for process-boundary use when signing RustFS/S3-compatible requests. The raw access key ID and secret access key are skipped/redacted in config JSON and error envelopes.
+
 `biohazardfs config show --redacted` and `biohazardfs-server --config <PATH> config` print safe JSON envelopes. It is safe for CI logs as long as new secret-bearing fields use the redaction type or boolean `*_set` convention. `biohazardfs-server --config <PATH> migrate` and `serve` use the same resolved config internally, but never print the raw database URL.
 
 ## Validation warnings
@@ -171,7 +173,9 @@ The shared config scaffold currently emits warnings for:
 - object-store endpoint set without a bucket (`object_store_bucket_missing`)
 - access key ID set without secret access key (`object_store_secret_missing`)
 
-These are warnings for now because routine config display remains non-secret and non-invasive. `biohazardfs-server migrate` now requires a database URL from the resolved shared config (`[database].url` or `BIOHAZARDFS_DATABASE_URL`) and connects to Postgres. The current synchronous Postgres client supports explicit plaintext only, so local/self-hosted URLs must include `sslmode=disable` until TLS support is implemented. Object-storage checks remain scaffolded until object/file APIs exist.
+These are warnings for routine config display because display remains non-secret and non-invasive. `biohazardfs-server migrate` requires a database URL from the resolved shared config (`[database].url` or `BIOHAZARDFS_DATABASE_URL`) and connects to Postgres. The current synchronous Postgres client supports explicit plaintext only, so local/self-hosted URLs must include `sslmode=disable` until TLS support is implemented.
+
+`biohazardfs-server object-store check` and `biohazardfs-server object-store ensure-bucket` require endpoint, bucket, access key ID, and secret access key from config/env. They sign path-style S3-compatible requests server-side and currently support internal/self-hosted `http://` RustFS endpoints until TLS support is implemented.
 
 ## Next implementation steps
 
@@ -179,5 +183,5 @@ These are warnings for now because routine config display remains non-secret and
 2. Generate a JSON schema for `2026-07-config-v1` under `generated/schemas/`.
 3. Mirror the shared config shape in the Electron TypeScript preload/renderer boundary.
 4. Add secure credential lookup: OS keyring first, owner-only fallback for headless/dev.
-5. Add RustFS bucket dependency checks.
-6. Add Compose integration smoke that boots RustFS and creates/checks the dev bucket.
+5. Add client-facing upload/download primitives on top of the RustFS bucket checks.
+6. Add full Compose integration smoke that boots server, Postgres, and RustFS together.

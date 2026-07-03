@@ -120,10 +120,12 @@ dependencies = [
  "biohazardfs-api-types",
  "biohazardfs-core",
  "clap",
+ "hmac",
  "postgres",
  "serde",
  "serde_json",
  "sha2",
+ "time",
 ]
 
 [[package]]
