@@ -309,6 +309,12 @@ dd {
   overflow-wrap: anywhere;
 }
 
+.muted-text {
+  color: var(--muted-foreground);
+  font-size: 0.86em;
+  margin-left: 0.35rem;
+}
+
 .checklist {
   color: var(--muted-foreground);
   line-height: 1.9;

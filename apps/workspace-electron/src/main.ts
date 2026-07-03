@@ -34,7 +34,7 @@ function isAllowedLoopbackEndpoint(endpoint: string): boolean {
   }
 }
 
-async function daemonStatus() {
+async function daemonRpc(method: string, params: Record<string, unknown> = {}) {
   const endpoint = DAEMON_ENDPOINT;
   if (!isAllowedLoopbackEndpoint(endpoint)) {
     return {
@@ -57,8 +57,8 @@ async function daemonStatus() {
       },
       body: JSON.stringify({
         id: `req_ui_${String(Date.now())}`,
-        method: 'daemon.status',
-        params: {},
+        method,
+        params,
         meta: {
           source: 'ui',
           actor_hint: null,
@@ -73,6 +73,18 @@ async function daemonStatus() {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, endpoint, error: message };
   }
+}
+
+async function daemonStatus() {
+  return daemonRpc('daemon.status');
+}
+
+async function workspaceStatus() {
+  return daemonRpc('workspace.status');
+}
+
+async function workspaceList(pathName = '') {
+  return daemonRpc('workspace.list', { path: pathName });
 }
 
 function rendererEntry(): string {
@@ -103,6 +115,8 @@ async function createWindow(): Promise<BrowserWindow> {
 }
 
 ipcMain.handle('daemon:status', daemonStatus);
+ipcMain.handle('workspace:status', workspaceStatus);
+ipcMain.handle('workspace:list', (_event, pathName: string) => workspaceList(pathName));
 ipcMain.handle('app:versions', () => ({
   app: app.getVersion(),
   electron: process.versions.electron,
@@ -117,9 +131,17 @@ void app
 
     if (IS_SMOKE) {
       const status = await daemonStatus();
-      console.log(JSON.stringify({ ok: status.ok, smoke: 'biohazard-workspace', daemon: status }));
+      const workspace = await workspaceStatus();
+      console.log(
+        JSON.stringify({
+          ok: status.ok && workspace.ok,
+          smoke: 'biohazard-workspace',
+          daemon: status,
+          workspace,
+        }),
+      );
       window.close();
-      if (status.ok) {
+      if (status.ok && workspace.ok) {
         app.quit();
       } else {
         app.exit(1);

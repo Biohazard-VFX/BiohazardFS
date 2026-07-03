@@ -33,6 +33,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - CLI content-object transfer commands: `biohazardfs object put <path>` and `biohazardfs object get --sha256 <hash> --output <path>`.
 - First metadata-backed file workflow: `PUT`/`GET /api/v1/files/content` plus `biohazardfs file put/get`, recording file nodes and current versions in Postgres while storing content in RustFS.
 - Local daemon workspace runtime methods: `workspace.status` and `workspace.list`, bridged by `biohazardfs daemon workspace-status/list` and smoke-tested through the owner-token loopback daemon.
+- Electron workspace visibility now calls daemon workspace status/list through preload IPC and surfaces root/list state in the desktop scaffold smoke.
 - Server HTTP scaffold endpoints for `/healthz`, `/readyz`, `/version`, and `/api/v1/status`.
 - Server API scaffold reference documentation.
 - Linux client smoke script that verifies daemon, CLI, and Electron launch together over authenticated dev-loopback JSON-RPC.

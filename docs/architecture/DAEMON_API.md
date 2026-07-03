@@ -256,7 +256,7 @@ The current scaffold exposes two local workspace runtime methods over the owner-
 - `workspace.status`: reports whether `BIOHAZARDFS_WORKSPACE_ROOT` is configured, exists, and is writable.
 - `workspace.list`: lists up to 500 entries under a relative workspace path while rejecting absolute paths, parent traversal, and control characters.
 
-The workspace root is configured in the daemon process environment, not passed by clients through argv. These methods are the first smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine.
+The workspace root is configured in the daemon process environment, not passed by clients through argv. These methods are the first smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine. The Electron scaffold calls them through context-isolated preload IPC and the desktop smoke requires both daemon status and workspace status to be reachable.
 
 ## Event stream
 
