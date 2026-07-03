@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use biohazardfs_api_types::{
-    ApiError, NamespaceChildrenResponse, NamespaceNodeSummary, PRODUCT_VERSION,
-    SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck, ServerResponseEnvelope, ServerState,
-    ServerStatus, ServerVersion, Source,
+    ApiError, ContentObjectGetResponse, ContentObjectPutResponse, NamespaceChildrenResponse,
+    NamespaceNodeSummary, PRODUCT_VERSION, SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck,
+    ServerResponseEnvelope, ServerState, ServerStatus, ServerVersion, Source,
 };
 use biohazardfs_core::config::RuntimeConfig;
 use hmac::{Hmac, KeyInit, Mac};
@@ -25,6 +25,8 @@ const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const MAX_CONTENT_UPLOAD_BYTES: usize = 1024 * 1024;
+const MAX_OBJECT_RESPONSE_BYTES: usize = 1024 * 1024 + 16 * 1024;
 const DEFAULT_NAMESPACE_LIMIT: u32 = 100;
 const MAX_NAMESPACE_LIMIT: u32 = 500;
 const DEFAULT_OBJECT_STORE_REGION: &str = "us-east-1";
@@ -158,6 +160,7 @@ struct AppliedMigration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthenticatedSubject {
     org_id: String,
+    scopes_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,15 +366,31 @@ pub fn dispatch_http_path(path: &str) -> (u16, String) {
 }
 
 pub fn dispatch_http_path_with_config(path: &str, config: &RuntimeConfig) -> (u16, String) {
-    dispatch_http_request_with_config(path, &[], config)
+    dispatch_http_request_with_config("GET", path, &[], &[], config)
 }
 
 fn dispatch_http_request_with_config(
+    method: &str,
     path: &str,
     headers: &[(String, String)],
+    body: &[u8],
     config: &RuntimeConfig,
 ) -> (u16, String) {
     let (route_path, query) = split_path_and_query(path);
+    if method != "GET" && !(method == "PUT" && route_path == "/api/v1/objects/content") {
+        return json_response(
+            405,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.request",
+                ApiError::new(
+                    "method_not_allowed",
+                    "server endpoint does not support this method",
+                ),
+                Source::Server,
+            ),
+        );
+    }
+
     match route_path {
         "/healthz" | "/health" => json_response(
             200,
@@ -401,7 +420,26 @@ fn dispatch_http_request_with_config(
             200,
             &ServerResponseEnvelope::ok("server.status", server_status("serve"), Source::Server),
         ),
-        "/api/v1/namespace/children" => namespace_children_response(query, headers, config),
+        "/api/v1/namespace/children" if method == "GET" => {
+            namespace_children_response(query, headers, config)
+        }
+        "/api/v1/objects/content" if method == "PUT" => {
+            content_object_put_response(headers, body, config)
+        }
+        "/api/v1/objects/content" if method == "GET" => {
+            content_object_get_response(query, headers, config)
+        }
+        "/api/v1/namespace/children" | "/api/v1/objects/content" => json_response(
+            405,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.request",
+                ApiError::new(
+                    "method_not_allowed",
+                    "server endpoint does not support this method",
+                ),
+                Source::Server,
+            ),
+        ),
         _ => json_response(
             404,
             &ServerResponseEnvelope::<serde_json::Value>::error(
@@ -466,6 +504,257 @@ fn namespace_children_payload(
     })?;
     let subject = authenticate_subject(&mut client, bearer)?;
     list_namespace_children(&mut client, &subject, query)
+}
+
+fn content_object_put_response(
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match content_object_put_payload(headers, body, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.objects.content.put", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.objects.content.put",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
+fn content_object_get_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match content_object_get_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.objects.content.get", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.objects.content.get",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
+fn content_object_put_payload(
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> Result<ContentObjectPutResponse, (u16, ApiError)> {
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let subject = authenticate_subject_from_config(config, bearer, "object requests")?;
+    if !scopes_allow_object_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot write content objects",
+            ),
+        ));
+    }
+
+    object_store_check_payload_with_config(config)
+        .map_err(|error| object_store_api_error(error, "object-store bucket is unavailable"))?;
+
+    let content_hash = sha256_hex(body);
+    let object_key = content_object_key(&subject.org_id, &content_hash);
+    let request = ObjectStoreRequest::from_config(config, "PUT")
+        .and_then(|request| {
+            request.with_object_payload(object_key.clone(), content_hash.clone(), body.len())
+        })
+        .map_err(|error| {
+            object_store_api_error(error, "object-store put request could not be built")
+        })?;
+    let response = send_signed_object_store_request_with_payload(&request, body)
+        .map_err(|error| object_store_api_error(error, "object-store put request failed"))?;
+    if response.status != 200 {
+        return Err((
+            if response.status == 401 || response.status == 403 {
+                403
+            } else {
+                503
+            },
+            ApiError::new(
+                "object_store_put_failed",
+                "object-store did not accept content object",
+            ),
+        ));
+    }
+
+    Ok(ContentObjectPutResponse {
+        content_hash,
+        size_bytes: body.len() as u64,
+        storage_provider: config.object_store.provider.clone(),
+        object_key,
+    })
+}
+
+fn content_object_get_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<ContentObjectGetResponse, (u16, ApiError)> {
+    let content_hash = parse_content_hash_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let subject = authenticate_subject_from_config(config, bearer, "object requests")?;
+    if !scopes_allow_object_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot read content objects",
+            ),
+        ));
+    }
+
+    object_store_check_payload_with_config(config)
+        .map_err(|error| object_store_api_error(error, "object-store bucket is unavailable"))?;
+
+    let object_key = content_object_key(&subject.org_id, &content_hash);
+    let request = ObjectStoreRequest::from_config(config, "GET")
+        .and_then(|request| {
+            request.with_object_payload(object_key.clone(), EMPTY_PAYLOAD_SHA256.to_string(), 0)
+        })
+        .map_err(|error| {
+            object_store_api_error(error, "object-store get request could not be built")
+        })?;
+    let (response, body) = send_signed_object_store_request_for_body(&request)
+        .map_err(|error| object_store_api_error(error, "object-store get request failed"))?;
+    if response.status == 404 {
+        return Err((
+            404,
+            ApiError::new("content_object_not_found", "content object was not found"),
+        ));
+    }
+    if response.status == 401 || response.status == 403 {
+        return Err((
+            403,
+            ApiError::new(
+                "object_store_auth_failed",
+                "object-store rejected configured credentials",
+            ),
+        ));
+    }
+    if response.status != 200 {
+        return Err((
+            503,
+            ApiError::new(
+                "object_store_get_failed",
+                "object-store could not read content object",
+            ),
+        ));
+    }
+    let actual_hash = sha256_hex(&body);
+    if actual_hash != content_hash {
+        return Err((
+            502,
+            ApiError::new(
+                "content_hash_mismatch",
+                "downloaded content did not match requested hash",
+            ),
+        ));
+    }
+
+    Ok(ContentObjectGetResponse {
+        content_hash,
+        size_bytes: body.len() as u64,
+        storage_provider: config.object_store.provider.clone(),
+        object_key,
+        content_hex: hex_lower(&body),
+    })
+}
+
+fn authenticate_subject_from_config(
+    config: &RuntimeConfig,
+    bearer: &str,
+    purpose: &str,
+) -> Result<AuthenticatedSubject, (u16, ApiError)> {
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            ApiError::new(
+                error.code(),
+                format!("database is not configured for {purpose}"),
+            ),
+        )
+    })?;
+    let mut client = connect_database(database_url).map_err(|error| {
+        (
+            503,
+            ApiError::new(
+                error.code(),
+                format!("database is unavailable for {purpose}"),
+            ),
+        )
+    })?;
+    authenticate_subject(&mut client, bearer)
+}
+
+fn object_store_api_error(
+    error: ObjectStoreError,
+    fallback_message: &'static str,
+) -> (u16, ApiError) {
+    let status = match error.code() {
+        "object_store_endpoint_missing"
+        | "object_store_endpoint_invalid"
+        | "object_store_endpoint_unsupported"
+        | "object_store_endpoint_insecure"
+        | "object_store_bucket_missing_config"
+        | "object_store_bucket_invalid"
+        | "object_store_access_key_missing"
+        | "object_store_access_key_invalid"
+        | "object_store_secret_missing"
+        | "object_store_region_invalid"
+        | "object_store_object_key_invalid"
+        | "object_store_payload_hash_invalid" => 400,
+        "object_store_auth_failed" => 403,
+        _ => 503,
+    };
+    (status, ApiError::new(error.code(), fallback_message))
+}
+
+fn content_object_key(org_id: &str, content_hash: &str) -> String {
+    format!("orgs/{org_id}/content/sha256/{content_hash}")
+}
+
+fn parse_content_hash_query(query: &str) -> Result<String, (u16, ApiError)> {
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "sha256" || key == "content_hash" {
+            let value = value.trim().to_ascii_lowercase();
+            validate_sha256_hex(&value).map_err(|error| (400, error))?;
+            return Ok(value);
+        }
+    }
+    Err((
+        400,
+        ApiError::new(
+            "content_hash_required",
+            "sha256 query parameter is required",
+        ),
+    ))
 }
 
 fn parse_namespace_children_query(query: &str) -> Result<NamespaceChildrenQuery, (u16, ApiError)> {
@@ -564,23 +853,34 @@ fn authenticate_subject(
         ));
     }
 
-    let scopes_json = row.get::<_, String>("scopes_json");
-    if !scopes_allow_namespace_read(&scopes_json) {
-        return Err((
-            403,
-            ApiError::new(
-                "auth_scope_missing",
-                "bearer token cannot read namespace metadata",
-            ),
-        ));
-    }
-
     Ok(AuthenticatedSubject {
         org_id: row.get("org_id"),
+        scopes_json: row.get("scopes_json"),
     })
 }
 
 fn scopes_allow_namespace_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["namespace:read", "namespace:*", "server:read"],
+    )
+}
+
+fn scopes_allow_object_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["object:read", "object:*", "file:read", "server:read"],
+    )
+}
+
+fn scopes_allow_object_write(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["object:write", "object:*", "file:write", "server:write"],
+    )
+}
+
+fn scopes_allow_any(scopes_json: &str, allowed_scopes: &[&str]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(scopes_json) else {
         return false;
     };
@@ -588,12 +888,7 @@ fn scopes_allow_namespace_read(scopes_json: &str) -> bool {
         scopes
             .iter()
             .filter_map(|scope| scope.as_str())
-            .any(|scope| {
-                matches!(
-                    scope,
-                    "*" | "namespace:read" | "namespace:*" | "server:read"
-                )
-            })
+            .any(|scope| scope == "*" || allowed_scopes.contains(&scope))
     })
 }
 
@@ -602,6 +897,15 @@ fn list_namespace_children(
     subject: &AuthenticatedSubject,
     query: NamespaceChildrenQuery,
 ) -> Result<NamespaceChildrenResponse, (u16, ApiError)> {
+    if !scopes_allow_namespace_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot read namespace metadata",
+            ),
+        ));
+    }
     let parent = query.parent_node_id.as_deref();
     let limit = i64::from(query.limit);
     let rows = client
@@ -657,9 +961,12 @@ struct ObjectStoreRequest {
     provider: String,
     endpoint: ObjectStoreEndpoint,
     bucket: String,
+    object_key: Option<String>,
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    payload_sha256: String,
+    content_length: usize,
 }
 
 impl ObjectStoreRequest {
@@ -726,10 +1033,32 @@ impl ObjectStoreRequest {
             provider: config.object_store.provider.clone(),
             endpoint,
             bucket: bucket.to_string(),
+            object_key: None,
             region,
             access_key_id,
             secret_access_key,
+            payload_sha256: EMPTY_PAYLOAD_SHA256.to_string(),
+            content_length: 0,
         })
+    }
+
+    fn with_object_payload(
+        mut self,
+        object_key: String,
+        payload_sha256: String,
+        content_length: usize,
+    ) -> Result<Self, ObjectStoreError> {
+        validate_object_key(&object_key)?;
+        validate_sha256_hex(&payload_sha256).map_err(|_| {
+            ObjectStoreError::new(
+                "object_store_payload_hash_invalid",
+                "object-store payload hash is not valid",
+            )
+        })?;
+        self.object_key = Some(object_key);
+        self.payload_sha256 = payload_sha256;
+        self.content_length = content_length;
+        Ok(self)
     }
 
     fn report(&self, status: impl Into<String>, http_status: u16) -> ObjectStoreCheckReport {
@@ -908,6 +1237,39 @@ fn validate_region(region: &str) -> Result<(), ObjectStoreError> {
     }
 }
 
+fn validate_sha256_hex(value: &str) -> Result<(), ApiError> {
+    let is_valid = value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if is_valid {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "invalid_content_hash",
+            "content hash must be a 64-character SHA-256 hex digest",
+        ))
+    }
+}
+
+fn validate_object_key(object_key: &str) -> Result<(), ObjectStoreError> {
+    let valid_length = !object_key.is_empty() && object_key.len() <= 512;
+    let valid_chars = object_key.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~' | b':')
+    });
+    let valid_shape = !object_key.starts_with('/')
+        && !object_key.ends_with('/')
+        && !object_key.contains("//")
+        && !object_key.contains("..")
+        && !object_key.contains('?')
+        && !object_key.contains('#');
+    if valid_length && valid_chars && valid_shape {
+        Ok(())
+    } else {
+        Err(ObjectStoreError::new(
+            "object_store_object_key_invalid",
+            "object-store object key is not valid",
+        ))
+    }
+}
+
 fn validate_bucket_name(bucket: &str) -> Result<(), ObjectStoreError> {
     let valid_length = (3..=63).contains(&bucket.len());
     let valid_chars = bucket.bytes().all(|byte| {
@@ -929,6 +1291,86 @@ fn validate_bucket_name(bucket: &str) -> Result<(), ObjectStoreError> {
 fn send_signed_object_store_request(
     request: &ObjectStoreRequest,
 ) -> Result<ObjectStoreHttpResponse, ObjectStoreError> {
+    send_signed_object_store_request_with_payload(request, &[])
+}
+
+fn send_signed_object_store_request_with_payload(
+    request: &ObjectStoreRequest,
+    payload: &[u8],
+) -> Result<ObjectStoreHttpResponse, ObjectStoreError> {
+    let mut reader = send_signed_object_store_request_reader(request, payload)?;
+    let status_line = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES).map_err(|_| {
+        ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+    })?;
+    let status = http_status_from_line(&status_line)?;
+    Ok(ObjectStoreHttpResponse { status })
+}
+
+fn send_signed_object_store_request_for_body(
+    request: &ObjectStoreRequest,
+) -> Result<(ObjectStoreHttpResponse, Vec<u8>), ObjectStoreError> {
+    let mut reader = send_signed_object_store_request_reader(request, &[])?;
+    let status_line = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES).map_err(|_| {
+        ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+    })?;
+    let status = http_status_from_line(&status_line)?;
+    let mut content_length = None;
+    for _ in 0..MAX_HEADERS {
+        let header = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES).map_err(|_| {
+            ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+        })?;
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+    let mut body = Vec::new();
+    match content_length {
+        Some(length) if length <= MAX_OBJECT_RESPONSE_BYTES => {
+            body.resize(length, 0);
+            reader.read_exact(&mut body).map_err(|_| {
+                ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+            })?;
+        }
+        Some(_) => {
+            return Err(ObjectStoreError::new(
+                "object_store_response_too_large",
+                "object-store response exceeded the MVP download limit",
+            ));
+        }
+        None => {
+            reader
+                .take(MAX_OBJECT_RESPONSE_BYTES as u64 + 1)
+                .read_to_end(&mut body)
+                .map_err(|_| {
+                    ObjectStoreError::new("object_store_unavailable", "object-store read failed")
+                })?;
+            if body.len() > MAX_OBJECT_RESPONSE_BYTES {
+                return Err(ObjectStoreError::new(
+                    "object_store_response_too_large",
+                    "object-store response exceeded the MVP download limit",
+                ));
+            }
+        }
+    }
+    Ok((ObjectStoreHttpResponse { status }, body))
+}
+
+fn send_signed_object_store_request_reader(
+    request: &ObjectStoreRequest,
+    payload: &[u8],
+) -> Result<BufReader<TcpStream>, ObjectStoreError> {
+    if request.content_length != payload.len() {
+        return Err(ObjectStoreError::new(
+            "object_store_payload_length_mismatch",
+            "object-store payload length did not match signed length",
+        ));
+    }
     let now = OffsetDateTime::now_utc();
     let amz_date = now.format(AWS_DATETIME_FORMAT).map_err(|_| {
         ObjectStoreError::new(
@@ -942,7 +1384,7 @@ fn send_signed_object_store_request(
             "object-store request signing failed",
         )
     })?;
-    let canonical_uri = object_store_bucket_uri(&request.endpoint, &request.bucket);
+    let canonical_uri = object_store_request_uri(request);
     let credential_scope = format!("{date}/{}/{}/{}", request.region, S3_SERVICE, AWS4_REQUEST);
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let canonical_request = format!(
@@ -950,10 +1392,10 @@ fn send_signed_object_store_request(
         request.method,
         canonical_uri,
         request.endpoint.host_header,
-        EMPTY_PAYLOAD_SHA256,
+        request.payload_sha256,
         amz_date,
         signed_headers,
-        EMPTY_PAYLOAD_SHA256
+        request.payload_sha256
     );
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
     let string_to_sign =
@@ -1013,24 +1455,30 @@ fn send_signed_object_store_request(
 
     write!(
         stream,
-        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nx-amz-content-sha256: {}\r\nx-amz-date: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nx-amz-content-sha256: {}\r\nx-amz-date: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         request.method,
         canonical_uri,
         request.endpoint.host_header,
         authorization,
-        EMPTY_PAYLOAD_SHA256,
-        amz_date
+        request.payload_sha256,
+        amz_date,
+        request.content_length
     )
     .map_err(|_| ObjectStoreError::new("object_store_unavailable", "object-store write failed"))?;
+    if !payload.is_empty() {
+        stream.write_all(payload).map_err(|_| {
+            ObjectStoreError::new("object_store_unavailable", "object-store write failed")
+        })?;
+    }
     stream.flush().map_err(|_| {
         ObjectStoreError::new("object_store_unavailable", "object-store write failed")
     })?;
 
-    let mut reader = BufReader::new(stream);
-    let status_line = read_limited_line(&mut reader, MAX_HEADER_LINE_BYTES).map_err(|_| {
-        ObjectStoreError::new("object_store_unavailable", "object-store read failed")
-    })?;
-    let status = status_line
+    Ok(BufReader::new(stream))
+}
+
+fn http_status_from_line(status_line: &str) -> Result<u16, ObjectStoreError> {
+    status_line
         .split_whitespace()
         .nth(1)
         .and_then(|status| status.parse::<u16>().ok())
@@ -1039,8 +1487,15 @@ fn send_signed_object_store_request(
                 "object_store_protocol_error",
                 "object-store response did not include a valid HTTP status",
             )
-        })?;
-    Ok(ObjectStoreHttpResponse { status })
+        })
+}
+
+fn object_store_request_uri(request: &ObjectStoreRequest) -> String {
+    let bucket_uri = object_store_bucket_uri(&request.endpoint, &request.bucket);
+    match request.object_key.as_deref() {
+        Some(object_key) => format!("{bucket_uri}/{object_key}"),
+        None => bucket_uri,
+    }
 }
 
 fn object_store_bucket_uri(endpoint: &ObjectStoreEndpoint, bucket: &str) -> String {
@@ -1499,20 +1954,95 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
     let method = request_line.split_whitespace().next().unwrap_or_default();
     let path = request_line.split_whitespace().nth(1).unwrap_or_default();
 
-    if method != "GET" {
+    if method != "GET" && method != "PUT" {
         let (_status_code, body) = json_response(
             405,
             &ServerResponseEnvelope::<serde_json::Value>::error(
                 "server.request",
-                ApiError::new("method_not_allowed", "server scaffold only accepts GET"),
+                ApiError::new(
+                    "method_not_allowed",
+                    "server accepts GET and bounded PUT requests",
+                ),
                 Source::Server,
             ),
         );
         return write_http_response(&mut stream, 405, &body);
     }
 
-    let (status_code, body) = dispatch_http_request_with_config(path, &headers, config);
+    let (route_path, _) = split_path_and_query(path);
+    let should_read_body = method == "PUT" && route_path == "/api/v1/objects/content";
+    let body_bytes = if should_read_body {
+        reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        match read_bounded_request_body(&mut reader, &headers) {
+            Ok(body) => body,
+            Err((status_code, error)) => {
+                let (_status_code, body) = json_response(
+                    status_code,
+                    &ServerResponseEnvelope::<serde_json::Value>::error(
+                        "server.request",
+                        error,
+                        Source::Server,
+                    ),
+                );
+                return write_http_response(&mut stream, status_code, &body);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let (status_code, body) =
+        dispatch_http_request_with_config(method, path, &headers, &body_bytes, config);
     write_http_response(&mut stream, status_code, &body)
+}
+
+fn read_bounded_request_body(
+    reader: &mut BufReader<TcpStream>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>, (u16, ApiError)> {
+    let content_length = header_value(headers, "content-length")
+        .ok_or_else(|| {
+            (
+                411,
+                ApiError::new(
+                    "content_length_required",
+                    "PUT requests require Content-Length",
+                ),
+            )
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            (
+                400,
+                ApiError::new("content_length_invalid", "Content-Length is not valid"),
+            )
+        })?;
+    if content_length > MAX_CONTENT_UPLOAD_BYTES {
+        return Err((
+            413,
+            ApiError::new(
+                "content_too_large",
+                "request body exceeds the MVP content upload limit",
+            ),
+        ));
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).map_err(|_| {
+        (
+            400,
+            ApiError::new("body_read_failed", "could not read request body"),
+        )
+    })?;
+    Ok(body)
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn json_response<T>(status_code: u16, envelope: &ServerResponseEnvelope<T>) -> (u16, String)
@@ -1556,7 +2086,10 @@ fn reason_phrase(status_code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
+        413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     }
@@ -1689,6 +2222,18 @@ mod tests {
     }
 
     #[test]
+    fn object_scope_parser_separates_read_and_write() {
+        assert!(scopes_allow_object_read(r#"["object:read"]"#));
+        assert!(scopes_allow_object_read(r#"["file:read"]"#));
+        assert!(scopes_allow_object_write(r#"["object:write"]"#));
+        assert!(scopes_allow_object_write(r#"["file:write"]"#));
+        assert!(scopes_allow_object_read(r#"["*"]"#));
+        assert!(scopes_allow_object_write(r#"["*"]"#));
+        assert!(!scopes_allow_object_read(r#"["object:write"]"#));
+        assert!(!scopes_allow_object_write(r#"["object:read"]"#));
+    }
+
+    #[test]
     fn namespace_query_parses_parent_and_limit() {
         let query = parse_namespace_children_query("parent=root&limit=3").expect("valid query");
         assert_eq!(query.parent_node_id.as_deref(), Some("root"));
@@ -1705,6 +2250,38 @@ mod tests {
         assert_eq!(
             object_store_bucket_uri(&endpoint, "biohazardfs-dev"),
             "/biohazardfs-dev"
+        );
+    }
+
+    #[test]
+    fn object_store_request_uri_includes_content_object_key() {
+        let config = RuntimeConfig::from_lookup(|key| match key {
+            biohazardfs_core::config::ENV_OBJECT_STORE_ENDPOINT => {
+                Some("http://object-store:9000".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_BUCKET => {
+                Some("biohazardfs-dev".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_ACCESS_KEY_ID => {
+                Some("biohazardfs".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_SECRET_ACCESS_KEY => {
+                Some("dev-secret".to_string())
+            }
+            _ => None,
+        });
+        let request = ObjectStoreRequest::from_config(&config, "GET")
+            .and_then(|request| {
+                request.with_object_payload(
+                    "orgs/org_smoke/content/sha256/abc123".to_string(),
+                    EMPTY_PAYLOAD_SHA256.to_string(),
+                    0,
+                )
+            })
+            .expect("request builds");
+        assert_eq!(
+            object_store_request_uri(&request),
+            "/biohazardfs-dev/orgs/org_smoke/content/sha256/abc123"
         );
     }
 

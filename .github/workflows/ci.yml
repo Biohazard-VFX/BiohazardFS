@@ -83,6 +83,9 @@ jobs:
       - name: Object store smoke
         run: bash scripts/ci/object-store-smoke.sh
 
+      - name: Server transfer smoke
+        run: bash scripts/ci/server-transfer-smoke.sh
+
       - name: Docker server image build
         run: docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:ci .
 

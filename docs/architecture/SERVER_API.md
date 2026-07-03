@@ -7,7 +7,7 @@ This document captures the currently runnable server API scaffold. It is intenti
 
 ## Scope
 
-The current server is a running foundation only. It does not yet implement transfer authorization, workers, file mutation APIs, or client-facing object transfers. It does include the first Postgres migration foundation for MVP metadata tables, a read-only authenticated namespace listing endpoint over Postgres, and server-side RustFS/S3-compatible bucket check/ensure admin commands.
+The current server is a running foundation only. It does not yet implement full transfer authorization sessions, workers, or file mutation APIs. It does include the first Postgres migration foundation for MVP metadata tables, a read-only authenticated namespace listing endpoint over Postgres, server-side RustFS/S3-compatible bucket check/ensure admin commands, and first authenticated content-object PUT/GET primitives backed by RustFS.
 
 It does establish:
 
@@ -17,6 +17,7 @@ It does establish:
 - HTTP health/readiness/version/status endpoints
 - first authenticated read-only namespace metadata endpoint
 - server-side RustFS/S3-compatible signed bucket check/ensure commands
+- authenticated content-object PUT/GET primitives backed by RustFS
 - server modes for `serve`, `worker`, `migrate`, `health`, `version`, `object-store`, and `config`
 - Docker, Compose, Helm, and CI smoke validation
 
@@ -91,11 +92,17 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 | `GET /version` | `server.version` | Version and schema info |
 | `GET /api/v1/status` | `server.status` | Server/control-plane status |
 | `GET /api/v1/namespace/children` | `server.namespace.children` | Authenticated live child-node listing for the caller's organization |
+| `PUT /api/v1/objects/content` | `server.objects.content.put` | Authenticated bounded content-object upload backed by RustFS |
+| `GET /api/v1/objects/content?sha256=<hash>` | `server.objects.content.get` | Authenticated content-object fetch by SHA-256 |
 
 `GET /api/v1/namespace/children` requires `Authorization: Bearer <token>`. The server stores and compares token hashes in the globally unique `tokens.secret_hash` column using the current `sha256:<hex>` MVP format. The token must be active, unexpired, unrevoked, attached to an active user and organization, and include one of `namespace:read`, `namespace:*`, `server:read`, or `*` in its JSON `scopes` array. The endpoint returns only live nodes in that authenticated org and accepts optional query params:
 
 - `parent=<node_id>` or `parent_node_id=<node_id>`; omitted means root children where `parent_node_id IS NULL`
 - `limit=<n>`; default `100`, max `500`
+
+`PUT /api/v1/objects/content` requires one of `object:write`, `object:*`, `file:write`, `server:write`, or `*`. The server reads a bounded request body, computes the SHA-256 hash, signs a path-style RustFS/S3-compatible PUT, stores the object under the caller organization's deterministic content key, and returns content hash, size, provider, and object key. The MVP upload limit is currently 1 MiB.
+
+`GET /api/v1/objects/content?sha256=<hash>` requires one of `object:read`, `object:*`, `file:read`, `server:read`, or `*`. It fetches the deterministic object from RustFS, verifies the SHA-256 hash, and returns a JSON response with `content_hex`. This hex payload is intentionally inefficient but binary-safe for the first smokeable primitive; client/daemon file workflows should replace it with a streaming or presigned transfer contract later.
 
 Compatibility aliases currently exist for early chart probes:
 
@@ -131,6 +138,12 @@ scripts/ci/object-store-smoke.sh
 
 This script uses live RustFS to validate signed server-side object-store bucket check/ensure behavior and verifies access key material is not printed.
 
+```bash
+scripts/ci/server-transfer-smoke.sh
+```
+
+This script uses live Postgres, live RustFS, and the HTTP server to validate authenticated content-object upload/download round trips and verifies bearer/database/object-store secrets are not printed.
+
 ## Docker and Compose
 
 Docker image build:
@@ -151,7 +164,7 @@ The dev Compose stack includes:
 - `postgres`
 - `object-store` using RustFS, the canonical BiohazardFS self-hosted object-store default
 
-The server migration and namespace-read paths connect to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. The object-store admin check path signs S3-compatible requests against RustFS through `scripts/ci/object-store-smoke.sh`; client-facing object/file APIs are not implemented yet.
+The server migration, namespace-read, and content-object paths connect to Postgres when the resolved shared config contains `[database].url` or `BIOHAZARDFS_DATABASE_URL`. The dev Compose stack uses `BIOHAZARDFS_DATABASE_URL` for container wiring, while CI also proves TOML-only migration/readiness through `scripts/ci/server-db-smoke.sh`. The object-store admin check path signs S3-compatible requests against RustFS through `scripts/ci/object-store-smoke.sh`; the first server-mediated content-object transfer path is covered by `scripts/ci/server-transfer-smoke.sh`.
 
 ## Next required server work
 
@@ -159,6 +172,6 @@ Before claiming a real server MVP, implement:
 
 1. Auth/device enrollment and bootstrap endpoints.
 2. Server-side metadata mutation and operation/idempotency APIs over the metadata foundation.
-3. Transfer authorization skeleton.
-4. Client-facing upload/download primitives backed by RustFS/S3-compatible object storage.
+3. Transfer authorization/session skeleton beyond the first bearer-scoped content-object primitive.
+4. CLI file upload/download commands backed by the content-object API and metadata tables.
 5. End-to-end integration tests using live Postgres and S3-compatible storage.

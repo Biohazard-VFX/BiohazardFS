@@ -255,6 +255,23 @@ pub struct NamespaceNodeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentObjectPutResponse {
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub storage_provider: String,
+    pub object_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentObjectGetResponse {
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub storage_provider: String,
+    pub object_key: String,
+    pub content_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerHealth {
     pub state: ServerState,
     pub checks: Vec<ServerHealthCheck>,

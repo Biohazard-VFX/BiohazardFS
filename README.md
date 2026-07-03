@@ -196,6 +196,7 @@ scripts/ci/client-smoke.sh
 scripts/ci/server-smoke.sh
 scripts/ci/server-db-smoke.sh
 scripts/ci/object-store-smoke.sh
+scripts/ci/server-transfer-smoke.sh
 ```
 
 The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-hosted storage direction:
@@ -204,7 +205,7 @@ The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-
 docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
 ```
 
-CI runs the full Linux suite, Electron build/smoke, server smoke, Postgres DB smoke, RustFS object-store smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
+CI runs the full Linux suite, Electron build/smoke, server smoke, Postgres DB smoke, RustFS object-store smoke, server transfer smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 
