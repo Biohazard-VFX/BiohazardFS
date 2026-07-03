@@ -11,7 +11,7 @@ CONFIG_FILE=""
 
 cd "$ROOT_DIR"
 
-cargo build -p biohazardfs-server --all-features
+cargo build -p biohazardfs-server -p biohazardfs-cli --all-features
 
 CONTAINER_ID="$(docker run --rm -d \
   --name "$CONTAINER_NAME" \
@@ -65,6 +65,9 @@ CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/biohazardfs-server-db-smoke.XXXXXX.toml")
 cat >"$CONFIG_FILE" <<EOF_CONFIG
 schema_version = "2026-07-config-v1"
 profile = "ci"
+
+[profiles.ci.server]
+public_url = "http://$SERVER_ENDPOINT"
 
 [profiles.ci.database]
 url = "$DATABASE_URL"
@@ -281,5 +284,34 @@ with urllib.request.urlopen(child_request, timeout=2) as response:
     child_payload = json.loads(response.read().decode())
 assert child_payload['data']['parent_node_id'] == 'node_root_dir', child_payload
 assert [node['node_id'] for node in child_payload['data']['nodes']] == ['node_child_file'], child_payload
+PY
+
+BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
+  env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci namespace children \
+  >/tmp/biohazardfs-cli-namespace-children.json
+
+BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
+  env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci namespace children --parent node_root_dir --limit 10 \
+  >/tmp/biohazardfs-cli-namespace-child-file.json
+
+python3 - <<PY
+import json
+from pathlib import Path
+root_text = Path('/tmp/biohazardfs-cli-namespace-children.json').read_text()
+child_text = Path('/tmp/biohazardfs-cli-namespace-child-file.json').read_text()
+root = json.loads(root_text)
+child = json.loads(child_text)
+assert root['ok'] is True, root
+assert root['command'] == 'namespace.children', root
+assert [node['node_id'] for node in root['data']['nodes']] == ['node_root_dir'], root
+assert child['ok'] is True, child
+assert child['command'] == 'namespace.children', child
+assert child['data']['parent_node_id'] == 'node_root_dir', child
+assert [node['node_id'] for node in child['data']['nodes']] == ['node_child_file'], child
+for text in (root_text, child_text):
+    assert '$SMOKE_TOKEN' not in text, text
+    assert 'biohazardfs-db-smoke-password' not in text, text
 print('server-db-smoke-ok')
 PY

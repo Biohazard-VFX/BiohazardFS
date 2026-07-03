@@ -157,6 +157,7 @@ biohazardfs daemon methods
 biohazardfs config path
 biohazardfs config show --redacted
 biohazardfs config validate
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
 biohazardfs schema list
 biohazardfs schema command daemon.status
 ```

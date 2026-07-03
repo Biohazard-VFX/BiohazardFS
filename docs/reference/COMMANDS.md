@@ -335,6 +335,23 @@ credentials.path
 features.*
 ```
 
+## Namespace commands
+
+Currently implemented server-backed namespace read command:
+
+```bash
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children --parent <node-id> --limit 50
+```
+
+Rules:
+
+- `BIOHAZARDFS_SERVER_TOKEN` is the only current server bearer-token source; do not pass server tokens through argv.
+- The command reads `server.public_url` from the resolved shared config (`--config`, `--profile`, env overrides, or defaults).
+- CLI output uses the `command` envelope with `command = "namespace.children"` even though the server endpoint uses the `operation` envelope.
+- Secrets from the server token and database config must not be printed in success or error envelopes.
+- The server endpoint returns only live nodes visible to the token's organization.
+
 ## Schema introspection commands
 
 Agents must be able to discover the command surface without reading Markdown docs.

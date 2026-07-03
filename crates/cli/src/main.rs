@@ -1,5 +1,8 @@
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use biohazardfs_api_types::{
     ApiError, ClientStatus, CommandResponseEnvelope, CommandSchemaSummary,
@@ -16,6 +19,9 @@ const EXIT_OK: u8 = 0;
 const EXIT_USAGE: u8 = 2;
 const EXIT_AUTH: u8 = 3;
 const EXIT_DAEMON_UNAVAILABLE: u8 = 6;
+const EXIT_SERVER_UNAVAILABLE: u8 = 6;
+const SERVER_TOKEN_ENV: &str = "BIOHAZARDFS_SERVER_TOKEN";
+const MAX_NAMESPACE_LIMIT: u32 = 500;
 
 #[derive(Debug, Parser)]
 #[command(name = "biohazardfs")]
@@ -51,6 +57,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Server-backed namespace metadata commands.
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
     /// Schema-introspection scaffold.
     Schema {
         #[command(subcommand)]
@@ -66,6 +77,19 @@ enum DaemonCommand {
     Status,
     /// List daemon RPC methods exposed by the scaffold daemon.
     Methods,
+}
+
+#[derive(Debug, Subcommand)]
+enum NamespaceCommand {
+    /// List live child nodes visible to the authenticated server token.
+    Children {
+        /// Optional parent node ID. Omit for root children.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Maximum number of children to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +126,7 @@ fn main() -> ExitCode {
             command: DaemonCommand::Methods,
         } => daemon_methods_json(&cli),
         Command::Config { command } => config_json(&cli, command),
+        Command::Namespace { command } => namespace_json(&cli, command),
         Command::Schema { command } => (schema_json(command), EXIT_OK),
         Command::Commands => (schema_json(SchemaCommand::List), EXIT_OK),
     };
@@ -239,6 +264,115 @@ fn daemon_methods_json(cli: &Cli) -> (String, u8) {
     }
 }
 
+fn namespace_json(cli: &Cli, command: NamespaceCommand) -> (String, u8) {
+    match command {
+        NamespaceCommand::Children { parent, limit } => namespace_children_json(cli, parent, limit),
+    }
+}
+
+fn namespace_children_json(cli: &Cli, parent: Option<String>, limit: u32) -> (String, u8) {
+    let Some(token) = server_token() else {
+        let envelope: CommandResponseEnvelope<serde_json::Value> = CommandResponseEnvelope::error(
+            "namespace.children",
+            ApiError::new(
+                "auth_required",
+                format!("set {SERVER_TOKEN_ENV} to call BiohazardFS server namespace APIs"),
+            ),
+            Source::Cli,
+        );
+        return (
+            serde_json::to_string_pretty(&envelope).expect("namespace auth error serializes"),
+            EXIT_AUTH,
+        );
+    };
+
+    let loaded = match load_config(cli) {
+        Ok(loaded) => loaded,
+        Err(error) => return config_error_json("namespace.children", error),
+    };
+
+    if let Err(error) = validate_namespace_limit(limit) {
+        let envelope: CommandResponseEnvelope<serde_json::Value> =
+            CommandResponseEnvelope::error("namespace.children", error, Source::Cli);
+        return (
+            serde_json::to_string_pretty(&envelope).expect("limit validation error serializes"),
+            EXIT_USAGE,
+        );
+    }
+
+    let mut path = format!("/api/v1/namespace/children?limit={limit}");
+    if let Some(parent) = parent.as_deref() {
+        let parent = match validate_node_id_query_value(parent) {
+            Ok(parent) => parent,
+            Err(error) => {
+                let envelope: CommandResponseEnvelope<serde_json::Value> =
+                    CommandResponseEnvelope::error("namespace.children", error, Source::Cli);
+                return (
+                    serde_json::to_string_pretty(&envelope)
+                        .expect("namespace validation error serializes"),
+                    EXIT_USAGE,
+                );
+            }
+        };
+        path.push_str("&parent=");
+        path.push_str(parent);
+    }
+
+    match server_get_json(&loaded.config.server.public_url, &path, Some(&token)) {
+        Ok((_status, payload)) if payload.get("ok").and_then(|ok| ok.as_bool()) == Some(true) => {
+            let data = payload
+                .get("data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let envelope = CommandResponseEnvelope::ok("namespace.children", data, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("namespace children serializes"),
+                EXIT_OK,
+            )
+        }
+        Ok((status, payload)) => {
+            let error = payload
+                .get("error")
+                .cloned()
+                .and_then(|error| serde_json::from_value::<ApiError>(error).ok())
+                .unwrap_or_else(|| ApiError::new("server_error", "server returned an error"));
+            let exit_code = if status == 401
+                || status == 403
+                || matches!(error.code.as_str(), "auth_required" | "auth_scope_missing")
+            {
+                EXIT_AUTH
+            } else if status == 400 || error.code == "invalid_limit" {
+                EXIT_USAGE
+            } else {
+                EXIT_SERVER_UNAVAILABLE
+            };
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error("namespace.children", error, Source::Cli);
+            (
+                serde_json::to_string_pretty(&envelope).expect("namespace error serializes"),
+                exit_code,
+            )
+        }
+        Err(error) => {
+            let exit_code = if matches!(error.code, "invalid_server_url" | "insecure_server_url") {
+                EXIT_USAGE
+            } else {
+                EXIT_SERVER_UNAVAILABLE
+            };
+            let envelope: CommandResponseEnvelope<serde_json::Value> =
+                CommandResponseEnvelope::error(
+                    "namespace.children",
+                    ApiError::new(error.code, error.message),
+                    Source::Cli,
+                );
+            (
+                serde_json::to_string_pretty(&envelope).expect("namespace client error serializes"),
+                exit_code,
+            )
+        }
+    }
+}
+
 fn config_json(cli: &Cli, command: ConfigCommand) -> (String, u8) {
     match command {
         ConfigCommand::Path => config_path_json(cli),
@@ -362,6 +496,228 @@ fn config_load_options(cli: &Cli) -> ConfigLoadOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerClientError {
+    code: &'static str,
+    message: String,
+}
+
+fn is_loopback_http_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn validate_namespace_limit(limit: u32) -> Result<(), ApiError> {
+    if (1..=MAX_NAMESPACE_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "invalid_limit",
+            format!("limit must be between 1 and {MAX_NAMESPACE_LIMIT}"),
+        ))
+    }
+}
+
+fn validate_node_id_query_value(value: &str) -> Result<&str, ApiError> {
+    let value = value.trim();
+    let is_valid = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'));
+    if is_valid {
+        Ok(value)
+    } else {
+        Err(ApiError::new(
+            "invalid_parent_node_id",
+            "parent node IDs may only contain ASCII letters, numbers, '.', '_', '-', or ':'",
+        ))
+    }
+}
+
+fn server_get_json(
+    server_url: &str,
+    path: &str,
+    bearer_token: Option<&str>,
+) -> Result<(u16, serde_json::Value), ServerClientError> {
+    let endpoint = parse_http_endpoint(server_url, path)?;
+    if bearer_token.is_some() && !is_loopback_http_host(&endpoint.host) {
+        return Err(ServerClientError {
+            code: "insecure_server_url",
+            message: "server bearer tokens may only be sent to loopback HTTP URLs until HTTPS support lands"
+                .to_string(),
+        });
+    }
+    let addresses = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map_err(|error| ServerClientError {
+            code: "server_unavailable",
+            message: format!("could not resolve BiohazardFS server: {error}"),
+        })?;
+    let require_loopback = bearer_token.is_some();
+    let mut saw_address = false;
+    let mut saw_loopback_address = false;
+    let mut last_error = None;
+    let mut stream = None;
+    for address in addresses {
+        saw_address = true;
+        if require_loopback && !address.ip().is_loopback() {
+            continue;
+        }
+        saw_loopback_address = true;
+        match TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        if require_loopback && saw_address && !saw_loopback_address {
+            ServerClientError {
+                code: "insecure_server_url",
+                message: "server bearer tokens may only be sent to resolved loopback addresses"
+                    .to_string(),
+            }
+        } else {
+            ServerClientError {
+                code: "server_unavailable",
+                message: match last_error {
+                    Some(error) => format!("could not connect to BiohazardFS server: {error}"),
+                    None => "could not resolve BiohazardFS server address".to_string(),
+                },
+            }
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(server_io_error)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(server_io_error)?;
+
+    let auth_header = bearer_token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\n{}Connection: close\r\n\r\n",
+        endpoint.path, endpoint.host_header, auth_header
+    )
+    .map_err(server_io_error)?;
+    stream.flush().map_err(server_io_error)?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(server_io_error)?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| ServerClientError {
+            code: "server_protocol_error",
+            message: "server response did not include HTTP headers".to_string(),
+        })?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or_else(|| ServerClientError {
+            code: "server_protocol_error",
+            message: "server response did not include a valid HTTP status".to_string(),
+        })?;
+    let payload =
+        serde_json::from_str::<serde_json::Value>(body).map_err(|error| ServerClientError {
+            code: "server_protocol_error",
+            message: format!("server response was not valid JSON: {error}"),
+        })?;
+    Ok((status, payload))
+}
+
+fn server_io_error(error: std::io::Error) -> ServerClientError {
+    ServerClientError {
+        code: "server_unavailable",
+        message: format!("BiohazardFS server request failed: {error}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpEndpoint {
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_http_endpoint(server_url: &str, path: &str) -> Result<HttpEndpoint, ServerClientError> {
+    let rest = server_url
+        .trim()
+        .strip_prefix("http://")
+        .ok_or_else(|| ServerClientError {
+            code: "invalid_server_url",
+            message: "server URL must start with http:// in the current MVP client".to_string(),
+        })?;
+    let (authority, base_path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port, host_header) = parse_http_authority(authority)?;
+    if host.trim().is_empty() {
+        return Err(ServerClientError {
+            code: "invalid_server_url",
+            message: "server URL host is empty".to_string(),
+        });
+    }
+
+    let base_path = base_path.trim_matches('/');
+    let request_path = path.trim_start_matches('/');
+    let full_path = if base_path.is_empty() {
+        format!("/{request_path}")
+    } else {
+        format!("/{base_path}/{request_path}")
+    };
+
+    Ok(HttpEndpoint {
+        host,
+        host_header,
+        port,
+        path: full_path,
+    })
+}
+
+fn parse_http_authority(authority: &str) -> Result<(String, u16, String), ServerClientError> {
+    if let Some(without_opening_bracket) = authority.strip_prefix('[') {
+        let (host, after_host) =
+            without_opening_bracket
+                .split_once(']')
+                .ok_or_else(|| ServerClientError {
+                    code: "invalid_server_url",
+                    message: "server URL IPv6 host is missing a closing bracket".to_string(),
+                })?;
+        let port = match after_host.strip_prefix(':') {
+            Some(port) => port.parse::<u16>().map_err(|_| ServerClientError {
+                code: "invalid_server_url",
+                message: "server URL port is not valid".to_string(),
+            })?,
+            None if after_host.is_empty() => 80,
+            None => {
+                return Err(ServerClientError {
+                    code: "invalid_server_url",
+                    message: "server URL IPv6 host has invalid authority syntax".to_string(),
+                });
+            }
+        };
+        return Ok((host.to_string(), port, authority.to_string()));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse::<u16>().map_err(|_| ServerClientError {
+                code: "invalid_server_url",
+                message: "server URL port is not valid".to_string(),
+            })?;
+            Ok((host.to_string(), port, authority.to_string()))
+        }
+        None => Ok((authority.to_string(), 80, authority.to_string())),
+    }
+}
+
 fn daemon_exit_code(code: &str) -> u8 {
     match code {
         "auth_required" => EXIT_AUTH,
@@ -389,6 +745,7 @@ fn schema_json(command: SchemaCommand) -> String {
         "config.path".to_string(),
         "config.show".to_string(),
         "config.validate".to_string(),
+        "namespace.children".to_string(),
         "schema.list".to_string(),
         "schema.command".to_string(),
     ];
@@ -406,4 +763,85 @@ fn local_token() -> Option<String> {
     std::env::var(LOCAL_TOKEN_ENV)
         .ok()
         .filter(|token| !token.is_empty())
+}
+
+fn server_token() -> Option<String> {
+    std::env::var(SERVER_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_http_server_endpoint_with_base_path() {
+        let endpoint = parse_http_endpoint(
+            "http://127.0.0.1:8080/api",
+            "/v1/namespace/children?limit=1",
+        )
+        .expect("endpoint parses");
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.host_header, "127.0.0.1:8080");
+        assert_eq!(endpoint.port, 8080);
+        assert_eq!(endpoint.path, "/api/v1/namespace/children?limit=1");
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_loopback_endpoint() {
+        let endpoint =
+            parse_http_endpoint("http://[::1]:8080", "/readyz").expect("endpoint parses");
+        assert_eq!(endpoint.host, "::1");
+        assert_eq!(endpoint.host_header, "[::1]:8080");
+        assert_eq!(endpoint.port, 8080);
+        assert_eq!(endpoint.path, "/readyz");
+    }
+
+    #[test]
+    fn rejects_https_until_tls_client_lands() {
+        let error = parse_http_endpoint("https://biohazardfs.example", "/readyz")
+            .expect_err("https is not supported by the MVP stdlib client");
+        assert_eq!(error.code, "invalid_server_url");
+    }
+
+    #[test]
+    fn identifies_only_loopback_hosts_as_bearer_safe() {
+        assert!(is_loopback_http_host("localhost"));
+        assert!(is_loopback_http_host("127.0.0.1"));
+        assert!(is_loopback_http_host("::1"));
+        assert!(!is_loopback_http_host("192.168.1.128"));
+        assert!(!is_loopback_http_host("biohazardfs.example"));
+    }
+
+    #[test]
+    fn rejects_query_injection_in_parent_node_id() {
+        let error = validate_node_id_query_value("node_root_dir&limit=500")
+            .expect_err("query separators are not valid node IDs");
+        assert_eq!(error.code, "invalid_parent_node_id");
+    }
+
+    #[test]
+    fn rejects_empty_parent_node_id() {
+        let error = validate_node_id_query_value("   ").expect_err("empty parent is invalid");
+        assert_eq!(error.code, "invalid_parent_node_id");
+    }
+
+    #[test]
+    fn validates_namespace_limit_against_server_contract() {
+        assert!(validate_namespace_limit(1).is_ok());
+        assert!(validate_namespace_limit(MAX_NAMESPACE_LIMIT).is_ok());
+        assert_eq!(
+            validate_namespace_limit(0)
+                .expect_err("zero is invalid")
+                .code,
+            "invalid_limit"
+        );
+        assert_eq!(
+            validate_namespace_limit(MAX_NAMESPACE_LIMIT + 1)
+                .expect_err("too large is invalid")
+                .code,
+            "invalid_limit"
+        );
+    }
 }
