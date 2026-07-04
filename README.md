@@ -5,7 +5,7 @@
 BiohazardFS is a self-hostable file workspace for production teams that need huge project trees, local caching, safe writes, explicit version/audit history, and agent-friendly automation without making artists manage storage plumbing.
 
 > [!IMPORTANT]
-> BiohazardFS is under active development. The repository currently contains product contracts, architecture docs, and a Rust scaffold. Do not use it for production data yet.
+> BiohazardFS is under active development. The repository currently contains product contracts, architecture docs, runnable Rust service/client scaffolds, an Electron workspace shell, and CI smoke paths. Do not use it for production data yet.
 
 ## What it is
 
@@ -66,18 +66,19 @@ S3-compatible object storage + PostgreSQL metadata
 
 ## Current status
 
-The repo is in planning/scaffolding mode with a runnable Linux-first client foundation.
+The repo is still in planning/scaffolding mode, but the runnable foundation now covers the Linux client loop, the Electron workspace shell, and the first self-hosted server/storage smoke paths.
 
 Current completed foundations:
 
-- Rust workspace scaffold
-- runnable `biohazardfs` CLI scaffold
-- runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC and local-token auth
-- runnable Electron + React + TypeScript + Tailwind/shadcn-compatible Biohazard Workspace shell
-- Linux client smoke path that verifies daemon, CLI, and Electron launch together
-- runnable `biohazardfs-server` foundation with health/readiness/version/status endpoints and Postgres migration baseline
-- server smoke path plus Docker build and RustFS/Postgres Compose config validation
-- strict cross-platform CI
+- Rust workspace scaffold for core, shared API types, CLI, daemon, FUSE adapter, and server/control-plane crates
+- runnable `biohazardfs` CLI scaffold with JSON envelopes, config inspection/validation, daemon calls, command schema introspection, and server-backed namespace/object/file transfer commands
+- runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC-like HTTP and local-token auth
+- runnable Electron + React + TypeScript + Tailwind-compatible Biohazard Workspace shell
+- Linux client smoke path that verifies daemon, CLI, config redaction, workspace listing, and Electron launch together
+- runnable `biohazardfs-server` foundation with health/readiness/version/status endpoints, worker/config commands, Postgres migrations, RustFS/S3-compatible object-store checks, and content/file transfer APIs
+- server smoke paths for API health, database migrations, object-store bucket setup, and end-to-end object/file transfers through Postgres plus RustFS
+- Docker server image, dev Compose stack, and Helm chart scaffolds
+- strict CI gates: the Linux job runs Rust, Electron, shell, workflow, Dockerfile, Docker/Compose, Helm, and smoke checks; Windows and macOS run Rust check/test gates
 - product spec
 - CLI/agent contract
 - local daemon API contract
@@ -97,12 +98,14 @@ Start with:
 - [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md) — filesystem/cache safety rules
 - [`docs/reference/CONFIG.md`](docs/reference/CONFIG.md) — shared typed runtime config contract
 - [`docs/reference/PACKAGING.md`](docs/reference/PACKAGING.md) — installer and release-channel policy
+- [`docs/reference/CI.md`](docs/reference/CI.md) — CI and release-gate policy
+- [`docs/reference/SMOKE.md`](docs/reference/SMOKE.md) — smoke-validation policy and workflow direction
 
 ## Installation
 
 No production installer is published yet.
 
-For local development:
+For local development, install Rust 1.91 or newer, Node 22, pnpm 10.33, and Docker if you want to run server/storage smoke tests. Then run:
 
 ```bash
 git clone https://github.com/Biohazard-VFX/BiohazardFS.git
@@ -136,6 +139,9 @@ For the automated Linux smoke paths used by CI:
 ```bash
 scripts/ci/client-smoke.sh
 scripts/ci/server-smoke.sh
+scripts/ci/server-db-smoke.sh
+scripts/ci/object-store-smoke.sh
+scripts/ci/server-transfer-smoke.sh
 ```
 
 Future public artifacts will target:
@@ -166,6 +172,20 @@ BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot0
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --output ./shot001.exr
 biohazardfs schema list
 biohazardfs schema command daemon.status
+biohazardfs commands
+```
+
+Server/control-plane scaffold commands:
+
+```bash
+biohazardfs-server serve --addr 127.0.0.1:8080
+biohazardfs-server health
+biohazardfs-server version
+biohazardfs-server config
+biohazardfs-server worker
+BIOHAZARDFS_DATABASE_URL=<postgres-url> biohazardfs-server migrate
+biohazardfs-server --config ./config.toml --profile dev object-store check
+biohazardfs-server --config ./config.toml --profile dev object-store ensure-bucket
 ```
 
 Planned examples:
@@ -208,10 +228,13 @@ scripts/ci/server-transfer-smoke.sh
 The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-hosted storage direction:
 
 ```bash
+docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:local .
 docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
+helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
+helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret >/tmp/biohazardfs-helm.yaml
 ```
 
-CI runs the full Linux suite, Electron build/smoke, server smoke, Postgres DB smoke, RustFS object-store smoke, server transfer smoke, Docker/Compose validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
+CI runs the full Linux suite, Electron build/smoke, server smoke, Postgres DB smoke, RustFS object-store smoke, server transfer smoke, Docker/Compose/Helm validation, and Windows/macOS check+test. See [`docs/reference/CI.md`](docs/reference/CI.md).
 
 ## Contributing
 

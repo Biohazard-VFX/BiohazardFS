@@ -54,6 +54,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Changed
 
+- README and `AGENTS.md` now reflect the current CLI/server command surface, smoke scripts, Docker/Compose/Helm validation, and CI gates.
 - Repository documentation now treats docs as product contracts for implementation work.
 
 [Unreleased]: https://github.com/Biohazard-VFX/BiohazardFS/compare/main...HEAD

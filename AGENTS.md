@@ -61,7 +61,7 @@ crates/
   cli/                  # thin CLI over core/daemon/server APIs; JSON-first
   daemon/               # local daemon: mounts, transfer queue, cache manager
   fuse/                 # Linux FUSE adapter/prototype
-  server/               # public server/control-plane binary and modules
+  server/               # public server/control-plane binary, API, migrations, and storage checks
 apps/
   workspace-electron/   # Electron shell, React UI, shadcn components
   admin-web/            # reserved for future admin web UI
@@ -76,7 +76,7 @@ docs/
   architecture/         # architecture and behavioral contracts
   reference/            # CLI/config/CI/security/packaging/smoke references
   adr/                  # architecture decision records
-  operations/           # self-hosting and operations runbooks
+  operations/           # reserved for future self-hosting and operations runbooks
 generated/              # generated schemas, MCP manifests, CLI reference
 tests/                  # product-level smoke/integration/filesystem safety tests
 scripts/                # CI/dev/release helper scripts
@@ -128,12 +128,17 @@ For Linux client integration changes, also run:
 scripts/ci/client-smoke.sh
 ```
 
-For server/control-plane changes, also run:
+For server/control-plane, metadata, transfer, object-store, Docker, Compose, or Helm changes, also run the relevant smoke and packaging checks:
 
 ```bash
 scripts/ci/server-smoke.sh
+scripts/ci/server-db-smoke.sh
+scripts/ci/object-store-smoke.sh
+scripts/ci/server-transfer-smoke.sh
 docker build -f deploy/docker/server/Dockerfile -t biohazardfs-server:local .
 docker compose -f deploy/compose/dev/docker-compose.yml config --quiet
+helm lint deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret
+helm template biohazardfs deploy/helm/biohazardfs --set secrets.existingSecret=biohazardfs-secret >/tmp/biohazardfs-helm.yaml
 ```
 
 Do not use npm for this app. If the project ever changes package manager, update this file and CI in the same change. Do not leave undocumented local build requirements.
@@ -148,8 +153,8 @@ CI also enforces:
 - actionlint for GitHub Actions workflows.
 - Hadolint for Dockerfiles.
 - Helm lint/template for the server chart.
-- Server smoke tests for health, readiness, version, status, and mode commands.
-- Docker server image build and Compose config validation.
+- Server smoke tests for API health/readiness/version/status, server CLI health/version/config/worker/migrate behavior, Postgres migrations, RustFS bucket setup, and object/file transfer paths.
+- Docker server image build, Compose config validation, and Helm lint/template validation.
 
 ### Full repo validation target
 
@@ -249,9 +254,9 @@ Use a CLI contract similar to mature agent-facing CLIs, but keep the requirement
 
 - JSON output by default for machine-oriented commands.
 - Stable JSON error envelope.
-- `commands schema --format json` for discoverability.
-- Redacted `smoke run --format json` for validation.
-- `config path`, `config show --redacted`, and `config doctor` style commands.
+- Implemented command discoverability through `schema list`, `schema command <command-id>`, and the backward-compatible `commands` scaffold.
+- Planned redacted `smoke run --format json` for validation once the smoke command surface exists.
+- `config path`, `config show --redacted`, and `config validate` commands now; `config doctor` remains a planned diagnostic surface.
 - OS keyring credential backend with owner-only local fallback for dev/headless.
 - Dry-run and `--yes` guardrails for destructive operations.
 - Secret-redacted JSONL audit/provenance logs.
@@ -296,13 +301,19 @@ Minimum CI jobs:
 - Linux full suite:
   - Rust format check.
   - Rust clippy with `-D warnings`.
-  - Rust test workspace.
   - Rust check workspace all features.
-  - `git diff --check` equivalent for whitespace.
-  - Rust dependency/security/license audit.
+  - Rust test workspace.
+  - committed-diff whitespace check.
+  - Rust dependency/security/license/source audit with cargo-deny.
+  - Electron pnpm install, strict TypeScript typecheck, ESLint, Prettier check, and build.
+  - ShellCheck for CI shell scripts.
+  - actionlint for GitHub Actions workflows.
+  - Hadolint for Dockerfiles.
+  - Server API smoke, server DB migration smoke, RustFS object-store smoke, server transfer smoke, and Linux client/Electron smoke.
+  - Docker server image build and Compose config validation.
+  - Helm lint and template validation.
 - Windows check/test.
 - macOS check/test.
-- TypeScript install/typecheck/lint/test/build once Electron app is real.
 
 No release artifacts should be cut when required CI fails, required smoke tests for claimed features/platforms fail or are missing, or known critical data-loss/security blockers are open.
 
