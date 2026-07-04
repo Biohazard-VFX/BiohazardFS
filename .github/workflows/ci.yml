@@ -97,6 +97,9 @@ jobs:
           BIOHAZARDFS_SKIP_ELECTRON_BUILD: "1"
         run: bash scripts/ci/client-smoke.sh
 
+      - name: FUSE smoke
+        run: bash scripts/ci/fuse-smoke.sh
+
       - name: Install Helm
         uses: azure/setup-helm@v4
 

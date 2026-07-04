@@ -384,6 +384,24 @@ Rules:
 - `workspace-list` accepts only relative paths that stay inside the configured workspace root.
 - These methods are local runtime inspection primitives for the daemon/Electron/CLI path, not server file APIs.
 
+
+## FUSE mount command
+
+The first virtual-filesystem slice is a separate adapter binary that exposes a read-only FUSE view of a local workspace/source tree:
+
+```bash
+biohazardfs-fuse mount --source /path/to/workspace --mountpoint /path/to/mountpoint
+```
+
+Rules:
+
+- The source and mountpoint must already exist and resolve to directories.
+- The adapter canonicalizes both paths before mounting.
+- The mounted view is read-only; write, unlink, and rmdir requests are denied with a read-only filesystem error.
+- Directory entries are indexed from regular files and directories under the source root. Symlinks and special files are skipped in the MVP to preserve path containment.
+- This is the live mount foundation for Linux. Other platforms currently return an explicit unsupported-platform error. It mirrors a local workspace tree while the daemon/server-backed virtual filesystem and writeback protocol are still evolving.
+- Reproducible smoke proof lives in `scripts/ci/fuse-smoke.sh`; it skips safely when `/dev/fuse` or `fusermount` is unavailable.
+
 ## File workflow commands
 
 First metadata-backed file commands:

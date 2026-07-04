@@ -9,3 +9,8 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+clap.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.17"
+libc = "0.2"
