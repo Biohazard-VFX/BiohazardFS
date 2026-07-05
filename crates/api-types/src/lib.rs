@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod known_methods;
+
 pub const COMMAND_SCHEMA_VERSION: &str = "2026-07-commands-v1";
 pub const DAEMON_SCHEMA_VERSION: &str = "2026-07-daemon-v1";
 pub const EVENT_SCHEMA_VERSION: &str = "2026-07-events-v1";
@@ -442,6 +444,116 @@ pub enum DaemonState {
 pub struct CommandSchemaSummary {
     pub commands: Vec<String>,
     pub note: String,
+}
+
+// ----- Event stream envelope (DAEMON_API.md "Event stream"; EVENT_SCHEMA_VERSION) -----
+
+/// One-way structured event carried over the daemon event stream (NDJSON over
+/// IPC, SSE/NDJSON over dev loopback). The discriminator is `type` on the wire.
+/// Clients must tolerate unknown event types by resyncing through state/list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventEnvelope {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub id: String,
+    pub timestamp: String,
+    pub data: Value,
+    pub meta: EventMeta,
+}
+
+impl EventEnvelope {
+    pub fn new(event_type: impl Into<String>, data: Value) -> Self {
+        Self {
+            event_type: event_type.into(),
+            id: request_id(),
+            timestamp: timestamp(),
+            data,
+            meta: EventMeta::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventMeta {
+    pub request_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub schema_version: String,
+}
+
+impl Default for EventMeta {
+    fn default() -> Self {
+        Self {
+            request_id: None,
+            actor_id: None,
+            device_id: None,
+            schema_version: EVENT_SCHEMA_VERSION.to_string(),
+        }
+    }
+}
+
+/// Initial event family names (DAEMON_API.md). Stable dotted strings.
+pub mod event_types {
+    pub const DAEMON_STARTED: &str = "daemon.started";
+    pub const DAEMON_STOPPING: &str = "daemon.stopping";
+    pub const DAEMON_HEALTH_CHANGED: &str = "daemon.health_changed";
+    pub const AUTH_CHANGED: &str = "auth.changed";
+    pub const MOUNT_ATTACHED: &str = "mount.attached";
+    pub const MOUNT_DETACHED: &str = "mount.detached";
+    pub const MOUNT_HEALTH_CHANGED: &str = "mount.health_changed";
+    pub const FILE_CHANGED: &str = "file.changed";
+    pub const CACHE_STATE_CHANGED: &str = "cache.state_changed";
+    pub const CACHE_QUOTA_WARNING: &str = "cache.quota_warning";
+    pub const TRANSFER_QUEUED: &str = "transfer.queued";
+    pub const TRANSFER_PROGRESS: &str = "transfer.progress";
+    pub const TRANSFER_COMPLETED: &str = "transfer.completed";
+    pub const TRANSFER_FAILED: &str = "transfer.failed";
+    pub const LOCK_CHANGED: &str = "lock.changed";
+    pub const CONFLICT_DETECTED: &str = "conflict.detected";
+    pub const CONFLICT_RESOLVED: &str = "conflict.resolved";
+    pub const SNAPSHOT_CREATED: &str = "snapshot.created";
+    pub const SNAPSHOT_MOUNTED: &str = "snapshot.mounted";
+    pub const AUDIT_EVENT_RECORDED: &str = "audit.event_recorded";
+    pub const WARNING_RAISED: &str = "warning.raised";
+}
+
+// ----- Mutation safety + dry-run operation tokens (COMMANDS.md / DAEMON_API.md) -----
+
+/// How strongly a method mutates state. Drives dry-run operation-token rules
+/// under the `AgentSafe` mutation profile: destructive/admin/data-moving
+/// methods require a token binding the validated params and plan hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationClassification {
+    Read,
+    LowRisk,
+    Destructive,
+    Admin,
+    DataMoving,
+}
+
+/// Fresh installs default to `AgentSafe`; first-run setup may choose `HumanFriendly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationProfile {
+    #[default]
+    AgentSafe,
+    HumanFriendly,
+}
+
+/// Dry-run operation token binding validated params, actor, device, source,
+/// classification, plan hash, and expiry. Applying with changed params must fail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationToken {
+    pub operation_token: String,
+    pub method: String,
+    pub params_hash: String,
+    pub plan_hash: String,
+    pub actor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub source: Source,
+    pub classification: MutationClassification,
+    pub expires_at: String,
 }
 
 pub fn timestamp() -> String {
