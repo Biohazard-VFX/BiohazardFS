@@ -569,17 +569,25 @@ Rules:
 
 ## First implementation slice
 
-The first server/control-plane schema implementation should include:
+The first server/control-plane schema implementation spans migrations `001_baseline.sql` and `003_metadata_baseline.sql`. Every record group below now has a physical Postgres table and a Rust domain type in `biohazardfs-core`:
 
-1. `Organization`, `User`, `Device`, `Token`, `Invite`.
-2. `Project`, `Workset`, `WorksetRule`.
-3. `Node` with stable IDs and soft delete fields.
-4. `FileVersion` pointing to `content_manifest_ref`.
-5. `Grant` for project/workset/node/share resources.
-6. `Operation` for idempotent replay/reconciliation.
-7. `AuditEvent` hybrid envelope/payload storage.
-8. `Lock` and `Conflict` records.
-9. `Snapshot` records with scope fields.
-10. `TrashRecord` and basic retention policy.
+| Group | Logical records | Rust type (`crates/core`) | Postgres table(s) |
+| --- | --- | --- | --- |
+| Org boundary | `Organization`, `User`, `Token` | `org::Organization`, `org::User`, `org::Token` | `organizations`, `users`, `tokens` (001) |
+| Devices | `Device` | `org::Device` | `devices` (003) |
+| Invites | `Invite` | `org::Invite` | `invites` (003) |
+| Projects/worksets | `Project`, `Workset`, `WorksetRule` | `org::Project`, `org::Workset`, `org::WorksetRule` | `projects`, `worksets`, `workset_rules` (003) |
+| Namespace | `Node` | `node::Node` | `nodes` (001) |
+| Versions | `FileVersion`, `ContentManifest` | `version::FileVersion`, `version::ContentManifestRef` | `file_versions`, `content_manifests` (001) |
+| Grants | `Grant`, `Share`, `Publish` | `grant::Grant`, `grant::Share`, `grant::Publish` | `grants`, `shares`, `publishes` (003) |
+| Operations | `Operation` | `operation::Operation` | `operations` (001) |
+| Audit | `AuditEvent` | `event::AuditEvent` | `audit_events` (001) |
+| Locks/conflicts | `Lock`, `Conflict` | `lock::FileLock`, `conflict::Conflict` | `locks`, `conflicts` (003) |
+| Snapshots | `Snapshot` | `snapshot::Snapshot` | `snapshots` (003) |
+| Trash/retention | `TrashRecord`, `RetentionPolicy` | `org::TrashRecord`, `org::RetentionPolicy` | `trash_records`, `retention_policies` (003) |
 
-Do not implement optimistic offline writes without operation idempotency, conflict creation, audit linkage, and dirty-data preservation tests.
+This document remains the authoritative logical schema; physical table names and column shapes live in the migration SQL and mirror the field names here. `upload_sessions` (001) is an upload/transfer-session table that supports the object-store transfer path but is not yet represented as a first-class domain record in `biohazardfs-core`.
+
+Known physical/logical divergences to keep aligned: the `operations` table CHECK constraint uses status values `pending|applying|applied|conflict|failed|cancelled`, whereas the logical `OperationStatus` enum is `received|accepted|applied|rejected|conflicted|superseded`; the server normalizes between them at the request boundary (currently writing `pending` on submit). Any future operation-status work must reconcile the enum and the CHECK constraint in the same change.
+
+The metadata read/submit spine (`locks`, `conflicts`, `operations.submit`, `trash`, `audit.events`, `devices`, `projects`, `worksets`) is exercised by the server over these tables (see SERVER_API.md). Optimistic offline writes remain gated: `operations.submit` records but does not yet apply, and `operations.replay`, conflict creation from replay, audit linkage on apply, and dirty-data preservation tests must land before daemon sync integration is enabled.

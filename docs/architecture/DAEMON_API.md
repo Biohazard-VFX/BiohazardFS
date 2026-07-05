@@ -251,12 +251,34 @@ Error responses use the same envelope:
 
 ## Current workspace runtime methods
 
-The current scaffold exposes two local workspace runtime methods over the owner-token daemon transport:
+The daemon dispatch table wires every method in the `known_methods::DAEMON_METHODS` registry — the single source of truth shared with the CLI `schema`/`commands` surface and the server methods route. `daemon.methods` enumerates that registry on the wire, sorted and deduped.
 
-- `workspace.status`: reports whether `BIOHAZARDFS_WORKSPACE_ROOT` is configured, exists, and is writable.
-- `workspace.list`: lists up to 500 entries under a relative workspace path while rejecting absolute paths, parent traversal, and control characters.
+Two layers are wired:
 
-The workspace root is configured in the daemon process environment, not passed by clients through argv. These methods are the first smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine. The Electron scaffold calls them through context-isolated preload IPC and the desktop smoke requires both daemon status and workspace status to be reachable.
+- **Spine — SCAFFOLD (in-memory):** read and low-risk methods run against an in-memory `DaemonBackend` that owns the seeded namespace, cache index, locks, conflicts, transfers, operation-token table, audit buffer, and live event buffer. They return real payloads and drive real `CacheState` transitions, but the backend is rebuilt on each daemon start; nothing is persisted to SQLite yet.
+- **Periphery — SCAFFOLD (`method_not_implemented`):** destructive, admin, data-moving, and not-yet-built methods pass the operation-token policy check and then return `method_not_implemented`, so the registry never overstates what is real.
+
+Spine methods (implemented against the in-memory backend):
+
+- daemon runtime: `daemon.status`, `daemon.health`, `daemon.version`, `daemon.methods`, `daemon.events.subscribe` (ack + replay window only; the NDJSON/SSE transport is not wired — see "Event stream").
+- workspace runtime: `workspace.status`, `workspace.list`.
+- auth/session: `auth.status`, `auth.whoami`, `auth.credentials_path`.
+- config: `config.path`, `config.show`, `config.get`, `config.validate`.
+- mount: `mount.status`, `mount.list`.
+- file: `file.stat`, `file.list`, `file.checksum`, `file.history`, `file.versions`, plus the Wave 3 pair `file.write` and `file.read`.
+- cache: `cache.status`, `cache.list`, `cache.pin`, `cache.unpin`, `cache.hydrate`, `cache.dehydrate`, `cache.verify`.
+- lock: `lock.list`, `lock.acquire`, `lock.release`, `lock.status`, `lock.extend`.
+- conflict: `conflict.list`, `conflict.show`.
+- transfer: `transfer.list`, `transfer.status`.
+- snapshot: `snapshot.list`.
+- workset: `workset.list`, `workset.show`.
+- collaboration reads: `invite.list`, `share.list`, `grant.list`, `publish.list`.
+- audit reads: `audit.events`, `audit.event`, `audit.actor`.
+- schema: `schema.list`, `schema.method`.
+
+Every other entry in the method-groups block above (`daemon.shutdown`, `daemon.restart`, `daemon.logs`; `auth.enroll`/`login_token`/`logout`/`rotate_credentials`; `config.set`/`migrate`; `mount.attach`/`detach`/`repair`; `file.restore`/`delete`/`move`/`copy`; `cache.evict`/`move`/`repair`; `transfer.pause`/`resume`/`cancel`/`retry`; `snapshot.create`/`mount`/`unmount`/`diff`/`restore`; `lock.break`; `conflict.resolve`/`preserve_all`; `workset.activate`/`deactivate`/`sync`/`create`/`update`; `invite.create`/`revoke`, `share.create`/`revoke`, `grant.set`/`revoke`, `publish.create`/`revoke`; `audit.export`; all `admin.*`; and `schema.event`/`error`/`config`/`all`) is wired but returns `method_not_implemented`.
+
+`workspace.status` reports whether `BIOHAZARDFS_WORKSPACE_ROOT` is configured, exists, and is writable; `workspace.list` lists up to 500 entries under a relative workspace path while rejecting absolute paths, parent traversal, and control characters. The workspace root is configured in the daemon process environment, not passed by clients through argv. These two remain the smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine, and the Electron scaffold still calls them through context-isolated preload IPC.
 
 ## Event stream
 
@@ -628,20 +650,29 @@ file.stat against local placeholder state
 
 ## Initial implementation slice
 
-The first daemon API implementation should establish the safety and introspection substrate before real filesystem mutation:
+The first daemon API implementation establishes the safety and introspection substrate before real filesystem mutation. Current status of each item:
 
-1. Endpoint discovery descriptor.
-2. IPC transport on the first dogfood platform.
-3. Optional loopback HTTP for tests/dev.
-4. Local session token validation.
-5. Standard request/response envelope.
-6. Schema registry for implemented methods/events/errors/config.
-7. `daemon.status`, `daemon.health`, `daemon.version`.
-8. `config.path`, `config.show`, `config.validate`.
-9. `auth.status` with redaction.
-10. `mount.status` against mock state.
-11. `cache.status`, `cache.pin`, `cache.dehydrate --dry-run` against mock state.
-12. `file.stat`, `file.list` against mock namespace.
-13. `daemon.events.subscribe` NDJSON/SSE stream.
+1. Endpoint discovery descriptor — SCAFFOLD. The `TransportDescriptor` shape and schema version are wired and round-trip tested; the IPC `endpoint` field is `None` because platform IPC is not implemented (`transport.rs`).
+2. IPC transport on the first dogfood platform — PLANNED. Unix domain socket (Linux/macOS) and named pipe (Windows) are reserved enum variants only.
+3. Optional loopback HTTP for tests/dev — IMPLEMENTED (`run_dev_loopback_http`: 127.0.0.1/[::1] only, owner token required). This is the transport the CLI, Electron, and tests drive today.
+4. Local session token validation — IMPLEMENTED (bearer-token check on every request; missing or invalid returns `unauthorized`).
+5. Standard request/response envelope — IMPLEMENTED (`DaemonRequest` / `ResponseEnvelope` with stable `method`, `request_id`, `source`, and `schema_version` metadata).
+6. Schema registry for implemented methods/events/errors/config — SCAFFOLD. `schema.list` and `schema.method` are spine (read from `known_methods::DAEMON_METHODS`); `schema.event`, `schema.error`, `schema.config`, and `schema.all` return `method_not_implemented`.
+7. `daemon.status`, `daemon.health`, `daemon.version` — IMPLEMENTED (spine).
+8. `config.path`, `config.show`, `config.validate` — IMPLEMENTED (spine). `config.get` is also spine; `config.set` and `config.migrate` are periphery.
+9. `auth.status` with redaction — IMPLEMENTED (spine; honestly reports `enrolled: false`).
+10. `mount.status` against mock state — IMPLEMENTED (spine, against the in-memory mounts vec).
+11. `cache.status`, `cache.pin`, `cache.dehydrate` against mock state — IMPLEMENTED (spine). `cache.pin`/`unpin`/`hydrate`/`dehydrate`/`verify` all drive the real `CacheState` machine, and `cache.dehydrate` enforces the dirty/pinned invariant today. `cache.evict`/`move`/`repair` are periphery.
+12. `file.stat`, `file.list` against mock namespace — IMPLEMENTED (spine). The Wave 3 pair `file.write` / `file.read` is also spine.
+13. `daemon.events.subscribe` NDJSON/SSE stream — SCAFFOLD. The method returns an ack with a bounded replay window; the streaming transport itself is not wired (`event_stream::drain_recent_events` is the seam).
 
-Do not implement destructive local filesystem behavior before local auth, schema validation, dry-run planning, response envelopes, and audit provenance are implemented.
+Beyond this slice, the spine now covers read surfaces for locks, conflicts, transfers, snapshots, worksets, collaboration, and audit, all against the in-memory backend. The AgentSafe mutation policy — dry-run operation tokens with params-hash binding, enforced uniformly across spine and periphery — is implemented (the scaffold params hash is FNV-1a; production swaps in `sha256:`).
+
+Next required work before this stops being a scaffold:
+
+- Production IPC transport (Unix socket / named pipe) plus the owner-only descriptor file on disk.
+- SQLite projection of cache index, transfer queue, operation tokens, audit buffer, and event cursors so dirty and queued state survives restart.
+- NDJSON/SSE event transport wired to the existing event buffer.
+- Promoting destructive/data-moving periphery (`file.delete`, `file.move`, `file.restore`, `cache.evict`, `mount.attach`/`detach`, `auth.logout`, and the rest) off `method_not_implemented`.
+
+Do not implement destructive local filesystem behavior before local auth, schema validation, dry-run planning, response envelopes, and audit provenance are implemented. The substrate for each is now in place; the remaining hard gate is durable local state.

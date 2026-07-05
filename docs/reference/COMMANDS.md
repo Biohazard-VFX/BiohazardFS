@@ -26,22 +26,30 @@ Command style: canonical namespaces with short aliases for common workflows
 MCP surface: biohazardfs mcp over stdio
 ```
 
-Global flags:
+Global flags (implemented):
 
 ```bash
 biohazardfs <command> \
-  --profile <name> \
+  --daemon-endpoint <host:port> \
   --config <path> \
+  --profile <name> \
   --output json|ndjson|text \
   --fields <field-mask> \
-  --limit <n> \
   --cursor <cursor> \
-  --source cli|agent|ui|api|server \
+  --source cli|agent|ui|api|server|test \
   --request-id <id> \
-  --no-color
+  --dry-run \
+  --yes
 ```
 
 `--output text` is for humans only. Tests, agents, scripts, and CI should use default JSON or explicit `--output json` / `--output ndjson`.
+
+`--output` versus `--out` (named distinctly to avoid collision):
+
+- `--output <json|ndjson|text>` is the global response format flag.
+- `object get` and `file get` write a downloaded blob to a local file with `--out <path>` (renamed from the earlier `--output`). The CLI refuses to overwrite an existing path.
+
+`--daemon-endpoint` defaults to the dev loopback HTTP JSON-RPC endpoint (`127.0.0.1:47666`) and is the current CLI↔daemon transport; production will move to descriptor-discovered IPC and this flag will be retired. `--limit` exists as a per-command argument on list-style subcommands, not as a global. `--no-color` is not implemented in the current CLI.
 
 ## Standard response envelope
 
@@ -297,9 +305,13 @@ Rules:
 - `auth status` redacts credential material.
 - Device sessions must be individually revocable by authorized users/admins.
 
+Status: `auth status`, `auth whoami`, and `auth credentials path` are wired to the daemon spine and return honest scaffold state (no enrolled device, no credentials present, advisory credentials path). `auth enroll`, `auth login`, `auth logout`, and `auth credentials rotate` are wired as CLI subcommands but their daemon backing (`auth.enroll`, `auth.login_token`, `auth.logout`, `auth.rotate_credentials`) returns `method_not_implemented` in the current scaffold. `auth logout` is Admin-class and additionally requires `--yes` or `--dry-run` under the agent-safe profile.
+
 ## Config commands
 
-Config is TOML on disk and JSON through the CLI. Currently implemented:
+Config is TOML on disk and JSON through the CLI.
+
+Implemented (CLI-local, read resolved TOML from `--config`/`--profile`/env):
 
 ```bash
 biohazardfs config path
@@ -307,10 +319,11 @@ biohazardfs config show --redacted
 biohazardfs config validate
 ```
 
-Planned:
+Scaffold (daemon RPC spine; invoked by the CLI's config subcommands above and by other clients — `config.path`, `config.show`, `config.validate`, and `config.get` all run against the in-memory backend and return scaffold defaults): no separate CLI subcommand is exposed for `config get` yet.
+
+Planned (CLI subcommands not yet present; daemon methods `config.set` and `config.migrate` return `method_not_implemented`):
 
 ```bash
-biohazardfs config show
 biohazardfs config get <key>
 biohazardfs config set <key> <value> --dry-run
 biohazardfs config set <key> <value> --yes
@@ -318,7 +331,7 @@ biohazardfs config migrate --dry-run
 biohazardfs config migrate --yes
 ```
 
-`config show` is redacted by default in the current scaffold even when `--redacted` is omitted.
+`config show` is redacted by default in the current scaffold even when `--redacted` is omitted; omitting the flag adds a warning that calls this out. The daemon's `config.get` is wired as a spine method but returns `config_key_not_found` for every key because the scaffold holds no configured values.
 
 Expected config keys include:
 
@@ -337,7 +350,7 @@ features.*
 
 ## Namespace commands
 
-Currently implemented server-backed namespace read command:
+Implemented server-backed namespace read command:
 
 ```bash
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
@@ -354,11 +367,11 @@ Rules:
 
 ## Content object commands
 
-Currently implemented server-backed content-object transfer commands:
+Implemented server-backed content-object transfer commands:
 
 ```bash
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object put ./plate.exr
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <content-hash> --output ./plate.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <content-hash> --out ./plate.exr
 ```
 
 Rules:
@@ -366,12 +379,12 @@ Rules:
 - `BIOHAZARDFS_SERVER_TOKEN` is the only current server bearer-token source; do not pass server tokens through argv.
 - The commands read `server.public_url` from resolved shared config and currently send bearer tokens only to resolved loopback HTTP server URLs.
 - `object.put` reads a bounded local file, uploads it through the server content-object API, and returns `content_hash`, `size_bytes`, `storage_provider`, and `object_key` in the CLI command envelope.
-- `object.get` downloads through the server content-object API, verifies/writes the requested object to `--output`, removes the server `content_hex` payload from CLI output, and returns metadata plus `output_path`.
+- `object.get` downloads through the server content-object API, verifies the decoded content hash locally, writes the requested object to `--out`, removes the server `content_hex` payload from CLI output, and returns metadata plus `output_path`. The CLI refuses to overwrite an existing `--out` path.
 - These commands are content-object primitives, not final user-facing file-version mutation commands.
 
 ## Daemon workspace commands
 
-Local daemon workspace runtime commands:
+Implemented local daemon workspace runtime commands:
 
 ```bash
 BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs daemon workspace-status
@@ -387,40 +400,54 @@ Rules:
 
 ## FUSE mount command
 
-The first virtual-filesystem slice is a separate adapter binary that exposes a read-only FUSE view of a local workspace/source tree:
+The FUSE adapter is a separate binary, `biohazardfs-fuse`. It currently exposes two mount modes.
+
+Read-only source-backed mount (Linux; the live mount foundation):
 
 ```bash
 biohazardfs-fuse mount --source /path/to/workspace --mountpoint /path/to/mountpoint
 ```
 
+Read-write daemon-backed workspace mount (Linux; the FUSE write path):
+
+```bash
+biohazardfs-fuse mount-workspace \
+  --daemon-endpoint 127.0.0.1:47666 \
+  --local-token "$BIOHAZARDFS_LOCAL_TOKEN" \
+  --cache-dir /path/to/cache \
+  --mountpoint /path/to/mountpoint
+```
+
 Rules:
 
-- The source and mountpoint must already exist and resolve to directories.
-- The adapter canonicalizes both paths before mounting.
-- The mounted view is read-only; write, unlink, and rmdir requests are denied with a read-only filesystem error.
-- Directory entries are indexed from regular files and directories under the source root. Symlinks and special files are skipped in the MVP to preserve path containment.
-- This is the live mount foundation for Linux. Other platforms currently return an explicit unsupported-platform error. It mirrors a local workspace tree while the daemon/server-backed virtual filesystem and writeback protocol are still evolving.
-- Reproducible smoke proof lives in `scripts/ci/fuse-smoke.sh`; it skips safely when `/dev/fuse` or `fusermount` is unavailable.
+- For `mount`: the source and mountpoint must already exist and resolve to directories. The adapter canonicalizes both paths before mounting.
+- For `mount`: the mounted view is read-only; write, unlink, and rmdir requests are denied with a read-only filesystem error. Directory entries are indexed from regular files and directories under the source root; symlinks and special files are skipped in the MVP to preserve path containment.
+- For `mount-workspace`: files hydrate from the daemon via `file.read` on open, writes buffer per file handle, and one complete blob is pushed per flush/fsync via `file.write`. Dirty data is never lost: a write that has not flushed is not acked to the daemon, and dehydrate/evict refuse dirty or pinned cache entries.
+- For `mount-workspace`: cache state drives through the legal forward transition path (Absent/Failed → Populating → Ready, Ready → Dirty → Ready on overwrite); illegal transitions are rejected, never papered over.
+- Both modes are Linux-only. Other platforms return an explicit `unsupported_platform` error.
+- Reproducible smoke proof lives in `scripts/ci/fuse-smoke.sh`; it exercises both `mount` and `mount-workspace` and skips safely when `/dev/fuse` or `fusermount` is unavailable.
 
 ## File workflow commands
 
-First metadata-backed file commands:
+Two file workflows are implemented. The server-backed metadata workflow (current-version primitives):
 
 ```bash
 BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot001.exr
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --output ./shot001.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --out ./shot001.exr
 ```
 
 Rules:
 
 - `file put` uploads bounded local content through the server, stores the object in RustFS, and records/updates a Postgres file node plus current file version.
-- `file get` resolves the current file version by node ID, downloads the server-verified object, verifies the decoded content hash locally, strips `content_hex` from CLI output, and refuses to overwrite existing output paths.
+- `file get` resolves the current file version by node ID, downloads the server-verified object, verifies the decoded content hash locally, writes it to `--out` (refusing to overwrite an existing path), and strips `content_hex` from CLI output.
 - Server bearer tokens still come only from `BIOHAZARDFS_SERVER_TOKEN`; the MVP HTTP client still sends bearer tokens only to resolved loopback HTTP URLs until HTTPS lands.
 - This is a smokeable current-version workflow, not the final conflict-resolution/sync protocol.
 
+The daemon-backed file namespace (`file stat`, `file list`, `file history`, `file versions`, `file checksum`, `file read`, `file write`) is wired to the daemon spine; see "Canonical command namespaces" for the full status split. `file restore`, `file delete`, `file move`, and `file copy` are wired as CLI subcommands but their daemon backing returns `method_not_implemented`.
+
 ## Schema introspection commands
 
-Agents must be able to discover the command surface without reading Markdown docs.
+Agents must be able to discover the command surface without reading Markdown docs. All `schema` subcommands are implemented at the CLI layer and read from the `known_methods` registry, so they return real data without a running daemon:
 
 ```bash
 biohazardfs schema list
@@ -431,6 +458,8 @@ biohazardfs schema config
 biohazardfs schema all --output ndjson
 ```
 
+`biohazardfs commands` is a backward-compatible alias for `schema list`.
+
 Examples:
 
 ```bash
@@ -440,7 +469,7 @@ biohazardfs schema error confirmation_required
 biohazardfs schema config
 ```
 
-Schema output should include:
+Schema output includes: command name, group, surface, mutation classification, mutation-gate description, summary, and aliases. The richer per-command contract fields below are the target shape; the current descriptor carries the classification + summary that the mutation gate and `tools/list` annotations consume.
 
 - command name
 - aliases
@@ -454,13 +483,13 @@ Schema output should include:
 
 ## MCP surface
 
-`biohazardfs mcp` exposes the same command schema as typed stdio tools.
+`biohazardfs mcp serve` exposes a minimal JSON-RPC 2.0 stdio surface.
 
 ```bash
-biohazardfs mcp
-biohazardfs mcp --tools file,snapshot,audit,cache
-biohazardfs mcp --profile studio
+biohazardfs mcp serve
 ```
+
+Status: the stdio seam implements `initialize`, `ping`, and `tools/list`. `tools/list` is generated from the same `known_methods` registry as the CLI, so every registered command appears as a tool with its classification in the annotations. `tools/call` validates the tool name but returns a typed JSON-RPC error (`method_not_implemented`) instructing the caller to run the matching `biohazardfs` CLI subcommand; tool execution is not wired through the CLI tree in this build. The earlier `--tools` / `--profile` filter flags are not implemented.
 
 Rules:
 
@@ -472,6 +501,14 @@ Rules:
 ## Canonical command namespaces
 
 The CLI uses canonical namespaced commands. Short aliases may exist for common workflows, but docs and schemas should always identify the canonical command.
+
+Status legend for the namespaces below (verified against `crates/cli/src/main.rs` and `crates/api-types/src/known_methods.rs`):
+
+- **IMPLEMENTED**: the CLI subcommand exists and its daemon backing runs against the in-memory backend, or the command is resolved CLI-local (schema, version, status, doctor, config). These return real data.
+- **SCAFFOLD**: the CLI subcommand exists and dispatches, but the daemon backing returns `method_not_implemented` (periphery), or the command returns a typed stub (for example `daemon start`, `smoke run`, `doctor --json-deep`). The mutation gate, error envelope, and exit code are all real; the body is not.
+- **PLANNED**: the command surface below is the contract target but no CLI subcommand is wired yet (for example `config get`, `config set`, `config migrate`, short aliases beyond the ones implemented).
+
+Destructive / admin / data-moving methods are wired as CLI subcommands and gated by the agent-safe policy. Under the current scaffold, running one with `--dry-run` mints a CLI-side operation token and plan (exit 7); running with `--yes` dispatches to the daemon, which still requires its own server-issued operation token for destructive/admin/data-moving methods, so the apply path surfaces `operation_token_required` (or `method_not_implemented` for periphery methods) until the CLI→daemon token handoff lands. Read and low-risk mutations proceed end-to-end.
 
 ### Core/runtime
 
@@ -488,6 +525,8 @@ biohazardfs daemon logs --limit 100
 biohazardfs daemon events --output ndjson
 ```
 
+Status: `version`, `status`, shallow `doctor`, `daemon status`, `daemon methods`, `daemon events`, `daemon workspace-status`, and `daemon workspace-list` are IMPLEMENTED. `doctor --json-deep`, `smoke run`, `daemon start`, `daemon stop`, `daemon restart`, and `daemon logs` are SCAFFOLD: `doctor --json-deep` emits a stub warning, `smoke run` returns `method_not_implemented` and points at `scripts/ci/*-smoke.sh`, and the daemon lifecycle methods (`daemon.shutdown`, `daemon.restart`, `daemon.logs`) are periphery. `daemon stop`/`daemon restart` are also Admin-class and require `--yes` or `--dry-run`.
+
 ### Mount
 
 ```bash
@@ -498,6 +537,8 @@ biohazardfs mount list
 biohazardfs mount repair --dry-run
 biohazardfs mount repair --yes
 ```
+
+Status: `mount status` and `mount list` are IMPLEMENTED (spine). `mount attach`, `mount detach`, and `mount repair` are SCAFFOLD (periphery → `method_not_implemented`). Live attach happens through the `biohazardfs-fuse` adapter binary, not this daemon RPC surface.
 
 ### File namespace
 
@@ -527,6 +568,8 @@ biohazardfs versions <path>        # file versions
 biohazardfs restore ...            # file restore
 ```
 
+Status: the daemon spine for `file.stat`, `file.list`, `file.history`, `file.versions`, `file.checksum`, `file.read`, and `file.write` is IMPLEMENTED against the in-memory namespace (resolves by `node_id` / `parent_node_id`). `file write` and `file read` round-trip real content via `content_hex`. `file restore`, `file delete`, `file move`, and `file copy` are SCAFFOLD (periphery → `method_not_implemented`). The short aliases above are PLANNED. Note: the thin `file stat/list/history/versions/checksum` subcommands currently forward a `path` argument while the daemon resolves by `node_id`; the path→node resolution seam is still being wired, so callers that hit the daemon through `--json '{"node_id":"..."}'` get real data while the positional `<path>` forms will round out in a follow-up.
+
 ### Cache namespace
 
 ```bash
@@ -553,6 +596,8 @@ biohazardfs hydrate <path>         # cache hydrate
 biohazardfs dehydrate <path>       # cache dehydrate
 ```
 
+Status: `cache status`, `cache list`, `cache pin`, `cache unpin`, `cache hydrate`, `cache dehydrate`, and `cache verify` are IMPLEMENTED. `cache dehydrate` enforces the dirty-data-never-lost and pinned-not-evicted invariants (returns `cache_entry_dirty` / `cache_entry_pinned` instead of removing data). `cache evict`, `cache move`, and `cache repair` are SCAFFOLD (periphery). The short aliases above are PLANNED.
+
 ### Transfer namespace
 
 ```bash
@@ -564,6 +609,8 @@ biohazardfs transfer cancel <transfer-id> --dry-run
 biohazardfs transfer cancel <transfer-id> --yes
 biohazardfs transfer retry <transfer-id> --yes
 ```
+
+Status: `transfer list` and `transfer status` are IMPLEMENTED (spine, against the in-memory transfer records). `transfer pause`, `transfer resume`, `transfer cancel`, and `transfer retry` are SCAFFOLD (periphery).
 
 ### Snapshot namespace
 
@@ -584,6 +631,8 @@ Short aliases:
 biohazardfs snapshots              # snapshot list
 ```
 
+Status: `snapshot list` is IMPLEMENTED (spine; returns an honest empty list because snapshots are server-owned). `snapshot create`, `snapshot mount`, `snapshot unmount`, `snapshot diff`, and `snapshot restore` are SCAFFOLD (periphery). The `snapshots` alias is PLANNED.
+
 ### Lock namespace
 
 ```bash
@@ -596,6 +645,8 @@ biohazardfs lock break <lock-id> --dry-run
 biohazardfs lock break --apply <operation-token>
 ```
 
+Status: `lock list`, `lock acquire`, `lock release`, `lock status`, and `lock extend` are IMPLEMENTED (spine, with lazy TTL expiry reporting). `lock break` is SCAFFOLD (periphery, Admin-class).
+
 ### Conflict namespace
 
 ```bash
@@ -605,6 +656,8 @@ biohazardfs conflict resolve --json '{...}' --dry-run
 biohazardfs conflict resolve --apply <operation-token>
 biohazardfs conflict preserve-all <conflict-id> --yes
 ```
+
+Status: `conflict list` and `conflict show` are IMPLEMENTED (spine). `conflict resolve` and `conflict preserve-all` are SCAFFOLD (periphery).
 
 ### Workset namespace
 
@@ -620,6 +673,8 @@ biohazardfs workset create --yes --json '{...}'
 biohazardfs workset update <workset-id> --json '{...}' --dry-run
 biohazardfs workset update <workset-id> --yes --json '{...}'
 ```
+
+Status: `workset list` and `workset show` are IMPLEMENTED (spine; honest empty / `workset_not_found` because worksets are server-owned and the daemon cache is empty in the scaffold). `workset activate`, `workset deactivate`, `workset sync`, `workset create`, and `workset update` are SCAFFOLD (periphery).
 
 ### Collaboration/share namespace
 
@@ -649,6 +704,8 @@ biohazardfs publish revoke <publish-id> --dry-run
 biohazardfs publish revoke --apply <operation-token>
 ```
 
+Status: `invite list`, `share list`, `grant list`, and `publish list` are IMPLEMENTED (spine; honest empty lists). All mutations in this namespace (`invite create/revoke`, `share create/revoke`, `grant set/revoke`, `publish create/revoke`) are SCAFFOLD (periphery). `grant set` and `grant revoke` are Admin-class.
+
 ### Audit namespace
 
 ```bash
@@ -660,6 +717,8 @@ biohazardfs audit export --params '{...}' --output ndjson
 ```
 
 Audit events should be safe for agents by default: redacted secrets, bounded output, stable event types, and explicit provenance.
+
+Status: `audit events`, `audit event`, and `audit actor` are IMPLEMENTED (spine, against the in-memory audit buffer). `audit export` is SCAFFOLD (periphery, Data-moving).
 
 ### Admin namespace
 
@@ -677,6 +736,8 @@ biohazardfs admin retention show
 biohazardfs admin retention set --json '{...}' --dry-run
 biohazardfs admin support-bundle create --redacted --yes
 ```
+
+Status: every `admin *` subcommand is wired but SCAFFOLD: the daemon backing for the entire `admin.*` group returns `method_not_implemented`. All admin methods are Admin-class, so under the agent-safe profile they require `--dry-run` (mints a CLI plan, exit 7) or `--yes` (dispatches; the daemon then reports `operation_token_required` until the token handoff lands, and `method_not_implemented` once it does).
 
 ## Error codes
 
@@ -704,6 +765,7 @@ mount_unavailable
 unsupported_platform
 feature_disabled
 internal_error
+method_not_implemented
 ```
 
 Error objects must include stable `code`, human-readable `message`, and optional structured `details`.
@@ -724,19 +786,37 @@ JSON is the source of truth, but shell exit codes should still be predictable:
 8  unsupported platform or feature disabled
 ```
 
-## First implementation slice
+## Implementation status
 
-The first CLI implementation should not build every command above. It should establish the contract that all later commands follow:
+The CLI command tree in `crates/cli/src/main.rs` wires the full canonical namespace above (every subcommand is parsed, dispatched, and emits the standard response envelope). What varies is whether the backing produces real data. The status of each command is summarized per-namespace in "Canonical command namespaces" above and verified against `crates/api-types/src/known_methods.rs` and the daemon dispatch table in `crates/daemon/src/lib.rs`.
 
-1. Standard JSON response envelope.
-2. `schema` registry for implemented commands/errors/config.
-3. TOML config read/write/validate.
-4. `auth status` with redacted credentials.
-5. `doctor` and `smoke run`.
-6. `daemon status`.
-7. `mount status`.
-8. `cache status`, `cache pin`, `cache dehydrate --dry-run`.
-9. `file stat`, `file list` against a mock namespace.
-10. `mcp` stdio surface for implemented commands.
+### Implemented (real behavior, tested)
 
-Do not add mutating filesystem behavior until dry-run, response envelope, input validation, and schema introspection exist.
+- Standard JSON response envelope, `--output json|ndjson|text`, ndjson streaming over list-shaped reads, `--fields`/`--cursor` pagination, `--source`/`--request-id` provenance, and the seven global mutation/provenance/output flags.
+- Mutation gating under the agent-safe profile: read/low-risk proceed; destructive/admin/data-moving commands require `--dry-run` (CLI mints an operation token + plan, exit 7) or `--yes`. Exit codes 5 (conflict/lock) and 8 (unsupported platform / feature disabled) are mapped.
+- `schema list` / `commands` (registry from `known_methods`), `schema command`, `schema event`, `schema error`, `schema config`, `schema all` — resolved CLI-local, no daemon required.
+- `version`, `status`, shallow `doctor`, `config path`, `config show --redacted`, `config validate` — CLI-local, read resolved TOML.
+- Server-backed `namespace children`, `object put`/`object get`, `file put`/`file get` (content-object and current-version primitives; `--out` writes the local file).
+- Daemon workspace runtime: `workspace.status`, `workspace.list`, `daemon.status`, `daemon.health`, `daemon.version`, `daemon.methods`, `daemon.events.subscribe`.
+- Daemon file/cache/lock/conflict/transfer/snapshot/workset/collaboration/audit **read spines** plus low-risk mutations (`file.write`, `file.read`, `cache.pin`, `cache.unpin`, `cache.hydrate`, `cache.dehydrate`, `cache.verify`, `lock.acquire`, `lock.release`, `lock.extend`).
+- `mcp serve` stdio seam: `initialize`, `ping`, `tools/list` (generated from `known_methods`).
+- FUSE: `biohazardfs-fuse mount` (read-only source-backed) and `biohazardfs-fuse mount-workspace` (read-write daemon-backed, hydrate-on-open, write/flush/fsync through `file.write`, dirty-data-never-lost). Linux only; smoke in `scripts/ci/fuse-smoke.sh`.
+
+### Scaffold (typed + wired + tested seam, returns `method_not_implemented` or a typed stub)
+
+- All destructive/admin/data-moving daemon methods are wired as CLI subcommands and pass the mutation gate, but the daemon dispatch routes them to a periphery arm that returns `method_not_implemented` after the operation-token check. This covers: `file.restore/delete/move/copy`, `cache.evict/move/repair`, `transfer.pause/resume/cancel/retry`, `snapshot.create/mount/unmount/diff/restore`, `lock.break`, `conflict.resolve/preserve_all`, `workset.activate/deactivate/sync/create/update`, all `invite/share/grant/publish` mutations, `audit.export`, and the entire `admin.*` group.
+- Auth mutations (`auth.enroll`, `auth.login`, `auth.logout`, `auth.credentials rotate`), `config.set`/`config.migrate`, `mount.attach`/`mount.detach`/`mount.repair`, and `daemon.shutdown`/`daemon.restart`/`daemon.logs` are periphery.
+- `daemon start`, `smoke run`, and `doctor --json-deep` return typed stubs (`method_not_implemented`) with pointers to where the real behavior will land.
+- `mcp serve` `tools/call` validates the tool name but returns a JSON-RPC error instructing the caller to use the matching CLI subcommand; tool execution is not wired through the CLI tree.
+- The CLI→daemon operation-token handoff is not wired: the CLI mints dry-run tokens locally, and the daemon validates only tokens it issued itself, so `--yes` on destructive/admin/data-moving methods surfaces `operation_token_required` from the daemon. Read and low-risk mutations execute end-to-end.
+
+### Planned (in the spec, not yet in code)
+
+- `config get`, `config set`, `config migrate` CLI subcommands; the daemon spine for `config.get` exists but `config.set`/`config.migrate` are periphery.
+- Short aliases (`ls`, `stat`, `history`, `versions`, `restore`, `pin`, `unpin`, `hydrate`, `dehydrate`, `snapshots`).
+- Per-command `--apply <operation-token>` flow and the HumanFriendly mutation profile.
+- `--no-color` global, `--limit` as a global, and the `--tools`/`--profile` MCP filter flags.
+- Full per-command JSON Schema output (input/output schemas, permissions, examples) in `schema command`; the current descriptor carries classification + summary + mutation gate.
+- `config doctor` diagnostic surface and the redacted `smoke run --format json` reporter.
+
+Do not add mutating filesystem behavior beyond the low-risk spine until dry-run, response envelope, input validation, schema introspection, and the daemon operation-token backend are all real.
