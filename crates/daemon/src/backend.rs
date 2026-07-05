@@ -29,9 +29,15 @@ use biohazardfs_core::{
     cache::{CacheEntry, CacheState, CacheStats, transition as cache_transition},
     conflict::Conflict,
     event::{AUDIT_PAYLOAD_SCHEMA_VERSION, AuditEvent, AuditEventResult},
-    id::{NODE_ID_PREFIX, generate_id, validate_node_id, validate_version_id},
+    id::{
+        NODE_ID_PREFIX, OBJECT_ID_PREFIX, OPERATION_ID_PREFIX, VERSION_ID_PREFIX, generate_id,
+        validate_node_id, validate_version_id,
+    },
     lock::{FileLock, LockKind, LockStatus},
     node::{Node, NodeKind},
+    operation::{Operation, OperationStatus},
+    path::case_insensitive_sibling_key,
+    version::{ContentManifestRef, FileVersion},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,6 +117,17 @@ pub struct InMemoryBackend {
     operation_tokens: HashMap<String, StoredOperationToken>,
     pub audit: Vec<AuditEvent>,
     pub events: Vec<EventEnvelope>,
+    /// File content store keyed by `node_id`. The source of truth for
+    /// `file.read` hydration; populated by `file.write`. Production moves this
+    /// to the object store and keeps only verified chunks locally.
+    pub file_contents: HashMap<String, Vec<u8>>,
+    /// Immutable file versions keyed by `version_id`. Populated by `file.write`;
+    /// `file.versions` surfaces these in a follow-up (the payload currently
+    /// returns an honest empty list pending its own promotion).
+    pub file_versions: HashMap<String, FileVersion>,
+    /// Offline/client operation log. `file.write` appends an Applied record so
+    /// the audit/operation trail is real, not fabricated.
+    pub operations: Vec<Operation>,
 }
 
 /// Thread-safe wrapper over `InMemoryBackend`. Cloning shares the state.
@@ -209,6 +226,9 @@ impl DaemonBackend {
             operation_tokens: HashMap::new(),
             audit: Vec::new(),
             events: Vec::new(),
+            file_contents: HashMap::new(),
+            file_versions: HashMap::new(),
+            operations: Vec::new(),
         };
 
         let backend = Self {
@@ -655,6 +675,327 @@ pub fn file_versions_payload(backend: &DaemonBackend, params: &Value) -> Result<
         "node_id": node.node_id,
         "current_version_id": node.current_version_id,
         "versions": [],
+    }))
+}
+
+/// `file.write`: commit a file version. Accepts either `{node_id, ...}` to
+/// update an existing file or `{parent_node_id, name, ...}` to create a new
+/// one. Content travels as `content_hex` (the same hex encoding the server's
+/// `content_hex` fields use, so no new wire shape). The write is atomic in this
+/// scaffold: content is stored, an immutable [`FileVersion`] is recorded, the
+/// node's `current_version_id` is advanced, an Applied [`Operation`] is logged,
+/// an audit event is recorded, and the cache entry is driven to `Ready` through
+/// the legal forward transition path. `file.write` is `LowRisk` under the
+/// AgentSafe policy, so no operation token is required.
+pub fn file_write_payload(
+    backend: &DaemonBackend,
+    params: &Value,
+    source: Source,
+) -> Result<Value, ApiError> {
+    let content_hex = require_str_param(params, "content_hex")?;
+    let content = decode_hex(content_hex).map_err(|message| {
+        ApiError::with_details(
+            "invalid_param",
+            message,
+            serde_json::json!({"field": "content_hex"}),
+        )
+    })?;
+    let content_hash = content_hash_for(&content);
+    let mode_str = params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let now = timestamp();
+
+    let mut inner = backend.lock();
+    let org_id = inner.org_id.clone();
+
+    // Resolve the target node: update an existing file, or build a new one
+    // under a live directory parent. Validates IDs/names at the trust boundary.
+    let (mut node, created) = match params.get("node_id").and_then(|v| v.as_str()) {
+        Some(node_id) => {
+            validate_node_id(node_id).map_err(core_error_to_api)?;
+            let existing = inner
+                .nodes
+                .get(node_id)
+                .cloned()
+                .filter(Node::is_live)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        "node_not_found",
+                        format!("node {node_id} was not found in the namespace"),
+                    )
+                })?;
+            if existing.kind != NodeKind::File {
+                return Err(ApiError::with_details(
+                    "node_not_file",
+                    "only file nodes accept writes",
+                    serde_json::json!({
+                        "node_id": node_id,
+                        "kind": serde_json::to_value(existing.kind).unwrap_or(Value::Null),
+                    }),
+                ));
+            }
+            // Optimistic concurrency: if the caller pinned a base version, the
+            // current version must match. Divergence is a conflict, never a
+            // silent overwrite (FILESYSTEM_SEMANTICS.md).
+            if let Some(base_version_id) = params.get("base_version_id").and_then(|v| v.as_str()) {
+                validate_version_id(base_version_id).map_err(core_error_to_api)?;
+                if existing.current_version_id.as_deref() != Some(base_version_id) {
+                    return Err(ApiError::with_details(
+                        "version_conflict",
+                        "base_version_id does not match the node's current version",
+                        serde_json::json!({
+                            "node_id": node_id,
+                            "expected": existing.current_version_id,
+                            "base_version_id": base_version_id,
+                        }),
+                    ));
+                }
+            }
+            let mut updated = existing.clone();
+            updated.updated_at = now.clone();
+            if let Some(mode_value) = &mode_str {
+                updated.mode = Some(mode_value.clone());
+            }
+            (updated, false)
+        }
+        None => {
+            let parent_id = require_str_param(params, "parent_node_id")?;
+            validate_node_id(parent_id).map_err(core_error_to_api)?;
+            let name = require_str_param(params, "name")?;
+            biohazardfs_core::path::validate_file_name(name).map_err(core_error_to_api)?;
+            let parent = inner
+                .nodes
+                .get(parent_id)
+                .cloned()
+                .filter(Node::is_live)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        "node_not_found",
+                        format!("parent node {parent_id} was not found"),
+                    )
+                })?;
+            if parent.kind != NodeKind::Directory {
+                return Err(ApiError::with_details(
+                    "parent_not_directory",
+                    "parent node must be a directory to create a file",
+                    serde_json::json!({"parent_node_id": parent_id}),
+                ));
+            }
+            // Case-insensitive sibling uniqueness: a same-key sibling is a
+            // conflict regardless of case (FILESYSTEM_SEMANTICS.md).
+            let sibling_key = case_insensitive_sibling_key(name);
+            let conflict = inner.nodes.values().any(|candidate| {
+                candidate.is_live()
+                    && candidate.parent_node_id.as_deref() == Some(parent_id)
+                    && case_insensitive_sibling_key(&candidate.name) == sibling_key
+            });
+            if conflict {
+                return Err(ApiError::with_details(
+                    "sibling_name_conflict",
+                    "a sibling with the same case-insensitive name already exists",
+                    serde_json::json!({"parent_node_id": parent_id, "name": name}),
+                ));
+            }
+            let node = Node {
+                org_id: org_id.clone(),
+                node_id: generate_id(NODE_ID_PREFIX),
+                project_id: parent.project_id.clone(),
+                parent_node_id: Some(parent_id.to_string()),
+                name: name.to_string(),
+                kind: NodeKind::File,
+                current_version_id: None,
+                target: None,
+                mode: Some(mode_str.clone().unwrap_or_else(|| "0o644".to_string())),
+                owner_user_id: None,
+                created_at: now.clone(),
+                created_by: None,
+                updated_at: now.clone(),
+                updated_by: None,
+                deleted_at: None,
+                deleted_by: None,
+                trash_id: None,
+                path_cache: None,
+            };
+            (node, true)
+        }
+    };
+
+    // Build the immutable version + the operation record. IDs are generated
+    // here so the cache/audit/operation trail references one consistent set.
+    let version_id = generate_id(VERSION_ID_PREFIX);
+    let operation_id = generate_id(OPERATION_ID_PREFIX);
+    let object_id = generate_id(OBJECT_ID_PREFIX);
+    let parent_version_id = node.current_version_id.clone();
+    let version = FileVersion {
+        org_id: org_id.clone(),
+        version_id: version_id.clone(),
+        node_id: node.node_id.clone(),
+        parent_version_id: parent_version_id.clone(),
+        content_manifest_ref: ContentManifestRef {
+            object_id: object_id.clone(),
+            storage_key: format!("orgs/{org_id}/content/{content_hash}"),
+            chunking: None,
+        },
+        content_hash: content_hash.clone(),
+        size_bytes: content.len() as u64,
+        logical_mtime: now.clone(),
+        created_at: now.clone(),
+        created_by: None,
+        created_device_id: None,
+        source: source.clone(),
+        operation_id: Some(operation_id.clone()),
+        audit_event_id: None,
+        metadata_json: None,
+    };
+    let operation = Operation {
+        org_id: org_id.clone(),
+        operation_id: operation_id.clone(),
+        client_operation_id: format!("cop_{operation_id}"),
+        device_id: None,
+        actor_user_id: None,
+        impersonated_user_id: None,
+        source: source.clone(),
+        method: "file.write".to_string(),
+        params_json: serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()),
+        base_node_id: Some(node.node_id.clone()),
+        base_version_id: parent_version_id.clone(),
+        base_snapshot_id: None,
+        idempotency_key: format!("idem_{operation_id}"),
+        status: OperationStatus::Applied,
+        result_json: Some(
+            serde_json::json!({
+                "version_id": version_id,
+                "content_hash": content_hash,
+                "created": created,
+            })
+            .to_string(),
+        ),
+        conflict_id: None,
+        created_at_client: now.clone(),
+        received_at_server: Some(now.clone()),
+        applied_at_server: Some(now.clone()),
+    };
+
+    // Commit node + version + content + operation in one critical section.
+    node.current_version_id = Some(version_id.clone());
+    node.updated_at = now.clone();
+    let node_id = node.node_id.clone();
+    inner.nodes.insert(node_id.clone(), node);
+    inner
+        .file_versions
+        .insert(version_id.clone(), version.clone());
+    inner.file_contents.insert(node_id.clone(), content);
+    inner.operations.push(operation);
+
+    // Drive the cache entry to Ready through the legal forward transition path.
+    // The guards reject unsafe moves (Dirty -> Evicting etc.); we never paper
+    // over them. For an existing Ready entry we exercise Ready -> Dirty -> Ready
+    // (the documented write cycle); for a fresh entry we use Absent/Failed ->
+    // Populating -> Ready (Dirty is unreachable from Absent).
+    let entry = inner
+        .cache_entries
+        .entry(node_id.clone())
+        .or_insert_with(|| CacheEntry {
+            node_id: node_id.clone(),
+            version_id: None,
+            state: CacheState::Absent,
+            content_hash: None,
+            size_bytes: 0,
+            pinned: false,
+            dirty: false,
+            last_accessed_at: None,
+        });
+    apply_write_cache_transition(entry)?;
+    entry.version_id = Some(version_id.clone());
+    entry.content_hash = Some(content_hash.clone());
+    entry.size_bytes = version.size_bytes;
+    entry.dirty = false;
+    entry.last_accessed_at = Some(now.clone());
+    drop(inner);
+
+    backend.record_event(
+        biohazardfs_api_types::event_types::FILE_CHANGED,
+        serde_json::json!({"node_id": node_id, "version_id": version_id, "created": created}),
+    );
+    backend.record_event(
+        biohazardfs_api_types::event_types::CACHE_STATE_CHANGED,
+        serde_json::json!({"node_id": node_id, "state": "ready"}),
+    );
+    backend.record_audit(
+        "file.write",
+        source,
+        None,
+        Some(node_id.clone()),
+        Some(version_id.clone()),
+        None,
+        AuditEventResult::Success,
+        Some(
+            serde_json::json!({
+                "size_bytes": version.size_bytes,
+                "content_hash": content_hash,
+                "created": created,
+            })
+            .to_string(),
+        ),
+    );
+
+    Ok(serde_json::json!({
+        "node_id": node_id,
+        "version_id": version_id,
+        "content_hash": content_hash,
+        "size_bytes": version.size_bytes,
+        "operation_id": operation_id,
+        "created": created,
+    }))
+}
+
+/// `file.read`: return the cached content bytes for a file node. The daemon
+/// content store is the source of truth; the FUSE layer hydrates from this.
+/// Returns typed `file_not_found` / `content_not_cached` errors when the node
+/// or its content is absent, never a panic.
+pub fn file_read_payload(backend: &DaemonBackend, params: &Value) -> Result<Value, ApiError> {
+    let node_id = require_node_id_param(params)?;
+    let mut inner = backend.lock();
+    let node = inner
+        .nodes
+        .get(&node_id)
+        .cloned()
+        .filter(Node::is_live)
+        .ok_or_else(|| {
+            ApiError::new(
+                "file_not_found",
+                format!("file node {node_id} was not found in the namespace"),
+            )
+        })?;
+    if node.kind != NodeKind::File {
+        return Err(ApiError::with_details(
+            "node_not_file",
+            "only file nodes have readable content",
+            serde_json::json!({
+                "node_id": node_id,
+                "kind": serde_json::to_value(node.kind).unwrap_or(Value::Null),
+            }),
+        ));
+    }
+    let content = inner.file_contents.get(&node_id).cloned().ok_or_else(|| {
+        ApiError::new(
+            "content_not_cached",
+            format!("node {node_id} has no cached content; upload via file.write or hydrate first"),
+        )
+    })?;
+    if let Some(entry) = inner.cache_entries.get_mut(&node_id) {
+        entry.last_accessed_at = Some(timestamp());
+    }
+    let content_hash = content_hash_for(&content);
+    let content_hex = encode_hex(&content);
+    Ok(serde_json::json!({
+        "node_id": node_id,
+        "version_id": node.current_version_id,
+        "content_hex": content_hex,
+        "size_bytes": content.len(),
+        "content_hash": content_hash,
     }))
 }
 
@@ -1404,6 +1745,102 @@ fn core_error_to_api(error: biohazardfs_core::error::CoreError) -> ApiError {
     ApiError::new(error.code, error.message)
 }
 
+/// Decode a hex string into bytes. Used by `file.write` to turn `content_hex`
+/// into raw content without introducing a base64 or bytes dep. Errors carry a
+/// human-readable message so the API boundary can surface them as `invalid_param`.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!(
+            "content_hex has an odd number of characters ({})",
+            hex.len()
+        ));
+    }
+    let bytes = hex.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_nibble(bytes[index])?;
+        let low = hex_nibble(bytes[index + 1])?;
+        out.push((high << 4) | low);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("content_hex contains non-hex character {byte:?}")),
+    }
+}
+
+/// Encode bytes as lowercase hex. Mirrors the server `content_hex` shape so the
+/// FUSE layer can hydrate and round-trip content with one wire encoding.
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Scaffold content hash: FNV-1a 64-bit over the raw bytes. Labelled
+/// `sha256:scaffold:` so callers cannot mistake it for a verified digest;
+/// `file.checksum` uses the same convention. Production swaps both to a real
+/// sha256 computed by the object store during ingest.
+fn content_hash_for(bytes: &[u8]) -> String {
+    format!("sha256:scaffold:{:x}", fxhash(bytes))
+}
+
+/// Drive a cache entry to `Ready` through the legal forward transition path
+/// after a `file.write` commit. The transition guards (core::cache::transition)
+/// reject unsafe moves; we never paper over them. This is the safety valve for
+/// the FILESYSTEM_SEMANTICS.md invariant that dirty/pinned data is never lost.
+fn apply_write_cache_transition(entry: &mut CacheEntry) -> Result<(), ApiError> {
+    match entry.state {
+        CacheState::Absent | CacheState::Failed => {
+            entry.state =
+                cache_transition(entry.state, CacheState::Populating).map_err(core_error_to_api)?;
+            entry.state =
+                cache_transition(entry.state, CacheState::Ready).map_err(core_error_to_api)?;
+        }
+        CacheState::Ready => {
+            // Documented write cycle: Ready -> Dirty (write made it dirty) ->
+            // Ready (upload acknowledged). Exercises Dirty -> Ready directly.
+            entry.state =
+                cache_transition(entry.state, CacheState::Dirty).map_err(core_error_to_api)?;
+            entry.state =
+                cache_transition(entry.state, CacheState::Ready).map_err(core_error_to_api)?;
+        }
+        CacheState::Dirty | CacheState::Populating => {
+            entry.state =
+                cache_transition(entry.state, CacheState::Ready).map_err(core_error_to_api)?;
+        }
+        CacheState::Pinned => {
+            // Pinned writes are allowed (pinned = never evicted, not read-only).
+            // Pinned -> Ready is not direct; route through Populating.
+            entry.state = cache_transition(CacheState::Pinned, CacheState::Populating)
+                .map_err(core_error_to_api)?;
+            entry.state =
+                cache_transition(entry.state, CacheState::Ready).map_err(core_error_to_api)?;
+        }
+        CacheState::Pinning | CacheState::Evicting => {
+            return Err(ApiError::with_details(
+                "cache_write_blocked",
+                "cache entry is in a transitional state that cannot accept a write",
+                serde_json::json!({
+                    "state": serde_json::to_value(entry.state).unwrap_or(Value::Null),
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Canonical JSON for hashing: object keys sorted recursively, scalars via
 /// `to_string`. Order-independent so issue and validate agree regardless of
 /// how the params object was constructed.
@@ -1867,5 +2304,308 @@ mod tests {
     fn request_round_trip_is_machine_shape() {
         let _request = req("cache.pin", serde_json::json!({"node_id": "node_readme"}));
         // Smoke-test the request builder; dispatch exercises it in lib tests.
+    }
+
+    #[test]
+    fn file_write_creates_node_version_and_content() {
+        let backend = test_backend();
+        let payload = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "shot010.exr",
+                "content_hex": "deadbeef",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+
+        assert_eq!(payload["created"], true);
+        let node_id = payload["node_id"].as_str().unwrap().to_string();
+        let version_id = payload["version_id"].as_str().unwrap().to_string();
+        assert!(node_id.starts_with("node_"));
+        assert!(version_id.starts_with("ver_"));
+        assert_eq!(payload["size_bytes"], 4);
+        assert_eq!(
+            payload["content_hash"],
+            content_hash_for(&[0xde, 0xad, 0xbe, 0xef])
+        );
+        assert!(payload["operation_id"].as_str().unwrap().starts_with("op_"));
+
+        let inner = backend.lock();
+        let stored = inner.nodes.get(&node_id).unwrap();
+        assert_eq!(stored.kind, NodeKind::File);
+        assert_eq!(
+            stored.current_version_id.as_deref(),
+            Some(version_id.as_str())
+        );
+        assert_eq!(stored.parent_node_id.as_deref(), Some("node_root"));
+        assert_eq!(
+            inner.file_contents.get(&node_id).unwrap(),
+            &vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        let version = inner.file_versions.get(&version_id).unwrap();
+        assert_eq!(version.size_bytes, 4);
+        assert_eq!(
+            version.content_hash,
+            content_hash_for(&[0xde, 0xad, 0xbe, 0xef])
+        );
+        assert!(version.operation_id.is_some());
+        // Operation log carries an Applied record for the write.
+        let op = inner
+            .operations
+            .iter()
+            .find(|op| op.method == "file.write")
+            .unwrap();
+        assert_eq!(op.status, OperationStatus::Applied);
+        assert_eq!(op.base_node_id.as_deref(), Some(node_id.as_str()));
+        // Audit trail records the write.
+        assert!(
+            inner
+                .audit
+                .iter()
+                .any(|event| event.event_type == "file.write"
+                    && event.node_id.as_deref() == Some(node_id.as_str()))
+        );
+    }
+
+    #[test]
+    fn file_write_updates_existing_node_through_dirty_ready() {
+        let backend = test_backend();
+        let first = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "shot020.exr",
+                "content_hex": "00ff",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let node_id = first["node_id"].as_str().unwrap().to_string();
+        let first_version = first["version_id"].as_str().unwrap().to_string();
+
+        let second = file_write_payload(
+            &backend,
+            &backend_inner_params_for_update(&node_id, "11223344"),
+            Source::Cli,
+        )
+        .unwrap();
+        assert_eq!(second["created"], false);
+        assert_eq!(second["node_id"], node_id);
+        let second_version = second["version_id"].as_str().unwrap().to_string();
+        assert_ne!(second_version, first_version);
+
+        let inner = backend.lock();
+        let stored = inner.nodes.get(&node_id).unwrap();
+        assert_eq!(
+            stored.current_version_id.as_deref(),
+            Some(second_version.as_str())
+        );
+        // Parent version linkage preserves history.
+        let v2 = inner.file_versions.get(&second_version).unwrap();
+        assert_eq!(
+            v2.parent_version_id.as_deref(),
+            Some(first_version.as_str())
+        );
+        // Content reflects the latest write.
+        assert_eq!(
+            inner.file_contents.get(&node_id).unwrap(),
+            &vec![0x11, 0x22, 0x33, 0x44]
+        );
+        // Cache entry ends up Ready, not Dirty.
+        let entry = inner.cache_entries.get(&node_id).unwrap();
+        assert_eq!(entry.state, CacheState::Ready);
+        assert!(!entry.dirty);
+    }
+
+    #[test]
+    fn file_write_rejects_case_insensitive_sibling_conflict() {
+        let backend = test_backend();
+        let _first = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "Shot.exr",
+                "content_hex": "00",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let err = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "shot.exr",
+                "content_hex": "01",
+            }),
+            Source::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "sibling_name_conflict");
+    }
+
+    #[test]
+    fn file_write_rejects_version_conflict() {
+        let backend = test_backend();
+        let first = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "v1.txt",
+                "content_hex": "aa",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let node_id = first["node_id"].as_str().unwrap().to_string();
+        let real_version = first["version_id"].as_str().unwrap().to_string();
+
+        // Stale base_version_id must surface as a conflict, not a silent overwrite.
+        let err = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "node_id": node_id,
+                "content_hex": "bb",
+                "base_version_id": "ver_stale_does_not_match",
+            }),
+            Source::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "version_conflict");
+
+        // Correct base_version_id is accepted.
+        let ok = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "node_id": node_id,
+                "content_hex": "bb",
+                "base_version_id": real_version,
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        assert_eq!(ok["node_id"], node_id);
+        assert_ne!(ok["version_id"], real_version);
+    }
+
+    #[test]
+    fn file_write_rejects_bad_hex_and_missing_params() {
+        let backend = test_backend();
+        let err = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "bad.txt",
+                "content_hex": "xyz",
+            }),
+            Source::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "invalid_param");
+
+        let err = file_write_payload(
+            &backend,
+            &serde_json::json!({"name": "no-parent.txt", "content_hex": "00"}),
+            Source::Cli,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "missing_param");
+    }
+
+    #[test]
+    fn file_read_returns_committed_content() {
+        let backend = test_backend();
+        let written = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "readable.txt",
+                "content_hex": "48656c6c6f",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let node_id = written["node_id"].as_str().unwrap();
+        let read = file_read_payload(&backend, &serde_json::json!({"node_id": node_id})).unwrap();
+        assert_eq!(read["content_hex"], "48656c6c6f");
+        assert_eq!(read["size_bytes"], 5);
+        assert_eq!(read["version_id"], written["version_id"]);
+    }
+
+    #[test]
+    fn file_read_returns_file_not_found_and_content_not_cached() {
+        let backend = test_backend();
+        // node_root exists but is a directory: node_not_file, not file_not_found.
+        let err =
+            file_read_payload(&backend, &serde_json::json!({"node_id": "node_root"})).unwrap_err();
+        assert_eq!(err.code, "node_not_file");
+
+        // README.md is a live file node but has no committed content.
+        let err = file_read_payload(&backend, &serde_json::json!({"node_id": "node_readme"}))
+            .unwrap_err();
+        assert_eq!(err.code, "content_not_cached");
+
+        // Unknown file node -> file_not_found.
+        let err =
+            file_read_payload(&backend, &serde_json::json!({"node_id": "node_ghost"})).unwrap_err();
+        assert_eq!(err.code, "file_not_found");
+    }
+
+    #[test]
+    fn file_write_and_read_round_trip_through_dispatch() {
+        use biohazardfs_api_types::DaemonRequest;
+        let backend = test_backend();
+        let mut request = DaemonRequest::new("file.write", Source::Cli);
+        request.params = serde_json::json!({
+            "parent_node_id": "node_root",
+            "name": "round.txt",
+            "content_hex": "c0ffee",
+        });
+        let response = crate::dispatch_rpc(&backend, &request);
+        assert!(response.ok);
+        let node_id = response.data.unwrap()["node_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut read_request = DaemonRequest::new("file.read", Source::Cli);
+        read_request.params = serde_json::json!({"node_id": node_id});
+        let read_response = crate::dispatch_rpc(&backend, &read_request);
+        assert!(read_response.ok);
+        assert_eq!(read_response.data.unwrap()["content_hex"], "c0ffee");
+    }
+
+    #[test]
+    fn hex_helpers_round_trip_and_reject_garbage() {
+        assert!(decode_hex("").unwrap().is_empty());
+        assert_eq!(
+            decode_hex("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(
+            decode_hex("DEADBEEF").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(decode_hex("abc").is_err());
+        assert!(decode_hex("xy").is_err());
+        assert_eq!(encode_hex(&[0x00, 0xff, 0x10]), "00ff10");
+        // Deterministic for the same bytes; labelled honestly as a scaffold hash.
+        assert_eq!(
+            content_hash_for(&[0xde, 0xad]),
+            content_hash_for(&[0xde, 0xad])
+        );
+        assert!(content_hash_for(&[0xde, 0xad]).starts_with("sha256:scaffold:"));
+        assert_ne!(
+            content_hash_for(&[0xde, 0xad]),
+            content_hash_for(&[0xde, 0xae])
+        );
+    }
+
+    fn backend_inner_params_for_update(node_id: &str, content_hex: &str) -> serde_json::Value {
+        serde_json::json!({
+            "node_id": node_id,
+            "content_hex": content_hex,
+        })
     }
 }

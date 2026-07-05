@@ -4,13 +4,19 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use biohazardfs_api_types::{ApiError, DaemonRequest, Source};
+use biohazardfs_core::cache::{CacheState, transition as cache_transition};
+use biohazardfs_core::path::case_insensitive_sibling_key;
+use biohazardfs_daemon::{DaemonClientError, DaemonHttpClient};
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, Request,
+    MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use serde_json::Value;
 
 use crate::{FuseError, FuseErrorKind, Result, validate_mount_inputs};
 
@@ -451,6 +457,1234 @@ impl OsStringBytes for OsString {
     }
 }
 
+// ===========================================================================
+// Read-write workspace mount (Wave 3)
+//
+// The read-write mount proxies every filesystem mutation through the local
+// daemon. Read paths hydrate whole files into a local cache on open via
+// `file.read`; write paths buffer per-handle and push one complete blob per
+// flush/fsync via `file.write`. Hard safety boundaries (see
+// FILESYSTEM_SEMANTICS.md) are stated at each method and below.
+// ===========================================================================
+
+const DEFAULT_FILE_MODE: u16 = 0o644;
+const DEFAULT_DIR_MODE: u16 = 0o755;
+
+/// Configuration for the read-write BiohazardFS workspace mount.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMountConfig {
+    /// Loopback daemon endpoint (`127.0.0.1:<port>` or `[::1]:<port>`).
+    pub daemon_endpoint: String,
+    /// Owner-only local daemon session token.
+    pub local_token: String,
+    /// Local cache directory for hydrated file content. Created if missing.
+    pub cache_dir: PathBuf,
+    /// Existing empty directory used as the FUSE mountpoint.
+    pub mountpoint: PathBuf,
+    /// Stay in the foreground. This is the current supported mode.
+    pub foreground: bool,
+}
+
+/// Per-inode namespace + cache state. The daemon `node_id` is the source of
+/// truth for identity; the inode number is the FUSE handle. A file created
+/// locally that has not yet been flushed has `node_id = None` and a
+/// provisional local inode only — the daemon assigns the node id on `file.write`.
+#[derive(Debug, Clone)]
+struct InodeState {
+    inode: u64,
+    parent_inode: u64,
+    node_id: Option<String>,
+    name: OsString,
+    kind: FileType,
+    mode: u16,
+    target: Option<String>,
+    mtime: SystemTime,
+    crtime: SystemTime,
+    cache_state: CacheState,
+    content_hash: Option<String>,
+    size_bytes: u64,
+}
+
+impl InodeState {
+    fn cache_path(&self, cache_dir: &Path) -> PathBuf {
+        cache_dir.join(format!("inode-{}", self.inode))
+    }
+}
+
+/// Children of a directory indexed by name and by daemon `node_id`. `fetched`
+/// is set once a `file.list` has populated the cache so subsequent lookups skip
+/// the RPC.
+#[derive(Debug, Default, Clone)]
+struct ChildrenCache {
+    by_name: BTreeMap<OsString, u64>,
+    by_node: HashMap<String, u64>,
+    fetched: bool,
+}
+
+/// One open file handle. `writable` is sticky for the handle's lifetime (set
+/// at create / open based on access mode); `write_buffer` is `Some` while
+/// writes are buffered and `None` after a flush has committed the buffer. The
+/// next write re-initializes it (see `write`): FUSE calls `flush` on each
+/// close() of a duplicated descriptor, so a dup-then-write pattern can flush
+/// before the write lands — the buffer must be re-allocatable, not treated as
+/// read-only.
+#[derive(Debug)]
+struct OpenHandle {
+    inode: u64,
+    writable: bool,
+    write_buffer: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct FsState {
+    inodes: HashMap<u64, InodeState>,
+    children: HashMap<u64, ChildrenCache>,
+    handles: HashMap<u64, OpenHandle>,
+    next_inode: u64,
+    next_handle: u64,
+    /// Owner uid/gid stamped on every attr so the kernel enforces the artist's
+    /// own permissions under `MountOption::DefaultPermissions`. The daemon does
+    /// not expose numeric ownership; identity lives in node.owner_user_id.
+    uid: u32,
+    gid: u32,
+}
+
+/// Error from a daemon RPC, mapped to FUSE errnos at the call site.
+#[derive(Debug)]
+enum RpcError {
+    Client(DaemonClientError),
+    Daemon(ApiError),
+    Protocol(&'static str),
+}
+
+impl From<DaemonClientError> for RpcError {
+    fn from(error: DaemonClientError) -> Self {
+        RpcError::Client(error)
+    }
+}
+
+impl RpcError {
+    /// Human-readable summary for diagnostics. Read at failure sites so the
+    /// artist/operator gets a real message alongside the EIO.
+    fn message(&self) -> String {
+        match self {
+            RpcError::Client(error) => format!("daemon transport error: {error}"),
+            RpcError::Daemon(error) => {
+                format!("daemon error {}: {}", error.code, error.message)
+            }
+            RpcError::Protocol(message) => {
+                format!("daemon protocol error: {message}")
+            }
+        }
+    }
+}
+
+/// The read-write BiohazardFS FUSE filesystem backed by the local daemon.
+///
+/// Safety boundaries (FILESYSTEM_SEMANTICS.md):
+/// - Dirty data is never silently lost: `flush`/`fsync` succeed only after the
+///   daemon acknowledges the version. On failure the buffer is restored and the
+///   call returns `EIO`; the artist sees a real write failure.
+/// - One complete blob per `flush`/`fsync`. No streaming, partial writes,
+///   fsync-after-rename atomicity, crash recovery, or write coalescing.
+/// - Hydrate-on-open fetches the whole file before reply (MVP full-file hydrate).
+/// - Cache state transitions go through `core::cache::transition` (rejects
+///   `Dirty -> Evicting` and other unsafe moves).
+#[derive(Debug)]
+pub struct WorkspaceFs {
+    http: Mutex<DaemonHttpClient>,
+    cache_dir: PathBuf,
+    state: Mutex<FsState>,
+}
+
+impl WorkspaceFs {
+    /// Build the filesystem and pre-flight the daemon connection. Pre-flight
+    /// fetches the namespace root so inode 1 binds to a real `node_id`, and
+    /// fails fast with a typed error if the daemon is unreachable.
+    pub fn connect(config: &WorkspaceMountConfig) -> Result<Self> {
+        validate_loopback_endpoint(&config.daemon_endpoint)?;
+        if config.local_token.is_empty() {
+            return Err(FuseError::new(
+                FuseErrorKind::InvalidSource,
+                "local daemon token must not be empty",
+            ));
+        }
+        let cache_dir = prepare_cache_dir(&config.cache_dir)?;
+        let http =
+            DaemonHttpClient::new(config.daemon_endpoint.clone(), config.local_token.clone());
+
+        let root_node_id = fetch_root_node_id(&http)?;
+
+        let now = SystemTime::now();
+        let (uid, gid) = current_owner();
+        let mut state = FsState {
+            inodes: HashMap::new(),
+            children: HashMap::new(),
+            handles: HashMap::new(),
+            next_inode: 2,
+            next_handle: 1,
+            uid,
+            gid,
+        };
+        state.inodes.insert(
+            ROOT_INODE,
+            InodeState {
+                inode: ROOT_INODE,
+                parent_inode: ROOT_INODE,
+                node_id: Some(root_node_id),
+                name: OsString::from("/"),
+                kind: FileType::Directory,
+                mode: DEFAULT_DIR_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 0,
+            },
+        );
+        state.children.insert(ROOT_INODE, ChildrenCache::default());
+
+        Ok(Self {
+            http: Mutex::new(http),
+            cache_dir,
+            state: Mutex::new(state),
+        })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, FsState> {
+        // Mutex poisoning while serving artist data is fatal; recover the inner
+        // state rather than panicking on top of inconsistent data, matching the
+        // daemon backend's policy.
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn lock_http(&self) -> std::sync::MutexGuard<'_, DaemonHttpClient> {
+        self.http
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Perform a daemon RPC and unpack the envelope. The HTTP lock is held only
+    /// for the call; the state lock is never held across this (callers gather
+    /// state first, drop it, then call).
+    fn rpc(&self, method: &str, params: Value) -> std::result::Result<Value, RpcError> {
+        let mut request = DaemonRequest::new(method, Source::Ui);
+        request.params = params;
+        let envelope = self.lock_http().call::<Value>(&request)?;
+        if envelope.ok {
+            envelope
+                .data
+                .ok_or(RpcError::Protocol("daemon returned ok=true without data"))
+        } else {
+            Err(RpcError::Daemon(envelope.error.unwrap_or_else(|| {
+                ApiError::new("daemon_error", "daemon returned an error without details")
+            })))
+        }
+    }
+
+    /// Populate the children cache for a directory inode via `file.list`.
+    /// Caller must NOT hold the state lock (this makes an RPC).
+    fn ensure_children_fetched(&self, parent_inode: u64) -> std::result::Result<(), RpcError> {
+        let parent_node_id = {
+            let state = self.lock_state();
+            let parent = state
+                .inodes
+                .get(&parent_inode)
+                .ok_or(RpcError::Protocol("parent inode missing"))?;
+            if parent.kind != FileType::Directory {
+                return Err(RpcError::Protocol("inode is not a directory"));
+            }
+            if state
+                .children
+                .get(&parent_inode)
+                .is_some_and(|cache| cache.fetched)
+            {
+                return Ok(());
+            }
+            parent
+                .node_id
+                .clone()
+                .ok_or(RpcError::Protocol("directory has no daemon node_id"))?
+        };
+
+        let data = self.rpc(
+            "file.list",
+            serde_json::json!({ "parent_node_id": parent_node_id }),
+        )?;
+        let entries = data
+            .get("entries")
+            .and_then(|value| value.as_array())
+            .ok_or(RpcError::Protocol(
+                "file.list response missing entries array",
+            ))?;
+
+        let mut discovered: Vec<(String, String, FileType, u16, Option<String>)> =
+            Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or(RpcError::Protocol("file.list entry missing name"))?;
+            let node_id = entry
+                .get("node_id")
+                .and_then(|v| v.as_str())
+                .ok_or(RpcError::Protocol("file.list entry missing node_id"))?;
+            let kind = parse_kind(entry.get("kind").and_then(|v| v.as_str()).unwrap_or("file"));
+            let mode = parse_mode(
+                entry.get("mode").and_then(|v| v.as_str()),
+                if kind == FileType::Directory {
+                    DEFAULT_DIR_MODE
+                } else {
+                    DEFAULT_FILE_MODE
+                },
+            );
+            let target = entry
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            discovered.push((name.to_string(), node_id.to_string(), kind, mode, target));
+        }
+
+        let mut state = self.lock_state();
+        let prior = state
+            .children
+            .get(&parent_inode)
+            .cloned()
+            .unwrap_or_default();
+        let mut next_inode = state.next_inode;
+        let mut refreshed = ChildrenCache::default();
+        for (name, node_id, kind, mode, target) in discovered {
+            let inode = if let Some(&existing) = prior.by_node.get(&node_id) {
+                existing
+            } else {
+                let allocated = next_inode;
+                next_inode += 1;
+                let now = SystemTime::now();
+                state.inodes.insert(
+                    allocated,
+                    InodeState {
+                        inode: allocated,
+                        parent_inode,
+                        node_id: Some(node_id.clone()),
+                        name: OsString::from(&name),
+                        kind,
+                        mode,
+                        target: target.clone(),
+                        mtime: now,
+                        crtime: now,
+                        cache_state: if kind == FileType::RegularFile {
+                            CacheState::Absent
+                        } else {
+                            CacheState::Ready
+                        },
+                        content_hash: None,
+                        size_bytes: 0,
+                    },
+                );
+                allocated
+            };
+            refreshed.by_name.insert(OsString::from(&name), inode);
+            refreshed.by_node.insert(node_id, inode);
+        }
+        refreshed.fetched = true;
+        state.next_inode = next_inode;
+        state.children.insert(parent_inode, refreshed);
+        Ok(())
+    }
+
+    /// Push the handle's write buffer to the daemon as one complete blob. This
+    /// is the single sink for buffered writes and the safety valve for the
+    /// "dirty data is never silently lost" invariant.
+    fn commit_handle(&self, ino: u64, fh: u64) -> std::result::Result<(), Errno> {
+        // Take the buffer and build params in one short critical section so the
+        // RPC below runs with no lock held.
+        let prepared = {
+            let mut state = self.lock_state();
+            let handle = state.handles.get_mut(&fh).ok_or(Errno::EBADF)?;
+            if handle.inode != ino {
+                return Err(Errno::EBADF);
+            }
+            let bytes = match handle.write_buffer.take() {
+                Some(bytes) => bytes,
+                None => return Ok(()),
+            };
+            let entry = state.inodes.get(&ino).ok_or(Errno::EIO)?.clone();
+            let content_hex = encode_hex(&bytes);
+            let params = if let Some(node_id) = &entry.node_id {
+                serde_json::json!({ "node_id": node_id, "content_hex": content_hex })
+            } else {
+                let parent_node_id = state
+                    .inodes
+                    .get(&entry.parent_inode)
+                    .and_then(|parent| parent.node_id.as_ref())
+                    .ok_or(Errno::EIO)?
+                    .clone();
+                let name = entry.name.to_string_lossy().into_owned();
+                serde_json::json!({
+                    "parent_node_id": parent_node_id,
+                    "name": name,
+                    "content_hex": content_hex,
+                })
+            };
+            PreparedCommit {
+                bytes,
+                params,
+                cache_path: entry.cache_path(&self.cache_dir),
+            }
+        };
+
+        // Hard safety boundary: success only after file.write acknowledges the
+        // version. The RPC runs with no state lock held.
+        match self.rpc("file.write", prepared.params) {
+            Ok(data) => {
+                let node_id = data
+                    .get("node_id")
+                    .and_then(|value| value.as_str())
+                    .map(String::from);
+                let content_hash = data
+                    .get("content_hash")
+                    .and_then(|value| value.as_str())
+                    .map(String::from);
+                let size_bytes = data
+                    .get("size_bytes")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(prepared.bytes.len() as u64);
+
+                // Persist the committed bytes to the local cache so a subsequent
+                // open/read sees them without a round-trip.
+                if fs::write(&prepared.cache_path, &prepared.bytes).is_err() {
+                    // The daemon truth is safe; the local cache write failed.
+                    // Surface EIO so the artist knows the cache is inconsistent.
+                    return Err(Errno::EIO);
+                }
+
+                let mut state = self.lock_state();
+                let parent_inode = state.inodes.get(&ino).map(|entry| entry.parent_inode);
+                if let Some(entry) = state.inodes.get_mut(&ino) {
+                    if let Some(node_id) = &node_id {
+                        entry.node_id = Some(node_id.clone());
+                    }
+                    entry.cache_state = CacheState::Ready;
+                    entry.content_hash = content_hash;
+                    entry.size_bytes = size_bytes;
+                    entry.mtime = SystemTime::now();
+                }
+                if let (Some(parent_inode), Some(node_id)) = (parent_inode, node_id)
+                    && let Some(cache) = state.children.get_mut(&parent_inode)
+                {
+                    cache.by_node.insert(node_id, ino);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // Daemon unreachable / rejected the write. Restore the buffer so
+                // a later flush/retry can push it, and mark the entry Dirty when
+                // reachable so cache state reflects unsynced work. Always EIO:
+                // the artist must see the write failure.
+                eprintln!(
+                    "biohazardfs-fuse: file.write push failed for inode {ino}: {}",
+                    error.message()
+                );
+                let mut state = self.lock_state();
+                if let Some(handle) = state.handles.get_mut(&fh) {
+                    handle.write_buffer = Some(prepared.bytes);
+                }
+                if let Some(entry) = state.inodes.get_mut(&ino)
+                    && entry.cache_state == CacheState::Ready
+                    && let Ok(dirty) = cache_transition(CacheState::Ready, CacheState::Dirty)
+                {
+                    entry.cache_state = dirty;
+                }
+                Err(Errno::EIO)
+            }
+        }
+    }
+}
+
+struct PreparedCommit {
+    bytes: Vec<u8>,
+    params: Value,
+    cache_path: PathBuf,
+}
+
+impl Filesystem for WorkspaceFs {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if self.ensure_children_fetched(parent.0).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let state = self.lock_state();
+        let Some(child_inode) = state
+            .children
+            .get(&parent.0)
+            .and_then(|cache| cache.by_name.get(name).copied())
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(entry) = state.inodes.get(&child_inode) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let attr = build_attr(entry, state.uid, state.gid);
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let state = self.lock_state();
+        let Some(entry) = state.inodes.get(&ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let attr = build_attr(entry, state.uid, state.gid);
+        reply.attr(&TTL, &attr);
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // MVP stores mtime/mode locally in the inode cache entry; size/truncate
+        // is out-of-scope (handled by O_TRUNC at open and the next flush).
+        let mut state = self.lock_state();
+        let uid = state.uid;
+        let gid = state.gid;
+        let Some(entry) = state.inodes.get_mut(&ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if let Some(mode_bits) = mode {
+            entry.mode = (mode_bits & 0o7777) as u16;
+        }
+        if let Some(new_mtime) = mtime {
+            entry.mtime = match new_mtime {
+                fuser::TimeOrNow::SpecificTime(time) => time,
+                fuser::TimeOrNow::Now => SystemTime::now(),
+            };
+        }
+        let attr = build_attr(entry, uid, gid);
+        reply.attr(&TTL, &attr);
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let state = self.lock_state();
+        let Some(entry) = state.inodes.get(&ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if entry.kind != FileType::Symlink {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let Some(target) = &entry.target else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        reply.data(target.as_bytes());
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let (kind, node_id, cache_state, cache_path) = {
+            let state = self.lock_state();
+            let Some(entry) = state.inodes.get(&ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            if entry.kind != FileType::RegularFile {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+            (
+                entry.kind,
+                entry.node_id.clone(),
+                entry.cache_state,
+                entry.cache_path(&self.cache_dir),
+            )
+        };
+        let _ = kind;
+
+        // O_TRUNC: drop cached content; the next flush commits the new content.
+        let truncating = flags.0 & libc::O_TRUNC != 0;
+
+        // FILESYSTEM_SEMANTICS.md: hydrate full file before reply unless
+        // truncating. open-for-write still hydrates first so the artist edits
+        // the complete file.
+        if !truncating && cache_state != CacheState::Ready {
+            let hydration = match node_id.as_ref() {
+                Some(node_id) => self.rpc("file.read", serde_json::json!({ "node_id": node_id })),
+                None => Ok(serde_json::Value::Null),
+            };
+            match hydration {
+                Ok(data) if !data.is_null() => {
+                    let content_hex = data
+                        .get("content_hex")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let content = decode_hex(content_hex).unwrap_or_default();
+                    if fs::write(&cache_path, &content).is_err() {
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                    let mut state = self.lock_state();
+                    if let Some(entry) = state.inodes.get_mut(&ino.0) {
+                        entry.cache_state = CacheState::Ready;
+                        entry.content_hash = data
+                            .get("content_hash")
+                            .and_then(|value| value.as_str())
+                            .map(String::from);
+                        entry.size_bytes = content.len() as u64;
+                        entry.mtime = SystemTime::now();
+                    }
+                }
+                Ok(_) => {
+                    // Locally created, uncommitted file: allow empty open.
+                }
+                Err(RpcError::Daemon(api_error))
+                    if api_error.code == "content_not_cached"
+                        || api_error.code == "file_not_found" =>
+                {
+                    // Placeholder or no committed content: allow empty open.
+                }
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        }
+
+        if truncating {
+            let _ = fs::write(&cache_path, []);
+            let mut state = self.lock_state();
+            if let Some(entry) = state.inodes.get_mut(&ino.0) {
+                entry.cache_state = CacheState::Ready;
+                entry.size_bytes = 0;
+            }
+        }
+
+        let handle = {
+            let mut state = self.lock_state();
+            let write_mode = flags.acc_mode() != OpenAccMode::O_RDONLY;
+            let writable = write_mode || truncating;
+            let handle_id = state.next_handle;
+            state.next_handle += 1;
+            state.handles.insert(
+                handle_id,
+                OpenHandle {
+                    inode: ino.0,
+                    writable,
+                    write_buffer: if writable { Some(Vec::new()) } else { None },
+                },
+            );
+            handle_id
+        };
+        reply.opened(FileHandle(handle), FopenFlags::empty());
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
+    ) {
+        let cache_path = {
+            let state = self.lock_state();
+            let Some(entry) = state.inodes.get(&ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            if entry.kind != FileType::RegularFile {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+            entry.cache_path(&self.cache_dir)
+        };
+
+        // Read from the hydrated cache file. If it does not exist (placeholder
+        // never hydrated) return an empty read, matching "read returns EOF".
+        let mut file = match fs::File::open(&cache_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reply.data(&[]);
+                return;
+            }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        let mut buffer = vec![0u8; (size as usize).min(MAX_READ_SIZE)];
+        match file.read(&mut buffer) {
+            Ok(count) => reply.data(&buffer[..count]),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let mut state = self.lock_state();
+        let Some(handle) = state.handles.get_mut(&fh.0) else {
+            reply.error(Errno::EBADF);
+            return;
+        };
+        if handle.inode != ino.0 {
+            reply.error(Errno::EBADF);
+            return;
+        }
+        if !handle.writable {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        // Re-initialize the buffer if a prior flush already committed it. FUSE
+        // flushes once per close() of a duplicated descriptor; a dup-then-write
+        // pattern can flush before the write lands. The buffered bytes for this
+        // call will be pushed by the next flush. Still one complete blob per
+        // flush; no streaming, no partial commits.
+        let buffer = handle.write_buffer.get_or_insert_with(Vec::new);
+        extend_at(buffer, offset as usize, data);
+        reply.written(data.len() as u32);
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        match self.commit_handle(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Same path as flush: one complete blob per fsync.
+        match self.commit_handle(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let mut state = self.lock_state();
+        state.handles.remove(&fh.0);
+        reply.ok();
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        // Verify parent is a directory.
+        {
+            let state = self.lock_state();
+            let Some(entry) = state.inodes.get(&parent.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            if entry.kind != FileType::Directory {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+        }
+
+        // Fetch siblings so case-insensitive uniqueness is enforced up front.
+        // The daemon re-checks on file.write (source of truth); this avoids a
+        // late EIO-on-flush in the common case.
+        if self.ensure_children_fetched(parent.0).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        {
+            let state = self.lock_state();
+            if let Some(cache) = state.children.get(&parent.0) {
+                let key = case_insensitive_sibling_key(&name.to_string_lossy());
+                let conflict = cache.by_name.keys().any(|existing| {
+                    case_insensitive_sibling_key(&existing.to_string_lossy()) == key
+                });
+                if conflict {
+                    reply.error(Errno::EEXIST);
+                    return;
+                }
+            }
+        }
+
+        let file_mode = parse_mode_from_u32(mode, DEFAULT_FILE_MODE);
+        let (_inode, handle, attr) = {
+            let mut state = self.lock_state();
+            let uid = state.uid;
+            let gid = state.gid;
+            let inode = state.next_inode;
+            state.next_inode += 1;
+            let now = SystemTime::now();
+            let entry = InodeState {
+                inode,
+                parent_inode: parent.0,
+                node_id: None,
+                name: name.to_os_string(),
+                kind: FileType::RegularFile,
+                mode: file_mode,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Absent,
+                content_hash: None,
+                size_bytes: 0,
+            };
+            let attr = build_attr(&entry, uid, gid);
+            state.inodes.insert(inode, entry);
+            state
+                .children
+                .entry(parent.0)
+                .or_default()
+                .by_name
+                .insert(name.to_os_string(), inode);
+            let handle_id = state.next_handle;
+            state.next_handle += 1;
+            state.handles.insert(
+                handle_id,
+                OpenHandle {
+                    inode,
+                    writable: true,
+                    write_buffer: Some(Vec::new()),
+                },
+            );
+            (inode, handle_id, attr)
+        };
+        reply.created(
+            &TTL,
+            &attr,
+            Generation(0),
+            FileHandle(handle),
+            FopenFlags::empty(),
+        );
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        {
+            let state = self.lock_state();
+            let Some(entry) = state.inodes.get(&ino.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            if entry.kind != FileType::Directory {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+        }
+        if self.ensure_children_fetched(ino.0).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let state = self.lock_state();
+        let parent_inode = state
+            .inodes
+            .get(&ino.0)
+            .map(|entry| entry.parent_inode)
+            .unwrap_or(ino.0);
+        let mut entries: Vec<(INodeNo, FileType, OsString)> = vec![
+            (ino, FileType::Directory, OsString::from(".")),
+            (
+                INodeNo(parent_inode),
+                FileType::Directory,
+                OsString::from(".."),
+            ),
+        ];
+        if let Some(cache) = state.children.get(&ino.0) {
+            for (name, child_inode) in &cache.by_name {
+                if let Some(child) = state.inodes.get(child_inode) {
+                    entries.push((INodeNo(child.inode), child.kind, name.clone()));
+                }
+            }
+        }
+        for (entry_index, (entry_ino, kind, name)) in
+            entries.into_iter().enumerate().skip(offset as usize)
+        {
+            let next_offset = (entry_index + 1) as u64;
+            if reply.add(entry_ino, next_offset, kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        // No daemon method yet for creating directories. Return EROFS so the
+        // artist sees "not supported" rather than a silent no-op. Promotion
+        // needs a daemon mkdir spine + FUSE-side operation-token minting.
+        reply.error(Errno::EROFS);
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _link_name: &OsStr,
+        _target: &Path,
+        reply: ReplyEntry,
+    ) {
+        // No daemon method yet for symlink creation. EROFS awaits promotion.
+        reply.error(Errno::EROFS);
+    }
+
+    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        // Routes to daemon file.delete once that method is promoted AND the
+        // FUSE layer can mint the required operation token over the daemon API
+        // (file.delete is Destructive under AgentSafe). Until then, EIO with a
+        // clear comment so the artist sees the delete fail rather than no-op.
+        reply.error(Errno::EIO);
+    }
+
+    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        // Same gap as unlink: awaits file.delete promotion + FUSE-side token mint.
+        reply.error(Errno::EIO);
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        // Routes to daemon file.move once promoted AND the FUSE layer can mint
+        // the required operation token (file.move is DataMoving under
+        // AgentSafe). Until then, EIO so the artist sees a real failure.
+        reply.error(Errno::EIO);
+    }
+}
+
+/// Mount the read-write BiohazardFS workspace filesystem.
+pub fn mount_workspace(config: WorkspaceMountConfig) -> Result<()> {
+    let mountpoint = validate_workspace_mountpoint(&config.mountpoint, &config.cache_dir)?;
+    let filesystem = WorkspaceFs::connect(&config)?;
+
+    let mut options = Config::default();
+    options.mount_options = vec![
+        MountOption::FSName("biohazardfs".to_string()),
+        MountOption::Subtype("biohazardfs".to_string()),
+        MountOption::DefaultPermissions,
+    ];
+    if config.foreground {
+        eprintln!(
+            "biohazardfs-fuse mounting workspace at {} (daemon {}, cache {})",
+            mountpoint.display(),
+            config.daemon_endpoint,
+            config.cache_dir.display()
+        );
+    }
+    fuser::mount2(filesystem, &mountpoint, &options).map_err(|error| {
+        FuseError::io(
+            FuseErrorKind::Io,
+            format!(
+                "could not mount BiohazardFS workspace at {}",
+                mountpoint.display()
+            ),
+            error,
+        )
+    })
+}
+
+fn fetch_root_node_id(http: &DaemonHttpClient) -> Result<String> {
+    let mut request = DaemonRequest::new("file.list", Source::Ui);
+    request.params = serde_json::Value::Object(Default::default());
+    let envelope = http
+        .call::<Value>(&request)
+        .map_err(|error| FuseError::new(FuseErrorKind::Io, daemon_preflight_message(error)))?;
+    if !envelope.ok {
+        return Err(FuseError::new(
+            FuseErrorKind::InvalidSource,
+            "daemon rejected workspace pre-flight",
+        ));
+    }
+    let data = envelope
+        .data
+        .ok_or_else(|| FuseError::new(FuseErrorKind::InvalidSource, "daemon returned no data"))?;
+    let root_id = data
+        .get("parent_node_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            FuseError::new(
+                FuseErrorKind::InvalidSource,
+                "daemon file.list did not report a root node id",
+            )
+        })?;
+    Ok(root_id.to_string())
+}
+
+fn daemon_preflight_message(error: DaemonClientError) -> String {
+    format!("daemon pre-flight failed: {error}")
+}
+
+fn validate_loopback_endpoint(endpoint: &str) -> Result<()> {
+    biohazardfs_daemon::validate_loopback_addr(endpoint).map_err(|message| {
+        FuseError::new(
+            FuseErrorKind::InvalidSource,
+            format!("invalid daemon endpoint {endpoint:?}: {message}"),
+        )
+    })
+}
+
+fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
+    let canonical = if cache_dir.exists() {
+        fs::canonicalize(cache_dir).map_err(|error| {
+            FuseError::io(
+                FuseErrorKind::InvalidMountpoint,
+                "cache_dir could not be canonicalized",
+                error,
+            )
+        })?
+    } else {
+        fs::create_dir_all(cache_dir).map_err(|error| {
+            FuseError::io(
+                FuseErrorKind::InvalidMountpoint,
+                format!("could not create cache_dir {}", cache_dir.display()),
+                error,
+            )
+        })?;
+        fs::canonicalize(cache_dir).map_err(|error| {
+            FuseError::io(
+                FuseErrorKind::InvalidMountpoint,
+                "cache_dir could not be canonicalized after creation",
+                error,
+            )
+        })?
+    };
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        FuseError::io(
+            FuseErrorKind::InvalidMountpoint,
+            "cache_dir cannot be inspected",
+            error,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(FuseError::new(
+            FuseErrorKind::InvalidMountpoint,
+            "cache_dir must be a directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_workspace_mountpoint(mountpoint: &Path, cache_dir: &Path) -> Result<PathBuf> {
+    let canonical_mountpoint = fs::canonicalize(mountpoint).map_err(|error| {
+        FuseError::io(
+            FuseErrorKind::InvalidMountpoint,
+            "mountpoint does not exist or cannot be resolved",
+            error,
+        )
+    })?;
+    let mount_metadata = fs::metadata(&canonical_mountpoint).map_err(|error| {
+        FuseError::io(
+            FuseErrorKind::InvalidMountpoint,
+            "mountpoint cannot be inspected",
+            error,
+        )
+    })?;
+    if !mount_metadata.is_dir() {
+        return Err(FuseError::new(
+            FuseErrorKind::InvalidMountpoint,
+            "mountpoint must be a directory",
+        ));
+    }
+    // The cache_dir holds the live hydrate content; mounting over it (or vice
+    // versa) would make cache I/O alias FUSE traffic and confuse the kernel.
+    if canonical_mountpoint == cache_dir
+        || canonical_mountpoint.starts_with(cache_dir)
+        || cache_dir.starts_with(&canonical_mountpoint)
+    {
+        return Err(FuseError::new(
+            FuseErrorKind::InvalidMountpoint,
+            "mountpoint and cache_dir must not overlap",
+        ));
+    }
+    Ok(canonical_mountpoint)
+}
+
+/// Owner uid/gid for stamped attrs. The mount runs as the artist; the daemon
+/// is per-user. Returned as a tuple so callers do not need libc directly.
+fn current_owner() -> (u32, u32) {
+    // Safety: getuid/getgid take no arguments and return the calling process's
+    // ids. They are documented as always-successful on POSIX platforms.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    (uid, gid)
+}
+
+fn build_attr(entry: &InodeState, uid: u32, gid: u32) -> FileAttr {
+    FileAttr {
+        ino: INodeNo(entry.inode),
+        size: if entry.kind == FileType::RegularFile {
+            entry.size_bytes
+        } else {
+            0
+        },
+        blocks: entry.size_bytes.div_ceil(4096),
+        atime: SystemTime::now(),
+        mtime: entry.mtime,
+        ctime: entry.mtime,
+        crtime: entry.crtime,
+        kind: entry.kind,
+        perm: entry.mode,
+        nlink: if entry.kind == FileType::Directory {
+            2
+        } else {
+            1
+        },
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
+    }
+}
+
+fn parse_kind(raw: &str) -> FileType {
+    match raw {
+        "directory" => FileType::Directory,
+        "symlink" => FileType::Symlink,
+        _ => FileType::RegularFile,
+    }
+}
+
+fn parse_mode(raw: Option<&str>, default: u16) -> u16 {
+    raw.and_then(|value| {
+        let trimmed = value.trim_start_matches("0o");
+        u16::from_str_radix(trimmed, 8).ok()
+    })
+    .unwrap_or(default)
+}
+
+fn parse_mode_from_u32(mode: u32, default: u16) -> u16 {
+    let candidate = (mode & 0o7777) as u16;
+    if candidate == 0 { default } else { candidate }
+}
+
+fn extend_at(buffer: &mut Vec<u8>, offset: usize, data: &[u8]) {
+    let end = offset.saturating_add(data.len());
+    if buffer.len() < end {
+        buffer.resize(end, 0);
+    }
+    buffer[offset..end].copy_from_slice(data);
+}
+
+/// Decode a lowercase hex string into bytes (mirrors the daemon encoder). Used
+/// to turn the daemon `content_hex` field into file content on hydration.
+fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, ()> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(());
+    }
+    let bytes = hex.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_nibble(bytes[index])?;
+        let low = hex_nibble(bytes[index + 1])?;
+        out.push((high << 4) | low);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> std::result::Result<u8, ()> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+/// Encode bytes as lowercase hex. Mirrors the daemon encoder so content
+/// round-trips byte-identically between file.read and file.write.
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +1810,463 @@ mod tests {
         let node = index.nodes.get(&asset).expect("asset node");
         assert_eq!(index.current_attr(node).expect("current attr").perm, 0o444);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    // ----- WorkspaceFs (read-write) tests -----
+
+    #[test]
+    fn hex_helpers_round_trip_and_reject_garbage() {
+        assert!(decode_hex("").unwrap().is_empty());
+        assert_eq!(
+            decode_hex("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(
+            decode_hex("DEADBEEF").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert!(decode_hex("abc").is_err());
+        assert!(decode_hex("xy").is_err());
+        assert_eq!(encode_hex(&[0x00, 0xff, 0x10]), "00ff10");
+        // Round trip preserves bytes exactly.
+        let payload = b"BiohazardFS hydrate payload \x00\xff\x10";
+        assert_eq!(decode_hex(&encode_hex(payload)).unwrap(), payload);
+    }
+
+    #[test]
+    fn extend_at_handles_sequential_overwrite_and_gap() {
+        let mut buffer = Vec::new();
+        extend_at(&mut buffer, 0, b"hello");
+        assert_eq!(buffer, b"hello");
+
+        // Overwrite the middle (in place, not insertion).
+        extend_at(&mut buffer, 1, b"EE");
+        assert_eq!(buffer, b"hEElo");
+
+        // Write past the end zero-pads the gap.
+        extend_at(&mut buffer, 8, b"XY");
+        assert_eq!(buffer, b"hEElo\x00\x00\x00XY");
+    }
+
+    #[test]
+    fn parse_kind_and_mode_use_defaults() {
+        assert_eq!(parse_kind("file"), FileType::RegularFile);
+        assert_eq!(parse_kind("directory"), FileType::Directory);
+        assert_eq!(parse_kind("symlink"), FileType::Symlink);
+        assert_eq!(parse_kind("unknown"), FileType::RegularFile);
+
+        assert_eq!(parse_mode(Some("0o755"), DEFAULT_DIR_MODE), 0o755);
+        assert_eq!(parse_mode(Some("0o644"), DEFAULT_FILE_MODE), 0o644);
+        assert_eq!(parse_mode(None, DEFAULT_FILE_MODE), DEFAULT_FILE_MODE);
+        assert_eq!(parse_mode(Some("garbage"), 0o700), 0o700);
+
+        assert_eq!(parse_mode_from_u32(0o755, DEFAULT_FILE_MODE), 0o755);
+        assert_eq!(parse_mode_from_u32(0, DEFAULT_FILE_MODE), DEFAULT_FILE_MODE);
+    }
+
+    /// Boot an in-process dev-loopback daemon on an ephemeral port. Returned
+    /// backend lets tests seed state before the client connects.
+    fn start_test_daemon(
+        token: &str,
+    ) -> (
+        String,
+        std::sync::Arc<biohazardfs_daemon::DaemonBackend>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use biohazardfs_daemon::{DaemonBackend, DevLoopbackConfig, run_dev_loopback_http};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+        let addr_string = addr.to_string();
+        let backend = std::sync::Arc::new(DaemonBackend::new(addr_string.clone()));
+        let config = DevLoopbackConfig::with_backend(
+            addr_string.clone(),
+            token.to_string(),
+            backend.clone(),
+        );
+        let handle = std::thread::spawn(move || {
+            let _ = run_dev_loopback_http(config);
+        });
+        // Spin briefly until the daemon accepts connections.
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (addr_string, backend, handle)
+    }
+
+    fn workspace_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "biohazardfs-fuse-workspace-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create workspace test dir");
+        path
+    }
+
+    #[test]
+    fn workspace_connect_binds_root_inode_to_daemon_root() {
+        let (addr, _backend, _handle) = start_test_daemon("ws_token");
+        let cache = workspace_test_dir("connect-cache");
+        let mount = workspace_test_dir("connect-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_token".to_string(),
+            cache_dir: cache.clone(),
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        let state = fs.lock_state();
+        let root = state.inodes.get(&ROOT_INODE).expect("root inode");
+        assert_eq!(root.kind, FileType::Directory);
+        assert!(
+            root.node_id
+                .as_ref()
+                .is_some_and(|id| id.starts_with("node_")),
+            "root must bind to a daemon node id"
+        );
+    }
+
+    #[test]
+    fn workspace_connect_rejects_bad_endpoint_and_empty_token() {
+        let cache = workspace_test_dir("bad-endpoint-cache");
+        let mount = workspace_test_dir("bad-endpoint-mount");
+        let err = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: "192.168.1.1:47666".to_string(),
+            local_token: "tok".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect_err("non-loopback endpoint rejected");
+        assert_eq!(err.kind(), &FuseErrorKind::InvalidSource);
+
+        let cache = workspace_test_dir("empty-token-cache");
+        let mount = workspace_test_dir("empty-token-mount");
+        let err = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: "127.0.0.1:47666".to_string(),
+            local_token: String::new(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect_err("empty token rejected");
+        assert_eq!(err.kind(), &FuseErrorKind::InvalidSource);
+    }
+
+    #[test]
+    fn workspace_ensure_children_fetched_lists_root_children() {
+        let (addr, _backend, _handle) = start_test_daemon("ws_list");
+        let cache = workspace_test_dir("list-cache");
+        let mount = workspace_test_dir("list-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_list".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        fs.ensure_children_fetched(ROOT_INODE)
+            .expect("fetch root children");
+        let state = fs.lock_state();
+        let cache = state
+            .children
+            .get(&ROOT_INODE)
+            .expect("root children cache populated");
+        assert!(cache.fetched);
+        // The seeded daemon namespace has `shots` and `README.md` under root.
+        let names: Vec<String> = cache
+            .by_name
+            .keys()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "shots"));
+        assert!(names.iter().any(|name| name == "README.md"));
+    }
+
+    /// Simulate `create()` + `flush()` end-to-end without a real FUSE mount:
+    /// insert an inode + handle holding a write buffer, call `commit_handle`,
+    /// and verify the daemon recorded an immutable version and bound the node.
+    #[test]
+    fn workspace_commit_handle_pushes_blob_and_binds_node() {
+        let (addr, backend, _handle) = start_test_daemon("ws_commit");
+        let cache = workspace_test_dir("commit-cache");
+        let mount = workspace_test_dir("commit-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_commit".to_string(),
+            cache_dir: cache.clone(),
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Simulate create(): allocate an inode + handle with a buffered payload.
+        let payload = b"biohazard workspace write".to_vec();
+        let (inode, handle) = {
+            let mut state = fs.lock_state();
+            let inode = state.next_inode;
+            state.next_inode += 1;
+            let now = SystemTime::now();
+            state.inodes.insert(
+                inode,
+                InodeState {
+                    inode,
+                    parent_inode: ROOT_INODE,
+                    node_id: None,
+                    name: OsString::from("committed.txt"),
+                    kind: FileType::RegularFile,
+                    mode: DEFAULT_FILE_MODE,
+                    target: None,
+                    mtime: now,
+                    crtime: now,
+                    cache_state: CacheState::Absent,
+                    content_hash: None,
+                    size_bytes: 0,
+                },
+            );
+            state
+                .children
+                .entry(ROOT_INODE)
+                .or_default()
+                .by_name
+                .insert(OsString::from("committed.txt"), inode);
+            let handle = state.next_handle;
+            state.next_handle += 1;
+            state.handles.insert(
+                handle,
+                OpenHandle {
+                    inode,
+                    writable: true,
+                    write_buffer: Some(payload.clone()),
+                },
+            );
+            (inode, handle)
+        };
+
+        fs.commit_handle(inode, handle).expect("commit succeeds");
+
+        // The inode is now bound to a daemon node id and cache_state is Ready.
+        let state = fs.lock_state();
+        let entry = state.inodes.get(&inode).expect("inode persists");
+        assert_eq!(entry.cache_state, CacheState::Ready);
+        assert!(
+            entry.node_id.is_some(),
+            "node id bound after successful flush"
+        );
+        assert_eq!(entry.size_bytes, payload.len() as u64);
+        // Cache file holds the committed bytes.
+        let cached = fs::read(entry.cache_path(&cache)).expect("cache file exists");
+        assert_eq!(cached, payload);
+        let node_id = entry.node_id.clone().unwrap();
+        drop(state);
+
+        // The daemon truth reflects the immutable version + content.
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(inner.file_contents.contains_key(&node_id));
+        assert_eq!(
+            inner.file_contents.get(&node_id).unwrap(),
+            &payload.as_slice()
+        );
+        assert!(
+            inner
+                .audit
+                .iter()
+                .any(|event| event.event_type == "file.write"
+                    && event.node_id.as_deref() == Some(node_id.as_str()))
+        );
+    }
+
+    /// When the daemon is unreachable, `commit_handle` must NOT silently drop
+    /// the buffer. It restores the buffer and returns EIO; the artist sees a
+    /// real write failure (FILESYSTEM_SEMANTICS.md dirty-data invariant).
+    #[test]
+    fn workspace_commit_handle_keeps_buffer_on_daemon_failure() {
+        // Construct a WorkspaceFs whose client points at a dead endpoint. We
+        // bypass connect() (which pre-flights) and build the state by hand.
+        let cache = workspace_test_dir("fail-cache");
+        let http = DaemonHttpClient::new("127.0.0.1:1".to_string(), "dead".to_string());
+        let (uid, gid) = current_owner();
+        let mut state = FsState {
+            inodes: HashMap::new(),
+            children: HashMap::new(),
+            handles: HashMap::new(),
+            next_inode: 2,
+            next_handle: 1,
+            uid,
+            gid,
+        };
+        let inode = 2u64;
+        let now = SystemTime::now();
+        state.inodes.insert(
+            inode,
+            InodeState {
+                inode,
+                parent_inode: ROOT_INODE,
+                node_id: None,
+                name: OsString::from("orphan.txt"),
+                kind: FileType::RegularFile,
+                mode: DEFAULT_FILE_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Absent,
+                content_hash: None,
+                size_bytes: 0,
+            },
+        );
+        let parent_node = "node_root".to_string();
+        state.inodes.entry(ROOT_INODE).or_insert_with(|| {
+            // Insert a synthetic root so commit_handle can resolve the parent.
+            InodeState {
+                inode: ROOT_INODE,
+                parent_inode: ROOT_INODE,
+                node_id: Some(parent_node.clone()),
+                name: OsString::from("/"),
+                kind: FileType::Directory,
+                mode: DEFAULT_DIR_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 0,
+            }
+        });
+        let payload = b"do not lose me".to_vec();
+        state.handles.insert(
+            1u64,
+            OpenHandle {
+                inode,
+                writable: true,
+                write_buffer: Some(payload.clone()),
+            },
+        );
+        let fs = WorkspaceFs {
+            http: Mutex::new(http),
+            cache_dir: cache,
+            state: Mutex::new(state),
+        };
+
+        let errno = fs
+            .commit_handle(inode, 1)
+            .expect_err("commit must fail when daemon is unreachable");
+        assert_eq!(i32::from(errno), libc::EIO);
+
+        // The buffer survives so a retry can push it.
+        let state = fs.lock_state();
+        let handle = state.handles.get(&1).expect("handle retained");
+        assert_eq!(handle.write_buffer.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn workspace_mountpoint_rejects_overlap_with_cache() {
+        let cache = workspace_test_dir("overlap-cache");
+        let mount = cache.join("mount");
+        fs::create_dir_all(&mount).expect("create nested mountpoint");
+        let err = validate_workspace_mountpoint(&mount, &cache);
+        assert!(err.is_err(), "overlapping mountpoint/cache_dir rejected");
+        assert_eq!(err.unwrap_err().kind(), &FuseErrorKind::InvalidMountpoint);
+    }
+
+    #[test]
+    fn workspace_prepare_cache_dir_creates_missing() {
+        let root = workspace_test_dir("prepare-parent");
+        let target = root.join("deep/cache");
+        let prepared = prepare_cache_dir(&target).expect("creates nested cache dir");
+        assert!(prepared.is_absolute());
+        assert!(prepared.is_dir());
+    }
+
+    /// Live end-to-end test: mount the read-write filesystem against a running
+    /// daemon, write a file through the mount, read it back, and assert bytes
+    /// match. Skips cleanly when /dev/fuse or fusermount is unavailable (CI
+    /// sandboxes). This is the gold test for the Wave 3 write path.
+    #[test]
+    fn live_mount_write_then_read_round_trip() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("fuse-live-skip: /dev/fuse not available");
+            return;
+        }
+        let has_fusermount = ["fusermount3", "fusermount"].iter().any(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .output()
+                .is_ok()
+        });
+        if !has_fusermount {
+            eprintln!("fuse-live-skip: fusermount not available");
+            return;
+        }
+
+        let (addr, _backend, _handle) = start_test_daemon("ws_live");
+        let cache = workspace_test_dir("live-cache");
+        let mount = workspace_test_dir("live-mount");
+        let config = WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_live".to_string(),
+            cache_dir: cache,
+            mountpoint: mount.clone(),
+            foreground: false,
+        };
+
+        let mount_for_thread = mount.clone();
+        let join = std::thread::spawn(move || {
+            let _ = mount_workspace(config);
+        });
+
+        // Wait for the mount to become active (or the thread to die).
+        let mut active = false;
+        for _ in 0..100 {
+            if std::process::Command::new("mountpoint")
+                .arg("-q")
+                .arg(&mount_for_thread)
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                active = true;
+                break;
+            }
+            if join.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !active {
+            eprintln!("fuse-live-skip: mountpoint did not become active");
+            let _ = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(&mount_for_thread)
+                .status();
+            return;
+        }
+
+        let test_path = mount_for_thread.join("live.txt");
+        let payload = b"live workspace payload\n";
+        let result = (|| -> std::io::Result<()> {
+            fs::write(&test_path, payload)?;
+            let read_back = fs::read(&test_path)?;
+            assert_eq!(read_back, payload);
+            Ok(())
+        })();
+
+        // Always unmount.
+        let _ = std::process::Command::new("fusermount")
+            .arg("-u")
+            .arg(&mount_for_thread)
+            .status();
+        let _ = join.join();
+
+        result.expect("live write-then-read must match");
     }
 }

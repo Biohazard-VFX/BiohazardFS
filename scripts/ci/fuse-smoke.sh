@@ -19,18 +19,26 @@ fi
 
 cd "$ROOT_DIR"
 cargo build -p biohazardfs-fuse
+cargo build -p biohazardfs-daemon
 
 SOURCE_ROOT="$(mktemp -d)"
 MOUNTPOINT="$(mktemp -d)"
 SMOKE_DIR="$(mktemp -d)"
 FUSE_PID=""
+DAEMON_PID=""
+RW_MOUNTPOINT="$(mktemp -d)"
+RW_CACHE_DIR="$(mktemp -d)"
 
 cleanup() {
   "$FUSERMOUNT" -u "$MOUNTPOINT" >/dev/null 2>&1 || true
+  "$FUSERMOUNT" -u "$RW_MOUNTPOINT" >/dev/null 2>&1 || true
   if [[ -n "$FUSE_PID" ]]; then
     kill "$FUSE_PID" >/dev/null 2>&1 || true
   fi
-  rm -rf "$SOURCE_ROOT" "$MOUNTPOINT" "$SMOKE_DIR"
+  if [[ -n "$DAEMON_PID" ]]; then
+    kill "$DAEMON_PID" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$SOURCE_ROOT" "$MOUNTPOINT" "$SMOKE_DIR" "$RW_MOUNTPOINT" "$RW_CACHE_DIR"
 }
 trap cleanup EXIT
 
@@ -80,5 +88,78 @@ fi
 
 "$FUSERMOUNT" -u "$MOUNTPOINT"
 wait "$FUSE_PID" || true
+FUSE_PID=""
 
 echo "fuse-live-mount-smoke-ok"
+
+# ----- read-write workspace mount: write a file through the mount and read it back -----
+# The read-write mount proxies file.write/file.read through the local daemon.
+DAEMON_PORT=47666
+DAEMON_ADDR="127.0.0.1:${DAEMON_PORT}"
+DAEMON_TOKEN="fuse-smoke-local-token"
+
+# The dev-loopback daemon refuses non-loopback addrs and requires a token env.
+BIOHAZARDFS_LOCAL_TOKEN="$DAEMON_TOKEN" \
+  target/debug/biohazardfsd --dev-loopback-http --addr "$DAEMON_ADDR" \
+  >"$SMOKE_DIR/daemon.log" 2>&1 &
+DAEMON_PID=$!
+
+DAEMON_HOST="${DAEMON_ADDR%%:*}"
+DAEMON_PORT_NUM="${DAEMON_ADDR##*:}"
+for _ in $(seq 1 80); do
+  if python3 -c "import socket,sys; s=socket.create_connection(('$DAEMON_HOST', $DAEMON_PORT_NUM), timeout=0.5); s.close()" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$DAEMON_PID" >/dev/null 2>&1; then
+    echo "fuse-smoke-fail: daemon process exited" >&2
+    cat "$SMOKE_DIR/daemon.log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+target/debug/biohazardfs-fuse mount-workspace \
+  --daemon-endpoint "$DAEMON_ADDR" \
+  --local-token "$DAEMON_TOKEN" \
+  --cache-dir "$RW_CACHE_DIR" \
+  --mountpoint "$RW_MOUNTPOINT" \
+  >"$SMOKE_DIR/rw-fuse.log" 2>&1 &
+FUSE_PID=$!
+
+for _ in $(seq 1 80); do
+  if mountpoint -q "$RW_MOUNTPOINT"; then
+    break
+  fi
+  if ! kill -0 "$FUSE_PID" >/dev/null 2>&1; then
+    echo "fuse-smoke-fail: read-write mount process exited" >&2
+    cat "$SMOKE_DIR/rw-fuse.log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! mountpoint -q "$RW_MOUNTPOINT"; then
+  echo "fuse-smoke-fail: read-write mountpoint did not become active" >&2
+  cat "$SMOKE_DIR/rw-fuse.log" >&2
+  exit 1
+fi
+
+# Write a file through the FUSE mount, then read it back and assert bytes match.
+RW_PAYLOAD="read-write workspace payload $(date +%s)"
+printf '%s' "$RW_PAYLOAD" >"$RW_MOUNTPOINT/through_mount.txt"
+READ_BACK="$(cat "$RW_MOUNTPOINT/through_mount.txt")"
+if [[ "$READ_BACK" != "$RW_PAYLOAD" ]]; then
+  echo "fuse-smoke-fail: read-write round trip mismatch" >&2
+  echo "expected: $RW_PAYLOAD" >&2
+  echo "actual:   $READ_BACK" >&2
+  exit 1
+fi
+
+"$FUSERMOUNT" -u "$RW_MOUNTPOINT"
+wait "$FUSE_PID" || true
+FUSE_PID=""
+kill "$DAEMON_PID" >/dev/null 2>&1 || true
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+
+echo "fuse-workspace-write-smoke-ok"

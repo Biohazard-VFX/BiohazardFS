@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 mod unix;
 
 #[cfg(target_os = "linux")]
-pub use unix::{MountConfig, ReadOnlyWorkspaceFs, WorkspaceIndex, mount_read_only_workspace};
+pub use unix::{
+    MountConfig, ReadOnlyWorkspaceFs, WorkspaceFs, WorkspaceIndex, WorkspaceMountConfig,
+    mount_read_only_workspace, mount_workspace,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FuseErrorKind {
@@ -140,4 +143,22 @@ pub struct MountConfig {
     pub source: PathBuf,
     pub mountpoint: PathBuf,
     pub foreground: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub struct WorkspaceMountConfig {
+    pub daemon_endpoint: String,
+    pub local_token: String,
+    pub cache_dir: PathBuf,
+    pub mountpoint: PathBuf,
+    pub foreground: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mount_workspace(_config: WorkspaceMountConfig) -> Result<()> {
+    Err(FuseError::new(
+        FuseErrorKind::UnsupportedPlatform,
+        "BiohazardFS FUSE mounts are currently supported only on Linux platforms",
+    ))
 }

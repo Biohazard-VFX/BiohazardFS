@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use biohazardfs_fuse::{MountConfig, mount_read_only_workspace};
+use biohazardfs_fuse::{
+    FuseErrorKind, MountConfig, WorkspaceMountConfig, mount_read_only_workspace, mount_workspace,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -26,6 +28,27 @@ enum Command {
         #[arg(long, default_value_t = true)]
         foreground: bool,
     },
+    /// Mount a read-write BiohazardFS workspace backed by the local daemon.
+    ///
+    /// Files hydrate on open via `file.read`; writes buffer per file handle
+    /// and push one complete blob per flush/fsync via `file.write`.
+    MountWorkspace {
+        /// Loopback daemon endpoint, e.g. `127.0.0.1:47666`.
+        #[arg(long)]
+        daemon_endpoint: String,
+        /// Owner-only local daemon session token (or set BIOHAZARDFS_LOCAL_TOKEN).
+        #[arg(long, env = "BIOHAZARDFS_LOCAL_TOKEN")]
+        local_token: String,
+        /// Local cache directory for hydrated content. Created if missing.
+        #[arg(long)]
+        cache_dir: PathBuf,
+        /// Existing empty directory used as the FUSE mountpoint.
+        #[arg(long)]
+        mountpoint: PathBuf,
+        /// Stay in the foreground. This is the current supported mode.
+        #[arg(long, default_value_t = true)]
+        foreground: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -37,6 +60,19 @@ fn main() -> ExitCode {
             foreground,
         } => mount_read_only_workspace(MountConfig {
             source,
+            mountpoint,
+            foreground,
+        }),
+        Command::MountWorkspace {
+            daemon_endpoint,
+            local_token,
+            cache_dir,
+            mountpoint,
+            foreground,
+        } => mount_workspace(WorkspaceMountConfig {
+            daemon_endpoint,
+            local_token,
+            cache_dir,
             mountpoint,
             foreground,
         }),
@@ -55,7 +91,11 @@ fn main() -> ExitCode {
                 eprintln!("caused by: {error}");
                 source = error.source();
             }
-            ExitCode::from(2)
+            if matches!(error.kind(), &FuseErrorKind::UnsupportedPlatform) {
+                ExitCode::from(3)
+            } else {
+                ExitCode::from(2)
+            }
         }
     }
 }

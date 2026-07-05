@@ -283,9 +283,9 @@ fn dispatch_method(
         "file.checksum" => b::file_checksum_payload(backend, params),
         "file.history" => b::file_history_payload(backend, params),
         "file.versions" => b::file_versions_payload(backend, params),
-        "file.restore" | "file.delete" | "file.move" | "file.copy" | "file.write" | "file.read" => {
-            Err(not_implemented(method))
-        }
+        "file.write" => b::file_write_payload(backend, params, source),
+        "file.read" => b::file_read_payload(backend, params),
+        "file.restore" | "file.delete" | "file.move" | "file.copy" => Err(not_implemented(method)),
 
         // ----- cache -----
         "cache.status" => b::cache_status_payload(backend),
