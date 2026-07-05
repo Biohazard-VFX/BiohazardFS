@@ -66,4 +66,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - README and `AGENTS.md` now reflect the current CLI/server command surface, smoke scripts, Docker/Compose/Helm validation, and CI gates.
 - Repository documentation now treats docs as product contracts for implementation work.
 
+### Fixed
+
+- FUSE read-write partial-write corruption: non-truncating edits to existing files committed a sparse zero-padded buffer instead of overlaying the existing content (repro: `abcdef` + seek 3 + write `X` became `00 00 58`). The write buffer is now seeded from the hydrated cache file on first write, and flush/close are a no-op when no writes occurred.
+- FUSE dirty-data loss on release: after a failed daemon flush, `release` dropped the only in-memory copy of the dirty bytes. Unsynced bytes are now persisted to a durable on-disk dirty journal (`<cache_dir>/dirty/`) on flush failure and release, and cleared on successful commit.
+- Security: `biohazardfs-fuse mount-workspace --local-token` and `biohazardfs auth login --token` exposed secrets in argv (process listings / shell history). Both flags are removed; the local daemon token is read from `BIOHAZARDFS_LOCAL_TOKEN` and the login token from `BIOHAZARDFS_TOKEN` (env only).
+- Windows CI: a migration-003 SQL assertion was line-ending sensitive and failed under CRLF checkouts. The SQL is now `\r`-normalized before the multi-line substring check.
+- Daemon path resolution: CLI file/cache/lock commands sent `{path}` but the daemon required `node_id`, returning `missing_param node_id`. The daemon now resolves either `node_id` or a mount-relative `path` (case-insensitive walk from the namespace root) for the spine lookup methods.
+- Server `operations.submit` idempotency race: two concurrent submissions with the same idempotency key could both miss the pre-read, with the loser mapped to `operation_store_unavailable` instead of replaying. The insert now uses `ON CONFLICT (org_id, idempotency_key) DO NOTHING` and replays the existing operation on the no-row path.
+- CLI mutation gate honesty: `--yes` on daemon-gated destructive/admin/data-moving methods no longer dispatches to the daemon (which would reject with `operation_token_required`); it returns a typed `apply_not_wired` (exit 7) explaining that daemon-issued operation tokens are not yet wired. `--apply <operation-token>` is documented as planned.
+
 [Unreleased]: https://github.com/Biohazard-VFX/BiohazardFS/compare/main...HEAD

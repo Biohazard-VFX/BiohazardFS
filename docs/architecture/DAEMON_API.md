@@ -109,7 +109,9 @@ Descriptor and token files must be readable only by the owning OS user.
 
 ## Local state store
 
-The daemon uses an owner-only SQLite local state DB.
+**Target behavior (production):** the daemon uses an owner-only SQLite local state DB.
+
+**Current scaffold:** the local state is in-memory (`DaemonBackend`) and rebuilt on each daemon start; nothing is persisted to SQLite yet (see "Spine — SCAFFOLD" below). The SQLite projection is planned work.
 
 The local state DB tracks:
 

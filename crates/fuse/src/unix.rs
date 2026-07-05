@@ -507,8 +507,14 @@ struct InodeState {
 
 impl InodeState {
     fn cache_path(&self, cache_dir: &Path) -> PathBuf {
-        cache_dir.join(format!("inode-{}", self.inode))
+        inode_cache_path(cache_dir, self.inode)
     }
+}
+
+/// On-disk cache path for a given inode under `cache_dir`. Centralized so the
+/// write-buffer seed path and `InodeState::cache_path` cannot drift.
+fn inode_cache_path(cache_dir: &Path, inode: u64) -> PathBuf {
+    cache_dir.join(format!("inode-{inode}"))
 }
 
 /// Children of a directory indexed by name and by daemon `node_id`. `fetched`
@@ -665,6 +671,40 @@ impl WorkspaceFs {
         self.http
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// On-disk path for an inode's dirty journal entry.
+    fn dirty_journal_path(&self, inode: u64) -> PathBuf {
+        self.cache_dir.join("dirty").join(format!("inode-{inode}"))
+    }
+
+    /// Best-effort durable persistence of unsynced dirty bytes. Survives
+    /// `release` of the in-memory handle (which would otherwise drop the only
+    /// copy after a failed flush) and mount-process restart. A follow-up replay
+    /// path will push journaled bytes on daemon reconnect. Best-effort on
+    /// purpose: a journal-write failure is logged and the bytes are lost rather
+    /// than crashing the mount on top of artist data.
+    fn journal_dirty(&self, inode: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let path = self.dirty_journal_path(inode);
+        let Some(parent) = path.parent() else {
+            eprintln!("biohazardfs-fuse: dirty journal path has no parent for inode {inode}");
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            eprintln!("biohazardfs-fuse: could not create dirty journal dir for inode {inode}");
+            return;
+        }
+        if fs::write(&path, bytes).is_err() {
+            eprintln!("biohazardfs-fuse: could not journal dirty bytes for inode {inode}");
+        }
+    }
+
+    /// Remove the journal entry once the bytes have reached the daemon.
+    fn clear_dirty_journal(&self, inode: u64) {
+        let _ = fs::remove_file(self.dirty_journal_path(inode));
     }
 
     /// Perform a daemon RPC and unpack the envelope. The HTTP lock is held only
@@ -861,6 +901,10 @@ impl WorkspaceFs {
                     return Err(Errno::EIO);
                 }
 
+                // The bytes reached the daemon and the cache; any earlier dirty
+                // journal entry is obsolete.
+                self.clear_dirty_journal(ino);
+
                 let mut state = self.lock_state();
                 let parent_inode = state.inodes.get(&ino).map(|entry| entry.parent_inode);
                 if let Some(entry) = state.inodes.get_mut(&ino) {
@@ -888,6 +932,10 @@ impl WorkspaceFs {
                     "biohazardfs-fuse: file.write push failed for inode {ino}: {}",
                     error.message()
                 );
+                // Persist the unsent bytes to the durable dirty journal so they
+                // survive release/restart; a daemon-reconnect replay path will
+                // push them. Done before re-locking state so the borrow is clean.
+                self.journal_dirty(ino, &prepared.bytes);
                 let mut state = self.lock_state();
                 if let Some(handle) = state.handles.get_mut(&fh) {
                     handle.write_buffer = Some(prepared.bytes);
@@ -1089,7 +1137,10 @@ impl Filesystem for WorkspaceFs {
                 OpenHandle {
                     inode: ino.0,
                     writable,
-                    write_buffer: if writable { Some(Vec::new()) } else { None },
+                    // No buffer until the first write seeds it from the hydrated
+                    // cache file. This keeps flush a no-op for opens that never
+                    // write, and prevents sparse-buffer corruption on partial writes.
+                    write_buffer: None,
                 },
             );
             handle_id
@@ -1170,13 +1221,14 @@ impl Filesystem for WorkspaceFs {
             reply.error(Errno::EACCES);
             return;
         }
-        // Re-initialize the buffer if a prior flush already committed it. FUSE
-        // flushes once per close() of a duplicated descriptor; a dup-then-write
-        // pattern can flush before the write lands. The buffered bytes for this
-        // call will be pushed by the next flush. Still one complete blob per
-        // flush; no streaming, no partial commits.
-        let buffer = handle.write_buffer.get_or_insert_with(Vec::new);
-        extend_at(buffer, offset as usize, data);
+        // Seed the buffer from the hydrated cache file on first write (or
+        // re-seed from the committed cache state after a prior flush), then
+        // overlay this write. This is what makes a non-truncating edit to an
+        // existing file preserve prior content: the writable open starts with
+        // no buffer, and the first write loads the current cache bytes so a
+        // write at an offset overlays instead of committing a sparse zero-padded
+        // buffer. Still one complete blob per flush; no streaming, no partials.
+        accumulate_write(handle, &self.cache_dir, offset as usize, data);
         reply.written(data.len() as u32);
     }
 
@@ -1212,15 +1264,28 @@ impl Filesystem for WorkspaceFs {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let mut state = self.lock_state();
-        state.handles.remove(&fh.0);
+        // Drop the in-memory handle, but if it still carries unsent bytes (a
+        // prior flush failed and restored them, and no retry followed), persist
+        // them to the durable journal first so release does not drop the only
+        // copy. A normal successful close has no buffer here (the last flush
+        // took it), so this only fires on the failure path.
+        let dirty_bytes = {
+            let mut state = self.lock_state();
+            state
+                .handles
+                .remove(&fh.0)
+                .and_then(|handle| handle.write_buffer)
+        };
+        if let Some(bytes) = dirty_bytes {
+            self.journal_dirty(ino.0, &bytes);
+        }
         reply.ok();
     }
 
@@ -1305,7 +1370,7 @@ impl Filesystem for WorkspaceFs {
                 OpenHandle {
                     inode,
                     writable: true,
-                    write_buffer: Some(Vec::new()),
+                    write_buffer: None,
                 },
             );
             (inode, handle_id, attr)
@@ -1638,6 +1703,22 @@ fn parse_mode_from_u32(mode: u32, default: u16) -> u16 {
     if candidate == 0 { default } else { candidate }
 }
 
+/// Overlay `data` at `offset` onto the handle's write buffer, seeding the
+/// buffer from the hydrated cache file on first write. This is the fix for
+/// non-truncating edits to existing files: a writable open must not start with
+/// an empty buffer, or a write at a non-zero offset commits a sparse
+/// zero-padded buffer (e.g. `abcdef` + seek 3 + write `X` became `00 00 00 58`)
+/// instead of overlaying the existing content. A freshly created file has no
+/// cache file yet, so its seed is empty. After a successful flush the buffer is
+/// re-seeded from the committed cache file, preserving content across
+/// dup-then-write cycles.
+fn accumulate_write(handle: &mut OpenHandle, cache_dir: &Path, offset: usize, data: &[u8]) {
+    let buffer = handle.write_buffer.get_or_insert_with(|| {
+        fs::read(inode_cache_path(cache_dir, handle.inode)).unwrap_or_default()
+    });
+    extend_at(buffer, offset, data);
+}
+
 fn extend_at(buffer: &mut Vec<u8>, offset: usize, data: &[u8]) {
     let end = offset.saturating_add(data.len());
     if buffer.len() < end {
@@ -1846,6 +1927,75 @@ mod tests {
         // Write past the end zero-pads the gap.
         extend_at(&mut buffer, 8, b"XY");
         assert_eq!(buffer, b"hEElo\x00\x00\x00XY");
+    }
+
+    #[test]
+    fn accumulate_write_overlays_existing_content_not_sparse() {
+        // Repro for the partial-write corruption blocker: a non-truncating edit
+        // to an existing file must preserve prior content. With an empty seed
+        // buffer, writing X at offset 3 of "abcdef" produced [0,0,0,X] and lost
+        // the original. Seeding from the hydrated cache file fixes it.
+        let dir = workspace_test_dir("accumulate-overlay");
+        let inode = 9u64;
+        fs::write(inode_cache_path(&dir, inode), b"abcdef").expect("seed cache file");
+
+        let mut handle = OpenHandle {
+            inode,
+            writable: true,
+            write_buffer: None,
+        };
+        accumulate_write(&mut handle, &dir, 3, b"X");
+        assert_eq!(handle.write_buffer.as_deref(), Some(b"abcXef".as_slice()));
+    }
+
+    #[test]
+    fn accumulate_write_seeds_empty_for_new_file() {
+        // A freshly created file has no cache file yet; the seed is empty so
+        // the first write starts the buffer from scratch.
+        let dir = workspace_test_dir("accumulate-newfile");
+        let inode = 10u64;
+        let mut handle = OpenHandle {
+            inode,
+            writable: true,
+            write_buffer: None,
+        };
+        accumulate_write(&mut handle, &dir, 0, b"hello");
+        assert_eq!(handle.write_buffer.as_deref(), Some(b"hello".as_slice()));
+    }
+
+    #[test]
+    fn dirty_journal_persists_and_clears() {
+        let dir = workspace_test_dir("dirty-journal");
+        let http = DaemonHttpClient::new("127.0.0.1:1".to_string(), "x".to_string());
+        let mount = WorkspaceFs {
+            http: Mutex::new(http),
+            cache_dir: dir,
+            state: Mutex::new(FsState {
+                inodes: HashMap::new(),
+                children: HashMap::new(),
+                handles: HashMap::new(),
+                next_inode: 2,
+                next_handle: 1,
+                uid: 0,
+                gid: 0,
+            }),
+        };
+
+        // Non-empty bytes are journaled.
+        mount.journal_dirty(7, b"persist me");
+        let path = mount.dirty_journal_path(7);
+        assert_eq!(std::fs::read(&path).unwrap(), b"persist me");
+
+        // Clearing removes the entry once the daemon has the bytes.
+        mount.clear_dirty_journal(7);
+        assert!(!path.exists(), "journal entry cleared after commit");
+
+        // Empty bytes are not journaled (no spurious empty entries).
+        mount.journal_dirty(8, b"");
+        assert!(
+            !mount.dirty_journal_path(8).exists(),
+            "empty bytes must not be journaled"
+        );
     }
 
     #[test]
@@ -2167,6 +2317,13 @@ mod tests {
         let state = fs.lock_state();
         let handle = state.handles.get(&1).expect("handle retained");
         assert_eq!(handle.write_buffer.as_deref(), Some(payload.as_slice()));
+        drop(state);
+
+        // The dirty bytes are also persisted to the durable journal so a later
+        // release cannot drop the only copy.
+        let journal_path = fs.dirty_journal_path(inode);
+        let journaled = std::fs::read(&journal_path).expect("dirty journal written on failure");
+        assert_eq!(journaled, payload);
     }
 
     #[test]

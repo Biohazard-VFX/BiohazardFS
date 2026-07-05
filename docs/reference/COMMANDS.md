@@ -508,7 +508,9 @@ Status legend for the namespaces below (verified against `crates/cli/src/main.rs
 - **SCAFFOLD**: the CLI subcommand exists and dispatches, but the daemon backing returns `method_not_implemented` (periphery), or the command returns a typed stub (for example `daemon start`, `smoke run`, `doctor --json-deep`). The mutation gate, error envelope, and exit code are all real; the body is not.
 - **PLANNED**: the command surface below is the contract target but no CLI subcommand is wired yet (for example `config get`, `config set`, `config migrate`, short aliases beyond the ones implemented).
 
-Destructive / admin / data-moving methods are wired as CLI subcommands and gated by the agent-safe policy. Under the current scaffold, running one with `--dry-run` mints a CLI-side operation token and plan (exit 7); running with `--yes` dispatches to the daemon, which still requires its own server-issued operation token for destructive/admin/data-moving methods, so the apply path surfaces `operation_token_required` (or `method_not_implemented` for periphery methods) until the CLI→daemon token handoff lands. Read and low-risk mutations proceed end-to-end.
+Destructive / admin / data-moving methods are wired as CLI subcommands and gated by the agent-safe policy. Under the current scaffold, running one with `--dry-run` mints a CLI-side operation token and plan (exit 7); running with `--yes` returns `apply_not_wired` (exit 7) and does NOT dispatch to the daemon — the daemon-issued operation-token flow is not yet wired, so the CLI cannot produce a daemon-valid token and declines to call (which would otherwise reject with `operation_token_required`). Running one with neither flag returns `confirmation_required` (exit 7). Read and low-risk mutations proceed end-to-end.
+
+The `--apply <operation-token>` form shown in examples below is **PLANNED**: it depends on a daemon token-issuance RPC that does not exist yet. Until that lands, the only mutation flags are `--dry-run` (plan + CLI-side token) and `--yes` (which surfaces `apply_not_wired`).
 
 ### Core/runtime
 

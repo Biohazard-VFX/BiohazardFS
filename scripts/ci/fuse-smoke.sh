@@ -118,9 +118,9 @@ for _ in $(seq 1 80); do
   sleep 0.1
 done
 
+BIOHAZARDFS_LOCAL_TOKEN="$DAEMON_TOKEN" \
 target/debug/biohazardfs-fuse mount-workspace \
   --daemon-endpoint "$DAEMON_ADDR" \
-  --local-token "$DAEMON_TOKEN" \
   --cache-dir "$RW_CACHE_DIR" \
   --mountpoint "$RW_MOUNTPOINT" \
   >"$SMOKE_DIR/rw-fuse.log" 2>&1 &

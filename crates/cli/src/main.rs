@@ -813,11 +813,10 @@ enum AuthCommand {
         #[arg(long)]
         code: String,
     },
-    /// Store a login token. Prefer BIOHAZARDFS_TOKEN over --token; tokens must never appear in logs.
-    Login {
-        #[arg(long)]
-        token: String,
-    },
+    /// Store a login token. The token is read from `BIOHAZARDFS_TOKEN` (env) and
+    /// is never accepted via argv, to keep it out of process listings and shell
+    /// history. A credential-file/stdin flow may replace the env source later.
+    Login,
     /// Clear the local session. Admin-class; requires --yes.
     Logout,
     /// Current actor.
@@ -1034,18 +1033,24 @@ fn cli_source(cli: &Cli) -> Source {
 //
 // The default profile is AgentSafe. Under AgentSafe:
 //   - Read and LowRisk commands proceed.
-//   - Destructive / Admin / DataMoving commands require --dry-run (which mints
-//     an operation token and prints the plan, exit 7) or --yes (which applies,
-//     exit 0/4/6 from the backend). Running one with neither returns a typed
-//     confirmation_required error (exit 7).
+//   - Destructive / Admin / DataMoving commands require confirmation:
+//       * --dry-run mints a CLI-local token and prints the plan (exit 7).
+//       * --yes is accepted but NOT applied: the daemon-issued operation-token
+//         flow is not wired yet, so the CLI cannot produce a daemon-valid token
+//         and declines to call the daemon (which would otherwise reject with
+//         operation_token_required). Returns apply_not_wired (exit 7).
+//       * With neither flag, returns confirmation_required (exit 7).
 // Classification is read from known_methods::classify(Surface::Cli, method).
-// HumanFriendly profile and per-command --apply <token> land with the daemon
-// token-validation backend; the CLI seam honors --yes as the apply path today.
+// The daemon token-issuance RPC and a real --apply <token> path are planned;
+// until they land, destructive daemon mutations are intentionally non-applied.
 
 enum MutationGate {
     Proceed,
     ConfirmationRequired,
     DryRunPlanned,
+    /// `--yes` was given for a daemon-gated mutation, but daemon-issued
+    /// operation tokens are not wired. Do not call the daemon.
+    ApplyPlanned,
 }
 
 fn mutation_gate(cli: &Cli, classification: MutationClassification) -> MutationGate {
@@ -1057,7 +1062,7 @@ fn mutation_gate(cli: &Cli, classification: MutationClassification) -> MutationG
             if cli.dry_run {
                 MutationGate::DryRunPlanned
             } else if cli.yes {
-                MutationGate::Proceed
+                MutationGate::ApplyPlanned
             } else {
                 MutationGate::ConfirmationRequired
             }
@@ -1101,6 +1106,32 @@ fn confirmation_envelope(
                 "policy": "agent_safe",
                 "classification": classification_label(classification),
                 "required": ["--dry-run", "--yes"],
+            }),
+        ),
+        Source::Cli,
+    )
+}
+
+/// `--yes` was given for a daemon-gated mutation, but the daemon-issued
+/// operation-token flow is not wired. The CLI cannot produce a daemon-valid
+/// token, so it declines to call the daemon (which would reject with
+/// `operation_token_required`) and surfaces the gap honestly. The daemon
+/// token-issuance RPC and a real `--apply <token>` path are planned.
+fn apply_planned_envelope(
+    command: &str,
+    classification: MutationClassification,
+) -> CommandResponseEnvelope<Value> {
+    CommandResponseEnvelope::error(
+        command,
+        ApiError::with_details(
+            "apply_not_wired",
+            "--yes was given, but daemon-issued operation tokens are not yet wired; \
+             the CLI cannot apply daemon-gated mutations yet. Use --dry-run to inspect \
+             the plan. The daemon token-issuance RPC and --apply <token> are planned.",
+            serde_json::json!({
+                "policy": "agent_safe",
+                "classification": classification_label(classification),
+                "planned": ["daemon operation-token RPC", "--apply <token>"],
             }),
         ),
         Source::Cli,
@@ -1360,6 +1391,11 @@ fn daemon_rpc_gated(
         MutationGate::DryRunPlanned => finish(
             cli,
             dry_run_envelope(cli, command, method, classification, &params),
+            EXIT_CONFIRMATION_REQUIRED,
+        ),
+        MutationGate::ApplyPlanned => finish(
+            cli,
+            apply_planned_envelope(command, classification),
             EXIT_CONFIRMATION_REQUIRED,
         ),
     }
@@ -2159,12 +2195,39 @@ fn auth_json(cli: &Cli, command: AuthCommand) -> (String, u8) {
             "auth.enroll",
             serde_json::json!({ "code": code }),
         ),
-        AuthCommand::Login { token } => daemon_rpc_gated(
-            cli,
-            "auth.login",
-            "auth.login_token",
-            serde_json::json!({ "token": token }),
-        ),
+        AuthCommand::Login => {
+            // The login token is never accepted via argv. Read it from the
+            // environment; a credential-file/stdin flow can replace this later.
+            let token = match std::env::var("BIOHAZARDFS_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => value,
+                None => {
+                    return (
+                        serde_json::to_string_pretty(
+                            &CommandResponseEnvelope::<serde_json::Value>::error(
+                                "auth.login_token",
+                                ApiError::new(
+                                    "token_required",
+                                    "BIOHAZARDFS_TOKEN env var is required; \
+                                 the login token is never accepted via argv",
+                                ),
+                                Source::Cli,
+                            ),
+                        )
+                        .expect("envelope serializes"),
+                        EXIT_USAGE,
+                    );
+                }
+            };
+            daemon_rpc_gated(
+                cli,
+                "auth.login",
+                "auth.login_token",
+                serde_json::json!({ "token": token }),
+            )
+        }
         AuthCommand::Logout => {
             daemon_rpc_gated(cli, "auth.logout", "auth.logout", serde_json::json!({}))
         }
@@ -4058,12 +4121,26 @@ mod tests {
     }
 
     #[test]
-    fn mutation_gate_yes_proceeds_for_destructive() {
+    fn mutation_gate_yes_does_not_apply_destructive() {
+        // --yes on a daemon-gated destructive mutation does NOT proceed: the
+        // daemon-issued operation-token flow is not wired, so the CLI declines
+        // to call the daemon (which would otherwise reject with
+        // operation_token_required) and returns ApplyPlanned instead.
         let cli = parse(&["biohazardfs", "--yes", "cache", "evict"]);
         assert!(matches!(
             mutation_gate(&cli, MutationClassification::Destructive),
-            MutationGate::Proceed
+            MutationGate::ApplyPlanned
         ));
+    }
+
+    #[test]
+    fn destructive_command_with_yes_returns_apply_not_wired() {
+        let cli = parse(&["biohazardfs", "--yes", "cache", "evict"]);
+        let (output, code) =
+            daemon_rpc_gated(&cli, "cache.evict", "cache.evict", serde_json::json!({}));
+        assert_eq!(code, EXIT_CONFIRMATION_REQUIRED);
+        assert!(output.contains("apply_not_wired"));
+        assert!(output.contains("agent_safe"));
     }
 
     #[test]

@@ -1702,13 +1702,15 @@ fn operations_submit_payload(
     let params_json = serde_json::to_string(&body.params).unwrap_or_else(|_| "{}".to_string());
     let received = ts_utc("created_at");
     let row = client
-        .query_one(
+        .query_opt(
             &format!(
                 "INSERT INTO operations
                    (org_id, operation_id, actor_user_id, device_id, source, kind, status,
                     base_version_id, node_id, idempotency_key, request_id, payload_json)
                  VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11::text::jsonb)
-                 RETURNING status, idempotency_key, {received}"
+                 ON CONFLICT (org_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+                 DO NOTHING
+                 RETURNING operation_id, status, idempotency_key, {received}"
             ),
             &[
                 &subject.org_id,
@@ -1730,15 +1732,43 @@ fn operations_submit_payload(
                 ApiError::new("operation_store_unavailable", "could not record operation"),
             )
         })?;
-    let status: String = row.get("status");
-    let idempotency_key: Option<String> = row.get("idempotency_key");
-    let received_at: String = row.get("created_at");
-    Ok(OperationSubmitResponse {
-        operation_id,
-        status,
-        idempotency_key,
-        received_at,
-    })
+    match row {
+        Some(row) => {
+            let operation_id: String = row.get("operation_id");
+            let status: String = row.get("status");
+            let idempotency_key: Option<String> = row.get("idempotency_key");
+            let received_at: String = row.get("created_at");
+            Ok(OperationSubmitResponse {
+                operation_id,
+                status,
+                idempotency_key,
+                received_at,
+            })
+        }
+        // Race loser: a concurrent submission with the same idempotency key
+        // won the unique index between our pre-read and this INSERT. Replay the
+        // existing operation instead of returning operation_store_unavailable.
+        None => {
+            let key = body.idempotency_key.as_deref().ok_or_else(|| {
+                (
+                    503,
+                    ApiError::new(
+                        "operation_store_unavailable",
+                        "operation insert returned no row and no idempotency_key to replay",
+                    ),
+                )
+            })?;
+            lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?.ok_or_else(|| {
+                (
+                    503,
+                    ApiError::new(
+                        "operation_store_unavailable",
+                        "operation conflicted but the existing row could not be read",
+                    ),
+                )
+            })
+        }
+    }
 }
 
 fn lookup_operation_by_idempotency(
@@ -5016,11 +5046,16 @@ mod tests {
 
     #[test]
     fn migration_003_has_required_metadata_tables() {
+        // Normalize CRLF -> LF so the multi-line assertion below is stable on
+        // Windows checkouts, where the bundled SQL may be read via include_str!
+        // with `\r\n` line endings and the literal "\n    " substring would not
+        // match otherwise.
         let sql = migrations()
             .iter()
             .find(|migration| migration.version == "003")
             .expect("migration 003 is registered")
-            .sql;
+            .sql
+            .replace('\r', "");
         for table in [
             "devices",
             "projects",

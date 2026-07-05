@@ -956,7 +956,7 @@ pub fn file_write_payload(
 /// Returns typed `file_not_found` / `content_not_cached` errors when the node
 /// or its content is absent, never a panic.
 pub fn file_read_payload(backend: &DaemonBackend, params: &Value) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     let mut inner = backend.lock();
     let node = inner
         .nodes
@@ -1023,7 +1023,7 @@ pub fn cache_pin_payload(
     params: &Value,
     source: Source,
 ) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     let mut inner = backend.lock();
     let entry = inner
         .cache_entries
@@ -1076,7 +1076,7 @@ pub fn cache_unpin_payload(
     params: &Value,
     source: Source,
 ) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     let mut inner = backend.lock();
     let entry = inner.cache_entries.get_mut(&node_id).ok_or_else(|| {
         ApiError::new(
@@ -1122,7 +1122,7 @@ pub fn cache_hydrate_payload(
     params: &Value,
     source: Source,
 ) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     // Hydration must target a known namespace node so we never fabricate cache
     // state for a path the daemon cannot see.
     {
@@ -1179,7 +1179,7 @@ pub fn cache_dehydrate_payload(
     params: &Value,
     source: Source,
 ) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     let mut inner = backend.lock();
     let entry = inner
         .cache_entries
@@ -1286,7 +1286,7 @@ pub fn lock_acquire_payload(
     params: &Value,
     source: Source,
 ) -> Result<Value, ApiError> {
-    let node_id = require_node_id_param(params)?;
+    let node_id = lookup_node_id(backend, params)?;
     let kind = lock_kind_param(params)?;
     let ttl_seconds = params
         .get("ttl_seconds")
@@ -1651,8 +1651,17 @@ pub fn schema_method_payload(params: &Value) -> Result<Value, ApiError> {
 /// Look up a namespace node by the `node_id` param. Validates the ID at the
 /// trust boundary (daemon params come from CLI/UI/agents).
 fn lookup_node(backend: &DaemonBackend, params: &Value) -> Result<Node, ApiError> {
-    let node_id = require_node_id_param(params)?;
     let inner = backend.lock();
+    let node_id = match resolve_node_id(&inner, params)? {
+        Some(node_id) => node_id,
+        None => {
+            return Err(ApiError::with_details(
+                "missing_param",
+                "node_id or path is required",
+                serde_json::json!({"field": "node_id"}),
+            ));
+        }
+    };
     inner
         .nodes
         .get(&node_id)
@@ -1666,17 +1675,86 @@ fn lookup_node(backend: &DaemonBackend, params: &Value) -> Result<Node, ApiError
         })
 }
 
-fn require_node_id_param(params: &Value) -> Result<String, ApiError> {
-    let node_id = require_str_param(params, "node_id")?;
-    if !node_id.starts_with(NODE_ID_PREFIX) {
-        return Err(ApiError::with_details(
-            "invalid_param",
-            format!("node_id must start with {NODE_ID_PREFIX:?}"),
-            serde_json::json!({"field": "node_id"}),
-        ));
+/// Resolve the target node id from request params. An explicit `node_id` wins;
+/// otherwise walk the namespace from the root by `path` so artist-facing
+/// callers (CLI, FUSE) can address nodes by mount-relative path without the
+/// caller pre-resolving to a node id. Returns `Ok(None)` if neither is present.
+fn resolve_node_id(inner: &InMemoryBackend, params: &Value) -> Result<Option<String>, ApiError> {
+    if let Some(node_id) = params.get("node_id").and_then(|value| value.as_str()) {
+        if !node_id.starts_with(NODE_ID_PREFIX) {
+            return Err(ApiError::with_details(
+                "invalid_param",
+                format!("node_id must start with {NODE_ID_PREFIX:?}"),
+                serde_json::json!({"field": "node_id"}),
+            ));
+        }
+        validate_node_id(node_id).map_err(core_error_to_api)?;
+        return Ok(Some(node_id.to_string()));
     }
-    validate_node_id(node_id).map_err(core_error_to_api)?;
-    Ok(node_id.to_string())
+    if let Some(path) = params.get("path").and_then(|value| value.as_str()) {
+        return resolve_node_by_path(inner, path).map(Some);
+    }
+    Ok(None)
+}
+
+/// Walk the namespace from the root by `path`. Mount-relative: a leading `/` is
+/// stripped, empty segments are ignored, and each segment names a live child of
+/// the current node (case-insensitive match, matching the sibling-uniqueness
+/// policy). The root's own name is not matched.
+fn resolve_node_by_path(inner: &InMemoryBackend, path: &str) -> Result<String, ApiError> {
+    use biohazardfs_core::path::case_insensitive_sibling_key;
+    let root_id = inner
+        .nodes
+        .values()
+        .find(|node| node.is_live() && node.parent_node_id.is_none())
+        .map(|node| node.node_id.clone())
+        .ok_or_else(|| {
+            ApiError::new(
+                "namespace_root_missing",
+                "namespace has no live root node to resolve paths against",
+            )
+        })?;
+    let mut current = root_id;
+    for segment in path.trim_start_matches('/').split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let key = case_insensitive_sibling_key(segment);
+        match inner
+            .nodes
+            .values()
+            .find(|node| {
+                node.is_live()
+                    && node.parent_node_id.as_deref() == Some(current.as_str())
+                    && case_insensitive_sibling_key(&node.name) == key
+            })
+            .map(|node| node.node_id.clone())
+        {
+            Some(node_id) => current = node_id,
+            None => {
+                return Err(ApiError::new(
+                    "node_not_found",
+                    format!("path segment {segment:?} not found under node {current}"),
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
+/// Backend-level node-id resolution. Locks internally and accepts either
+/// `node_id` or a mount-relative `path`. Use when a payload needs only the id
+/// string and does not otherwise hold the backend lock.
+fn lookup_node_id(backend: &DaemonBackend, params: &Value) -> Result<String, ApiError> {
+    let inner = backend.lock();
+    resolve_node_id(&inner, params)?.ok_or_else(|| {
+        ApiError::with_details(
+            "missing_param",
+            "node_id or path is required",
+            serde_json::json!({"field": "node_id"}),
+        )
+    })
 }
 
 fn require_str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, ApiError> {
@@ -1946,6 +2024,36 @@ mod tests {
         let err = file_stat_payload(&backend, &serde_json::json!({"node_id": "node_missing"}))
             .unwrap_err();
         assert_eq!(err.code, "node_not_found");
+    }
+
+    #[test]
+    fn file_stat_resolves_path_to_node() {
+        // Path-based addressing: artist-facing callers (CLI/FUSE) send a
+        // mount-relative path instead of a node_id. The daemon resolves it by
+        // walking the namespace from the root, so the CLI does not need to
+        // pre-resolve paths to node ids.
+        let backend = test_backend();
+
+        let shots = file_stat_payload(&backend, &serde_json::json!({"path": "shots"})).unwrap();
+        assert_eq!(shots["node_id"], "node_shots");
+        assert_eq!(shots["name"], "shots");
+
+        // Leading slash resolves the same way.
+        let readme =
+            file_stat_payload(&backend, &serde_json::json!({"path": "/README.md"})).unwrap();
+        assert_eq!(readme["node_id"], "node_readme");
+
+        // Case-insensitive match per the sibling-uniqueness policy.
+        let upper = file_stat_payload(&backend, &serde_json::json!({"path": "readme.md"})).unwrap();
+        assert_eq!(upper["node_id"], "node_readme");
+
+        // A missing segment returns node_not_found (not missing_param).
+        let err = file_stat_payload(&backend, &serde_json::json!({"path": "nope"})).unwrap_err();
+        assert_eq!(err.code, "node_not_found");
+
+        // Neither node_id nor path present keeps the missing_param contract.
+        let err = file_stat_payload(&backend, &serde_json::json!({})).unwrap_err();
+        assert_eq!(err.code, "missing_param");
     }
 
     #[test]

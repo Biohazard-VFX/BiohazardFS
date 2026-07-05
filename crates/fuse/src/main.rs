@@ -36,9 +36,6 @@ enum Command {
         /// Loopback daemon endpoint, e.g. `127.0.0.1:47666`.
         #[arg(long)]
         daemon_endpoint: String,
-        /// Owner-only local daemon session token (or set BIOHAZARDFS_LOCAL_TOKEN).
-        #[arg(long, env = "BIOHAZARDFS_LOCAL_TOKEN")]
-        local_token: String,
         /// Local cache directory for hydrated content. Created if missing.
         #[arg(long)]
         cache_dir: PathBuf,
@@ -49,6 +46,26 @@ enum Command {
         #[arg(long, default_value_t = true)]
         foreground: bool,
     },
+}
+
+/// Read the owner-only local daemon token from the environment. Never argv: the
+/// token must not appear in process listings or shell history. Prints a
+/// diagnostic and returns `None` if unset or empty.
+fn local_token_from_env() -> Option<String> {
+    match std::env::var("BIOHAZARDFS_LOCAL_TOKEN") {
+        Ok(token) if !token.is_empty() => Some(token),
+        Ok(_) => {
+            eprintln!("biohazardfs-fuse: BIOHAZARDFS_LOCAL_TOKEN is empty");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "biohazardfs-fuse: BIOHAZARDFS_LOCAL_TOKEN is required \
+                 (env var only; the local token is never accepted via argv)"
+            );
+            None
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -65,17 +82,24 @@ fn main() -> ExitCode {
         }),
         Command::MountWorkspace {
             daemon_endpoint,
-            local_token,
             cache_dir,
             mountpoint,
             foreground,
-        } => mount_workspace(WorkspaceMountConfig {
-            daemon_endpoint,
-            local_token,
-            cache_dir,
-            mountpoint,
-            foreground,
-        }),
+        } => {
+            // The local daemon token is read from the environment only: it must
+            // not appear in argv (process listings / shell history). See
+            // docs/reference/SECURITY.md.
+            let Some(local_token) = local_token_from_env() else {
+                return ExitCode::from(2);
+            };
+            mount_workspace(WorkspaceMountConfig {
+                daemon_endpoint,
+                local_token,
+                cache_dir,
+                mountpoint,
+                foreground,
+            })
+        }
     };
 
     match result {
