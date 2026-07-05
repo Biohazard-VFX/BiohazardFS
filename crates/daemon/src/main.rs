@@ -34,8 +34,8 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    biohazardfs_daemon::run_dev_loopback_http(biohazardfs_daemon::DevLoopbackConfig {
-        addr: args.addr,
+    biohazardfs_daemon::run_dev_loopback_http(biohazardfs_daemon::DevLoopbackConfig::new(
+        args.addr,
         local_token,
-    })
+    ))
 }

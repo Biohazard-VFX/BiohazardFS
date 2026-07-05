@@ -556,6 +556,173 @@ pub struct OperationToken {
     pub expires_at: String,
 }
 
+// ----- Server control-plane response DTOs (Wave 2 metadata routes) -----
+// These mirror docs/architecture/METADATA_SCHEMA.md field names and are
+// returned inside ServerResponseEnvelope<T> by the server spine routes.
+// Timestamps are explicit RFC3339 UTC strings; nullable timestamps use
+// Option<String> so absent values are explicit on the wire.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockSummary {
+    pub lock_id: String,
+    pub node_id: Option<String>,
+    pub provisional_local_id: Option<String>,
+    pub path_snapshot: Option<String>,
+    pub owner_user_id: String,
+    pub owner_device_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub acquired_at: String,
+    pub expires_at: Option<String>,
+    pub released_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockAcquireResponse {
+    pub lock_id: String,
+    pub node_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub owner_user_id: String,
+    pub acquired_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockReleaseResponse {
+    pub lock_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockListResponse {
+    pub locks: Vec<LockSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictSummary {
+    pub conflict_id: String,
+    pub node_id: Option<String>,
+    pub path_snapshot: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub base_version_id: Option<String>,
+    pub local_version_id: Option<String>,
+    pub remote_version_id: Option<String>,
+    pub local_operation_id: Option<String>,
+    pub remote_operation_id: Option<String>,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictListResponse {
+    pub conflicts: Vec<ConflictSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationSubmitResponse {
+    pub operation_id: String,
+    pub status: String,
+    pub idempotency_key: Option<String>,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrashSummary {
+    pub trash_id: String,
+    pub node_id: String,
+    pub original_parent_node_id: Option<String>,
+    pub original_name: String,
+    pub deleted_version_id: Option<String>,
+    pub deleted_at: String,
+    pub deleted_by: Option<String>,
+    pub status: String,
+    pub purge_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrashListResponse {
+    pub trash: Vec<TrashSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventSummary {
+    pub audit_event_id: String,
+    pub event_type: String,
+    pub actor_user_id: Option<String>,
+    pub device_id: Option<String>,
+    pub source: String,
+    pub node_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub request_id: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventsResponse {
+    pub events: Vec<AuditEventSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub platform: Option<String>,
+    pub hostname: Option<String>,
+    pub status: String,
+    pub enrolled_at: String,
+    pub last_seen_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceListResponse {
+    pub devices: Vec<DeviceSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub root_node_id: Option<String>,
+    pub name: String,
+    pub code: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorksetSummary {
+    pub workset_id: String,
+    pub project_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub source: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorksetListResponse {
+    pub worksets: Vec<WorksetSummary>,
+    pub limit: u32,
+}
+
 pub fn timestamp() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

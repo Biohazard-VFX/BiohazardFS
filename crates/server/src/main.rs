@@ -35,6 +35,10 @@ enum Command {
     Health,
     /// Print version envelope and exit.
     Version,
+    /// Print a redacted admin status envelope and exit. The admin surface is a
+    /// scaffold: it reports configured-vs-missing dependencies without echoing
+    /// connection strings or credentials, and does not perform admin work yet.
+    Admin,
     /// Check or initialize the configured RustFS/S3-compatible object-store bucket.
     ObjectStore {
         #[command(subcommand)]
@@ -99,6 +103,14 @@ fn main() -> std::io::Result<()> {
             biohazardfs_server::server_version(),
             biohazardfs_api_types::Source::Server,
         )),
+        Command::Admin => {
+            let loaded = load_runtime_config_or_exit(&cli, "server.admin")?;
+            print_json(&biohazardfs_api_types::ServerResponseEnvelope::ok(
+                "server.admin",
+                biohazardfs_server::admin_payload(&loaded.config),
+                biohazardfs_api_types::Source::Server,
+            ))
+        }
         Command::ObjectStore { command } => {
             let loaded = load_runtime_config_or_exit(&cli, "server.object_store")?;
             let result = match command {
