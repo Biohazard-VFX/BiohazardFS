@@ -129,9 +129,14 @@
         "AppImage",
         "deb"
       ],
-      "category": "Utility"
+      "category": "Utility",
+      "maintainer": "Biohazard VFX <engineering@biohazardvfx.com>"
     },
     "executableName": "biohazard-workspace"
   },
-  "author": "Biohazard VFX"
+  "author": {
+    "name": "Biohazard VFX",
+    "email": "engineering@biohazardvfx.com"
+  },
+  "homepage": "https://github.com/Biohazard-VFX/BiohazardFS"
 }
