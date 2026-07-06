@@ -131,3 +131,13 @@ Key decisions:
 - Offline operations are first-class server records for replay/reconciliation.
 - Deletes use trash records, soft-deleted nodes, and retention/purge policy.
 - Audit events use indexed envelope columns plus typed schema-versioned JSON payloads.
+
+## Desktop UI boundary
+
+Electron owns presentation only; it never invents sync truth. The desktop shell renders daemon state through the context-isolated preload IPC defined in `docs/architecture/DAEMON_API.md`.
+
+- Shell: a left sidebar (workspace, navigation, cache-usage footer), a topbar (sync-status pill, filter, refresh), the active view, and a status bar (daemon reachability, endpoint, versions, last refresh). Navigation is in-shell view-state, not a router.
+- Views: Files (workset browser with per-entry sync-state icons and `cache.pin`/`cache.dehydrate` actions), Activity (transfer queue with pause/resume), Cache (usage, per-directory breakdown, clear-all-local-cache), Conflicts (preserve-all), Settings (cache path, daemon/endpoint info, theme, diagnostics).
+- Daemon state: the renderer polls the daemon adaptively (faster while transfers run or files are dirty, slower when idle, paused while hidden) and applies keep-last-good so a transient dropout never blanks the panels.
+- Safety invariants are enforced at the UI boundary and tested: dirty files are never offered "Remove local copy"; clear-all-local-cache refuses when anything is unsynced; lock state defaults to locked when unknown.
+- Artist-facing language is required in the default flow ("Make available offline", "Remove local copy", "Syncing", "Waiting to sync"). Backend jargon (endpoint, token, raw envelopes) lives only in the status bar and Settings → Diagnostics.

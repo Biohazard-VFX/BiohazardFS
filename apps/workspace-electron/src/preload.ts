@@ -80,6 +80,76 @@ async function versions(): Promise<VersionInfo> {
   return (await ipcRenderer.invoke('app:versions')) as VersionInfo;
 }
 
+// Generic read-only RPC for methods outside the always-polled global snapshot
+// (workset.list, mount.status, audit.events, …). Same envelope shape as the
+// dedicated helpers; the renderer parses it defensively.
+async function rpc(
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('daemon:rpc', { method, params })) as DaemonStatusResult;
+}
+
+// Open a folder in the OS file manager. Returns {ok, error}.
+async function openPath(target: string): Promise<{ ok: boolean; error: string | null }> {
+  return (await ipcRenderer.invoke('shell:openPath', target)) as {
+    ok: boolean;
+    error: string | null;
+  };
+}
+
+// UI prefs + window chrome. These are presentation concerns owned by Electron,
+// not the daemon. prefs.set persists to userData/prefs.json in the main process.
+type WindowChrome = 'auto' | 'native' | 'frameless';
+type Theme = 'light' | 'dark' | 'system';
+type Prefs = {
+  windowChrome: WindowChrome;
+  zoomFactor: number;
+  theme: Theme;
+  cacheLimitGB: number | null;
+};
+type AppInfo = {
+  platform: string;
+  frameless: boolean;
+  versions: VersionInfo;
+};
+
+async function prefsGet(): Promise<Prefs> {
+  return (await ipcRenderer.invoke('prefs:get')) as Prefs;
+}
+
+async function prefsSet(patch: Partial<Prefs>): Promise<Prefs> {
+  return (await ipcRenderer.invoke('prefs:set', patch)) as Prefs;
+}
+
+async function appInfo(): Promise<AppInfo> {
+  return (await ipcRenderer.invoke('app:info')) as AppInfo;
+}
+
+// Subscribe to prefs changes pushed from main (so the Settings UI stays in sync
+// when zoom is changed via the Ctrl+± keyboard shortcuts). Returns an unsub.
+function onPrefsChanged(cb: (prefs: Prefs) => void): () => void {
+  const listener = (_event: unknown, prefs: Prefs) => {
+    cb(prefs);
+  };
+  ipcRenderer.on('prefs:changed', listener);
+  return () => {
+    ipcRenderer.removeListener('prefs:changed', listener);
+  };
+}
+
+function minimizeWindow(): void {
+  ipcRenderer.send('window:minimize');
+}
+
+function toggleMaximize(): void {
+  ipcRenderer.send('window:toggleMaximize');
+}
+
+function closeWindow(): void {
+  ipcRenderer.send('window:close');
+}
+
 contextBridge.exposeInMainWorld('biohazardfs', {
   daemonStatus,
   workspaceStatus,
@@ -96,4 +166,13 @@ contextBridge.exposeInMainWorld('biohazardfs', {
   lockList,
   configSet,
   versions,
+  rpc,
+  openPath,
+  prefsGet,
+  prefsSet,
+  appInfo,
+  minimizeWindow,
+  toggleMaximize,
+  closeWindow,
+  onPrefsChanged,
 });
