@@ -1692,7 +1692,7 @@ fn operations_submit_payload(
     if let Some(key) = body.idempotency_key.as_deref()
         && let Some(existing) = lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?
     {
-        verify_idempotency_payload_match(&existing, &body.params, key)?;
+        verify_idempotency_payload_match(&existing, &body, key)?;
         return Ok(existing.response);
     }
     let operation_id = generated_id("op");
@@ -1774,7 +1774,7 @@ fn operations_submit_payload(
                         ),
                     )
                 })?;
-            verify_idempotency_payload_match(&existing, &body.params, key)?;
+            verify_idempotency_payload_match(&existing, &body, key)?;
             Ok(existing.response)
         }
     }
@@ -1789,8 +1789,9 @@ fn lookup_operation_by_idempotency(
     let row = client
         .query_opt(
             &format!(
-                "SELECT operation_id, status, idempotency_key,
-                        payload_json::text AS payload_json_text, {created}
+                "SELECT operation_id, status, idempotency_key, kind, source, node_id,
+                        base_version_id, device_id, payload_json::text AS payload_json_text,
+                        {created}
                  FROM operations
                  WHERE org_id = $1 AND idempotency_key = $2
                  LIMIT 1"
@@ -1818,16 +1819,29 @@ fn lookup_operation_by_idempotency(
                 idempotency_key: row.get("idempotency_key"),
                 received_at: row.get("created_at"),
             },
+            kind: row.get("kind"),
+            source: row.get("source"),
+            node_id: row.get("node_id"),
+            base_version_id: row.get("base_version_id"),
+            device_id: row.get("device_id"),
             payload,
         }
     }))
 }
 
 /// An existing operation located by idempotency key: the replayable response
-/// plus the stored payload needed to verify a replay carries the same params.
+/// plus the stored semantic request fields needed to verify a replay carries
+/// the same identity. `payload` is the jsonb-canonical `params` value read
+/// back from `payload_json`; the scalar fields come from their TEXT columns,
+/// which round-trip exactly without jsonb normalization.
 #[derive(Debug, Clone)]
 struct ExistingOperation {
     response: OperationSubmitResponse,
+    kind: String,
+    source: String,
+    node_id: Option<String>,
+    base_version_id: Option<String>,
+    device_id: Option<String>,
     payload: serde_json::Value,
 }
 
@@ -1842,29 +1856,108 @@ fn payload_hash(params: &serde_json::Value) -> String {
     hex_lower(&Sha256::digest(canonical.as_bytes()))
 }
 
-/// Reject an idempotency replay whose submitted params differ from the stored
-/// operation's payload. Returns Ok for a matching payload and a typed 409
-/// otherwise. Both sides are hashed through `payload_hash` so the comparison is
-/// invariant under key reordering; the stored side is the jsonb-canonical form
-/// read back from `payload_json`, which round-trips cleanly for the object- and
-/// string-heavy params used by file operations.
+/// Canonical JSON value of an operation's full semantic request: every field
+/// that must be identical for an idempotency-key replay to return the original
+/// operation rather than be rejected. serde_json::Map is BTreeMap-backed in
+/// this workspace, so the serialized form sorts object keys and the value is
+/// independent of client-side key ordering and whitespace.
+fn semantic_payload_value(
+    kind: &str,
+    source: &str,
+    node_id: Option<&str>,
+    base_version_id: Option<&str>,
+    device_id: Option<&str>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "base_version_id": base_version_id,
+        "device_id": device_id,
+        "kind": kind,
+        "node_id": node_id,
+        "params": params,
+        "source": source,
+    })
+}
+
+/// Reject an idempotency replay whose full semantic request differs from the
+/// stored operation. A reused idempotency_key must return the original
+/// operation only when kind, source, node_id, base_version_id, device_id, AND
+/// params all match; otherwise a stale key reuse (e.g. same params but a
+/// different kind) would silently return the wrong operation. Both sides are
+/// reduced to a canonical JSON value and hashed through `payload_hash`, so the
+/// comparison is invariant under key reordering. The diverging field is
+/// included in the error detail when it can be identified cheaply.
 fn verify_idempotency_payload_match(
     existing: &ExistingOperation,
-    submitted_params: &serde_json::Value,
+    submitted: &OperationSubmitBody,
     idempotency_key: &str,
 ) -> Result<(), (u16, ApiError)> {
-    if payload_hash(&existing.payload) == payload_hash(submitted_params) {
-        Ok(())
-    } else {
-        Err((
-            409,
-            ApiError::with_details(
-                "operation_idempotency_payload_mismatch",
-                "an operation with this idempotency_key already exists with a different payload",
-                serde_json::json!({ "idempotency_key": idempotency_key }),
-            ),
-        ))
+    let existing_hash = payload_hash(&semantic_payload_value(
+        &existing.kind,
+        &existing.source,
+        existing.node_id.as_deref(),
+        existing.base_version_id.as_deref(),
+        existing.device_id.as_deref(),
+        &existing.payload,
+    ));
+    let submitted_hash = payload_hash(&semantic_payload_value(
+        &submitted.kind,
+        &submitted.source,
+        submitted.node_id.as_deref(),
+        submitted.base_version_id.as_deref(),
+        submitted.device_id.as_deref(),
+        &submitted.params,
+    ));
+    if existing_hash == submitted_hash {
+        return Ok(());
     }
+    let details = match semantic_divergence_field(existing, submitted) {
+        Some(field) => serde_json::json!({
+            "idempotency_key": idempotency_key,
+            "field": field,
+        }),
+        None => serde_json::json!({ "idempotency_key": idempotency_key }),
+    };
+    Err((
+        409,
+        ApiError::with_details(
+            "operation_idempotency_payload_mismatch",
+            "an operation with this idempotency_key already exists with a different semantic request",
+            details,
+        ),
+    ))
+}
+
+/// Identify the first semantic field that differs between a stored operation
+/// and a resubmitted body, to populate the mismatch error's `field` detail.
+/// Diagnostics-only: the match decision is the canonical-hash comparison in
+/// `verify_idempotency_payload_match`. `params` is compared through
+/// `payload_hash` so key reordering does not register as a divergence. Returns
+/// `None` only when every semantic field agrees, which for these field types
+/// implies the canonical hashes also agree.
+fn semantic_divergence_field(
+    existing: &ExistingOperation,
+    submitted: &OperationSubmitBody,
+) -> Option<&'static str> {
+    if existing.kind != submitted.kind {
+        return Some("kind");
+    }
+    if existing.source != submitted.source {
+        return Some("source");
+    }
+    if existing.node_id.as_deref() != submitted.node_id.as_deref() {
+        return Some("node_id");
+    }
+    if existing.base_version_id.as_deref() != submitted.base_version_id.as_deref() {
+        return Some("base_version_id");
+    }
+    if existing.device_id.as_deref() != submitted.device_id.as_deref() {
+        return Some("device_id");
+    }
+    if payload_hash(&existing.payload) != payload_hash(&submitted.params) {
+        return Some("params");
+    }
+    None
 }
 
 // ===== Trash =====
@@ -5487,45 +5580,68 @@ mod tests {
                 idempotency_key: Some("key-existing".to_string()),
                 received_at: "2026-01-01T00:00:00Z".to_string(),
             },
+            kind: "file.write".to_string(),
+            source: "api".to_string(),
+            node_id: Some("node-1".to_string()),
+            base_version_id: None,
+            device_id: None,
             payload,
         }
     }
 
+    // Default submission body whose semantic fields mirror `existing_operation_fixture`
+    // so a test can flip a single field and assert a targeted mismatch.
+    fn operation_submit_body_fixture(params: serde_json::Value) -> OperationSubmitBody {
+        OperationSubmitBody {
+            kind: "file.write".to_string(),
+            source: "api".to_string(),
+            device_id: None,
+            node_id: Some("node-1".to_string()),
+            base_version_id: None,
+            idempotency_key: Some("key-existing".to_string()),
+            params,
+        }
+    }
+
     #[test]
-    fn idempotency_payload_match_allows_identical_payload() {
+    fn idempotency_payload_match_allows_identical_request() {
         let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let body = operation_submit_body_fixture(serde_json::json!({"foo": "bar"}));
         assert!(
-            verify_idempotency_payload_match(
-                &existing,
-                &serde_json::json!({"foo": "bar"}),
-                "key-existing"
-            )
-            .is_ok()
-        );
-        // Key reordering on the replay side is still a match.
-        assert!(
-            verify_idempotency_payload_match(
-                &existing,
-                &serde_json::json!({"foo": "bar"}),
-                "key-existing"
-            )
-            .is_ok()
+            verify_idempotency_payload_match(&existing, &body, "key-existing").is_ok(),
+            "identical semantic request must replay cleanly"
         );
     }
 
     #[test]
-    fn idempotency_payload_match_rejects_mismatched_payload() {
+    fn idempotency_payload_match_rejects_mismatched_params() {
         let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
-        let (status, error) = verify_idempotency_payload_match(
-            &existing,
-            &serde_json::json!({"foo": "baz"}),
-            "key-existing",
-        )
-        .expect_err("mismatched payload must be rejected");
+        let body = operation_submit_body_fixture(serde_json::json!({"foo": "baz"}));
+        let (status, error) = verify_idempotency_payload_match(&existing, &body, "key-existing")
+            .expect_err("mismatched params must be rejected");
         assert_eq!(status, 409);
         assert_eq!(error.code, "operation_idempotency_payload_mismatch");
-        let details = error.details.expect("details carry the idempotency key");
+        let details = error.details.expect("details carry the diverging field");
         assert_eq!(details["idempotency_key"], "key-existing");
+        assert_eq!(details["field"], "params");
+    }
+
+    #[test]
+    fn idempotency_payload_match_rejects_mismatched_kind() {
+        // SAFETY: replaying the same idempotency_key with the SAME params but a
+        // DIFFERENT kind must be rejected, not silently replayed. Before the
+        // full semantic comparison covered kind, this returned the original
+        // operation instead of a 409.
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let mut body = operation_submit_body_fixture(serde_json::json!({"foo": "bar"}));
+        body.kind = "file.delete".to_string();
+        let (status, error) = verify_idempotency_payload_match(&existing, &body, "key-existing")
+            .expect_err("mismatched kind must be rejected");
+        assert_eq!(status, 409);
+        assert_eq!(error.code, "operation_idempotency_payload_mismatch");
+        let details = error.details.expect("details carry the diverging field");
+        assert_eq!(details["idempotency_key"], "key-existing");
+        assert_eq!(details["field"], "kind");
     }
 
     #[test]
@@ -5945,6 +6061,37 @@ mod tests {
         assert!(
             body.contains(&format!("idem-{suffix}")),
             "details must echo the idempotency key without the bearer"
+        );
+
+        // SAFETY: replaying the same idempotency_key with the SAME params and
+        // node but a DIFFERENT kind must also be rejected. Before the semantic
+        // comparison covered kind, this silently returned the original op.
+        let kind_orig_body = format!(
+            r#"{{"kind":"file.write","node_id":"{file_node}","idempotency_key":"idem-kind-{suffix}","params":{{"foo":"bar"}}}}"#
+        );
+        let (status, _body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            kind_orig_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 200, "original kind submit should succeed: {_body}");
+        let kind_mismatch_body = format!(
+            r#"{{"kind":"file.delete","node_id":"{file_node}","idempotency_key":"idem-kind-{suffix}","params":{{"foo":"bar"}}}}"#
+        );
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            kind_mismatch_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 409, "mismatched kind must be 409: {body}");
+        assert!(body.contains("operation_idempotency_payload_mismatch"));
+        assert!(
+            body.contains(r#""field":"kind""#),
+            "details must identify kind as the diverging field: {body}"
         );
 
         // Read endpoints return org-scoped 200 envelopes with the contract shape.

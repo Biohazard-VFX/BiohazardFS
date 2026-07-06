@@ -1006,6 +1006,16 @@ impl WorkspaceFs {
 
                 let mut state = self.lock_state();
                 let parent_inode = state.inodes.get(&ino).map(|entry| entry.parent_inode);
+                // Round-3 FIX 2: the daemon advanced the node's current version
+                // on this commit. Mirror it onto the inode AND every open
+                // handle bound to it. Without this, write→flush→write→flush on
+                // the SAME handle re-sends the prior base_version_id (captured
+                // at open time) and the daemon rejects the second commit with
+                // version_conflict against the version we just committed — a
+                // self-inflicted conflict on a single handle. The calling
+                // handle's buffer was already taken above; other open handles
+                // keep their own buffers but now pin the fresh base.
+                let next_base = version_id.clone();
                 if let Some(entry) = state.inodes.get_mut(&ino) {
                     if let Some(node_id) = &node_id {
                         entry.node_id = Some(node_id.clone());
@@ -1017,6 +1027,13 @@ impl WorkspaceFs {
                         entry.current_version_id = version_id;
                     }
                     entry.mtime = SystemTime::now();
+                }
+                if let Some(next_base) = next_base {
+                    for handle in state.handles.values_mut() {
+                        if handle.inode == ino {
+                            handle.base_version_id = Some(next_base.clone());
+                        }
+                    }
                 }
                 if let (Some(parent_inode), Some(node_id)) = (parent_inode, node_id)
                     && let Some(cache) = state.children.get_mut(&parent_inode)
@@ -1063,6 +1080,97 @@ impl WorkspaceFs {
                 Err(Errno::EIO)
             }
         }
+    }
+
+    /// Apply a setattr(size) truncation (round-3 FIX 1). The kernel issues
+    /// setattr(size=N) for `truncate(path, N)`, `ftruncate(fd, N)`, and the
+    /// `: > $MNT/file` / Python `open(path, "wb")` patterns when they arrive
+    /// as setattr rather than open(O_TRUNC). The prior code ignored `size` and
+    /// returned success, so the mount kept reading the old content while the
+    /// daemon kept the old bytes — a silent data-loss blocker for artists.
+    ///
+    /// This truncates the inode cache file to N bytes and stages the surviving
+    /// bytes in a handle's write buffer so the next flush commits a real
+    /// version. `fh` is the handle the kernel passed (Some for ftruncate, None
+    /// for path-style truncate): with a handle the buffer is staged on it;
+    /// without one the truncation folds into any open writable handle for the
+    /// inode — the kernel follows a path-style truncate with a flush on its
+    /// internally-opened handle — and if no handle is open the bytes are
+    /// journaled so a later open+flush commits them rather than dropping them.
+    ///
+    /// Sparse extension past the current cache length is unimplemented: the
+    /// MVP commits one complete blob per flush, so an extension would zero-pad
+    /// the gap and manufacture artist data that does not exist on the daemon.
+    /// It returns ENOSYS so the artist sees a real failure instead of a
+    /// corrupt commit.
+    fn apply_setattr_size(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+        new_size: u64,
+    ) -> std::result::Result<(), Errno> {
+        // Gather the cache path under lock; the truncation I/O runs without
+        // the state lock so other inodes' FUSE ops keep progressing (matches
+        // buffer_write's local-IO discipline — the state lock is never held
+        // across disk or RPC work).
+        let cache_path = {
+            let state = self.lock_state();
+            let entry = state.inodes.get(&ino).ok_or(Errno::ENOENT)?;
+            if entry.kind != FileType::RegularFile {
+                return Err(Errno::EISDIR);
+            }
+            inode_cache_path(&self.cache_dir, ino)
+        };
+
+        let new_len = usize::try_from(new_size).map_err(|_| Errno::EOVERFLOW)?;
+        let truncated = truncate_cache_file(&cache_path, new_len)?;
+
+        // Stage the truncation on a handle so flush commits it; advance the
+        // inode size so getattr reflects the new length even before the flush
+        // lands.
+        let journal_pending = {
+            let mut state = self.lock_state();
+            if let Some(entry) = state.inodes.get_mut(&ino) {
+                entry.size_bytes = truncated.len() as u64;
+                entry.cache_state = CacheState::Ready;
+            }
+            // Prefer the kernel-provided fh; fall back to any open writable
+            // handle for the inode so a path-style truncate still reaches a
+            // flush. The immutable lookups below end at the expression boundary
+            // (NLL), so the mutable staging borrow that follows is clean.
+            let target = if fh.is_some_and(|id| {
+                state
+                    .handles
+                    .get(&id)
+                    .is_some_and(|handle| handle.inode == ino)
+            }) {
+                fh
+            } else {
+                state
+                    .handles
+                    .iter()
+                    .find(|(_, handle)| handle.inode == ino && handle.writable)
+                    .map(|(id, _)| *id)
+            };
+            match target {
+                Some(id) => {
+                    if let Some(handle) = state.handles.get_mut(&id) {
+                        stage_handle_truncation(handle, new_len, &truncated);
+                    }
+                    None
+                }
+                None => Some(truncated),
+            }
+        };
+
+        if let Some(bytes) = journal_pending {
+            // No open handle is carrying the truncation. Persist the bytes to
+            // the durable dirty journal so a future open+flush commits them;
+            // today the replay path is the documented follow-up, but the bytes
+            // survive release/restart rather than being dropped.
+            self.journal_dirty(ino, &bytes);
+        }
+        Ok(())
     }
 }
 
@@ -1112,19 +1220,29 @@ impl Filesystem for WorkspaceFs {
         mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
+        size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // MVP stores mtime/mode locally in the inode cache entry; size/truncate
-        // is out-of-scope (handled by O_TRUNC at open and the next flush).
+        // size: truncate/extend the cache file and stage the surviving bytes in
+        // the handle's write buffer so the next flush commits a real version
+        // (round-3 FIX 1). mtime/mode are stored locally on the inode cache
+        // entry. A failed truncation short-circuits the whole call so the
+        // kernel reports setattr failed rather than applying mode/mtime on top
+        // of stale content.
+        if let Some(new_size) = size
+            && let Err(errno) = self.apply_setattr_size(ino.0, fh.map(|handle| handle.0), new_size)
+        {
+            reply.error(errno);
+            return;
+        }
         let mut state = self.lock_state();
         let uid = state.uid;
         let gid = state.gid;
@@ -1918,6 +2036,72 @@ fn extend_at(buffer: &mut Vec<u8>, offset: usize, data: &[u8]) {
         buffer.resize(end, 0);
     }
     buffer[offset..end].copy_from_slice(data);
+}
+
+/// Truncate the inode cache file to `new_len` bytes and return the surviving
+/// content so it can be staged in a handle's write buffer. Used by
+/// `apply_setattr_size` to honor setattr(size) (round-3 FIX 1).
+///
+/// A missing cache file (never-hydrated placeholder) is treated as empty so a
+/// size==0 setattr on a placeholder still commits a zero-byte version rather
+/// than failing on a file that does not exist. Sparse extension past the
+/// current cache length is rejected with ENOSYS: the MVP commits one complete
+/// blob per flush, so an extension would zero-pad the gap and manufacture
+/// artist data that does not exist on the daemon. The read happens before any
+/// rewrite, so a rejected extend leaves the cache file untouched.
+fn truncate_cache_file(cache_path: &Path, new_len: usize) -> std::result::Result<Vec<u8>, Errno> {
+    let existing = match fs::read(cache_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            eprintln!(
+                "biohazardfs-fuse: setattr cache read failed for {}: {error}",
+                cache_path.display()
+            );
+            return Err(Errno::EIO);
+        }
+    };
+    if new_len > existing.len() {
+        eprintln!(
+            "biohazardfs-fuse: setattr extend to {new_len} beyond cache len {} not supported \
+             (sparse extension unimplemented)",
+            existing.len()
+        );
+        return Err(Errno::ENOSYS);
+    }
+    let mut truncated = existing;
+    truncated.truncate(new_len);
+    if let Err(error) = fs::write(cache_path, &truncated) {
+        eprintln!(
+            "biohazardfs-fuse: setattr cache rewrite failed for {}: {error}",
+            cache_path.display()
+        );
+        return Err(Errno::EIO);
+    }
+    Ok(truncated)
+}
+
+/// Stage a setattr(size) truncation on an open handle so the next flush
+/// commits exactly `new_len` bytes (round-3 FIX 1). If the handle already has
+/// a write buffer, truncate it in place; if the buffer was shorter than the
+/// target (a partial write that never reached `new_len`), re-seed from the
+/// now-truncated cache content rather than zero-padding a partial buffer. If
+/// the handle has no buffer yet, seed it from the cache content so a flush has
+/// something to push even when no write syscall lands — this is the
+/// `: > file` / `ftruncate(fd, 0)` path that must commit a zero-byte version.
+fn stage_handle_truncation(handle: &mut OpenHandle, new_len: usize, truncated: &[u8]) {
+    match handle.write_buffer.as_mut() {
+        Some(buffer) => {
+            if buffer.len() > new_len {
+                buffer.truncate(new_len);
+            } else if buffer.len() < new_len {
+                *buffer = truncated.to_vec();
+            }
+        }
+        None => {
+            handle.write_buffer = Some(truncated.to_vec());
+        }
+    }
 }
 
 /// Decode a lowercase hex string into bytes (mirrors the daemon encoder). Used
@@ -2938,6 +3122,335 @@ mod tests {
                 .map(|bytes| bytes.as_slice()),
             Some(&b"stale write"[..]),
             "stale bytes not committed"
+        );
+    }
+
+    // ----- Round-3 FIX 1: setattr(size) truncates + stages a flush -----
+
+    /// setattr(size=0) must truncate the cache file and stage an empty buffer
+    /// so the next flush commits a zero-byte version. The blocker repro:
+    /// `: > $MNT/truncate-me.txt` (or Python `with open(path,"wb"): pass`)
+    /// issued via setattr(size=0) silently did nothing — the mount still read
+    /// `abc` and the daemon still returned the old bytes.
+    #[test]
+    fn workspace_setattr_size_zero_commits_empty_version() {
+        let (addr, backend, _handle) = start_test_daemon("ws_setattr_zero");
+        let cache = workspace_test_dir("setattr-zero-cache");
+        let mount = workspace_test_dir("setattr-zero-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_setattr_zero".to_string(),
+            cache_dir: cache.clone(),
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Seed a daemon file with content "abc" via a prior flush.
+        let (inode, handle_seed) =
+            seed_uncommitted_handle(&fs, "truncate-me.txt", b"abc".to_vec(), None);
+        fs.commit_handle(inode, handle_seed).expect("seed commit");
+        let node_id = {
+            let state = fs.lock_state();
+            state
+                .inodes
+                .get(&inode)
+                .and_then(|entry| entry.node_id.clone())
+                .expect("node bound after seed")
+        };
+
+        // Simulate open() of the existing file for ftruncate: a writable
+        // handle with no buffer, pinned to the committed version.
+        let base_version = {
+            let state = fs.lock_state();
+            state
+                .inodes
+                .get(&inode)
+                .and_then(|entry| entry.current_version_id.clone())
+        };
+        let handle = seed_handle_on(&fs, inode, base_version);
+        let cache_path = inode_cache_path(&cache, inode);
+        assert_eq!(fs::read(&cache_path).expect("seed cache"), b"abc");
+
+        // setattr(size=0): the kernel's truncation callback.
+        fs.apply_setattr_size(inode, Some(handle), 0)
+            .expect("truncate to zero");
+
+        // The handle buffer is Some(empty), inode.size_bytes is 0, and the
+        // cache file is empty.
+        {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            assert_eq!(entry.size_bytes, 0);
+            let open_handle = state.handles.get(&handle).expect("handle");
+            assert_eq!(
+                open_handle.write_buffer.as_deref(),
+                Some(b"".as_slice()),
+                "buffer staged empty for the zero-byte flush"
+            );
+        }
+        assert_eq!(
+            fs::read(&cache_path).expect("cache truncated"),
+            b"",
+            "cache file truncated to zero"
+        );
+
+        // A subsequent flush commits a zero-byte version to the daemon.
+        fs.commit_handle(inode, handle)
+            .expect("flush commits empty");
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            inner
+                .file_contents
+                .get(&node_id)
+                .map(|bytes| bytes.as_slice()),
+            Some(&b""[..]),
+            "daemon recorded zero bytes after truncate-to-zero flush"
+        );
+        assert!(
+            inner
+                .nodes
+                .get(&node_id)
+                .and_then(|node| node.current_version_id.as_ref())
+                .is_some(),
+            "daemon advanced the current version on the empty commit"
+        );
+    }
+
+    /// setattr(size=N) where 0 < N < current_len truncates the cache file to N
+    /// bytes and stages the first N bytes in the handle's write buffer.
+    #[test]
+    fn workspace_setattr_size_n_stages_first_n_bytes() {
+        let cache = workspace_test_dir("setattr-n-cache");
+        // apply_setattr_size only touches the cache file + in-memory state; no
+        // RPC, so a dead endpoint is fine and the test stays hermetic.
+        let http = DaemonHttpClient::new("127.0.0.1:1".to_string(), "unused".to_string());
+        let (uid, gid) = current_owner();
+        let inode = 7u64;
+        let now = SystemTime::now();
+        let mut state = FsState {
+            inodes: HashMap::new(),
+            children: HashMap::new(),
+            handles: HashMap::new(),
+            next_inode: 2,
+            next_handle: 1,
+            uid,
+            gid,
+        };
+        state.inodes.insert(
+            inode,
+            InodeState {
+                inode,
+                parent_inode: ROOT_INODE,
+                node_id: Some("node_setattr_n".to_string()),
+                name: OsString::from("truncated.txt"),
+                kind: FileType::RegularFile,
+                mode: DEFAULT_FILE_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 6,
+                current_version_id: Some("ver_open".to_string()),
+            },
+        );
+        let handle = 1u64;
+        state.handles.insert(
+            handle,
+            OpenHandle {
+                inode,
+                writable: true,
+                write_buffer: None,
+                base_version_id: Some("ver_open".to_string()),
+            },
+        );
+        let fs = WorkspaceFs {
+            http: Mutex::new(http),
+            cache_dir: cache.clone(),
+            state: Mutex::new(state),
+        };
+
+        // Seed the inode cache file with "abcdef".
+        fs::write(inode_cache_path(&cache, inode), b"abcdef").expect("seed cache");
+
+        // setattr(size=4): truncate to the first 4 bytes.
+        fs.apply_setattr_size(inode, Some(handle), 4)
+            .expect("truncate to 4");
+
+        {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            assert_eq!(
+                entry.size_bytes, 4,
+                "inode size reflects the truncated length"
+            );
+            let open_handle = state.handles.get(&handle).expect("handle");
+            assert_eq!(
+                open_handle.write_buffer.as_deref(),
+                Some(b"abcd".as_slice()),
+                "buffer holds the first N bytes"
+            );
+        }
+        assert_eq!(
+            fs::read(inode_cache_path(&cache, inode)).expect("cache read"),
+            b"abcd",
+            "cache file truncated to N bytes"
+        );
+    }
+
+    /// Sparse extension past the current cache length is unimplemented and
+    /// must fail with ENOSYS rather than silently zero-padding a partial
+    /// buffer that would commit artist data not present on the daemon.
+    #[test]
+    fn workspace_setattr_size_extend_returns_enosys() {
+        let cache = workspace_test_dir("setattr-extend-cache");
+        let http = DaemonHttpClient::new("127.0.0.1:1".to_string(), "unused".to_string());
+        let (uid, gid) = current_owner();
+        let inode = 8u64;
+        let now = SystemTime::now();
+        let mut state = FsState {
+            inodes: HashMap::new(),
+            children: HashMap::new(),
+            handles: HashMap::new(),
+            next_inode: 2,
+            next_handle: 1,
+            uid,
+            gid,
+        };
+        state.inodes.insert(
+            inode,
+            InodeState {
+                inode,
+                parent_inode: ROOT_INODE,
+                node_id: Some("node_setattr_ext".to_string()),
+                name: OsString::from("extend.txt"),
+                kind: FileType::RegularFile,
+                mode: DEFAULT_FILE_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 3,
+                current_version_id: Some("ver_open".to_string()),
+            },
+        );
+        let fs = WorkspaceFs {
+            http: Mutex::new(http),
+            cache_dir: cache.clone(),
+            state: Mutex::new(state),
+        };
+        fs::write(inode_cache_path(&cache, inode), b"abc").expect("seed cache");
+
+        let errno = fs
+            .apply_setattr_size(inode, None, 6)
+            .expect_err("sparse extend rejected");
+        assert_eq!(
+            i32::from(errno),
+            libc::ENOSYS,
+            "extension past current length returns ENOSYS"
+        );
+        // The read in truncate_cache_file happens before any rewrite, so a
+        // rejected extend leaves the cache file intact.
+        assert_eq!(
+            fs::read(inode_cache_path(&cache, inode)).expect("cache read"),
+            b"abc",
+            "rejected extend leaves cache file unchanged"
+        );
+    }
+
+    // ----- Round-3 FIX 2: flush advances open handles' base_version_id -----
+
+    /// A successful flush must advance the still-open handle's base_version_id
+    /// to the version the daemon just returned. Without that, write→flush→
+    /// write→flush on the SAME handle re-sends the prior base and the daemon
+    /// rejects the second commit with version_conflict (self-conflict against
+    /// the version we just committed). After the fix, the second commit
+    /// carries the version_id returned by the first.
+    #[test]
+    fn workspace_flush_advances_open_handle_base_version_id() {
+        let (addr, backend, _handle) = start_test_daemon("ws_fix2_round3");
+        let cache = workspace_test_dir("fix2r3-cache");
+        let mount = workspace_test_dir("fix2r3-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix2_round3".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Create the file (version v1) on one handle.
+        let (inode, handle) = seed_uncommitted_handle(&fs, "reuse.txt", b"first".to_vec(), None);
+        fs.commit_handle(inode, handle).expect("first commit");
+        let (node_id, v1) = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            (
+                entry.node_id.clone().expect("node bound"),
+                entry
+                    .current_version_id
+                    .clone()
+                    .expect("v1 mirrored from file.write"),
+            )
+        };
+
+        // FIX 2: the still-open handle's base must advance to v1. Before the
+        // fix it stayed None (the create-time base), so the next flush on this
+        // handle would send no base and self-conflict once v1 existed.
+        {
+            let state = fs.lock_state();
+            let open_handle = state.handles.get(&handle).expect("handle retained");
+            assert_eq!(
+                open_handle.base_version_id.as_deref(),
+                Some(v1.as_str()),
+                "open handle base_version_id must advance after flush"
+            );
+        }
+
+        // Second write+flush on the SAME handle must succeed (no self-conflict).
+        fs.buffer_write(inode, handle, 0, b"second")
+            .expect("second write buffered");
+        fs.commit_handle(inode, handle)
+            .expect("second commit (no self-conflict)");
+
+        let v2 = {
+            let state = fs.lock_state();
+            state
+                .inodes
+                .get(&inode)
+                .and_then(|entry| entry.current_version_id.clone())
+                .expect("v2 set")
+        };
+        assert_ne!(v1, v2, "daemon advanced the version on the second commit");
+
+        // The last file.write for this node must carry base_version_id == v1
+        // (the version returned by the first commit), proving the handle base
+        // advanced rather than sending a stale or missing base.
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let second_write = inner
+            .operations
+            .iter()
+            .rev()
+            .find(|op| {
+                op.method == "file.write" && op.base_node_id.as_deref() == Some(node_id.as_str())
+            })
+            .expect("second file.write recorded");
+        let params: Value = serde_json::from_str(&second_write.params_json).expect("params parse");
+        assert_eq!(
+            params
+                .get("base_version_id")
+                .and_then(|value| value.as_str()),
+            Some(v1.as_str()),
+            "second commit carried the version_id returned by the first"
         );
     }
 

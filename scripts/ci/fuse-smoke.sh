@@ -155,6 +155,21 @@ if [[ "$READ_BACK" != "$RW_PAYLOAD" ]]; then
   exit 1
 fi
 
+# Truncate an existing mounted file to zero and assert the truncate takes
+# effect end-to-end (round-3 repro: `: > existing` previously no-op'd through
+# setattr(size=0) and the mount kept reading the old content).
+printf 'abc' >"$RW_MOUNTPOINT/truncate-me.txt"
+if [[ "$(cat "$RW_MOUNTPOINT/truncate-me.txt")" != "abc" ]]; then
+  echo "fuse-smoke-fail: truncate setup write mismatch" >&2
+  exit 1
+fi
+: >"$RW_MOUNTPOINT/truncate-me.txt"
+TRUNC_AFTER="$(cat "$RW_MOUNTPOINT/truncate-me.txt")"
+if [[ -n "$TRUNC_AFTER" ]]; then
+  echo "fuse-smoke-fail: truncate-to-zero did not take effect (got: $TRUNC_AFTER)" >&2
+  exit 1
+fi
+
 "$FUSERMOUNT" -u "$RW_MOUNTPOINT"
 wait "$FUSE_PID" || true
 FUSE_PID=""

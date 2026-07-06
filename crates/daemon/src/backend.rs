@@ -1167,6 +1167,22 @@ pub fn cache_hydrate_payload(
         }
     }
     let mut inner = backend.lock();
+    // Dirty guard: a Dirty entry holds unuploaded local changes. Driving it to
+    // Ready (the documented hydrate outcome) would silently discard them. The
+    // caller must commit or dehydrate first. Pinned/Ready/Absent/Failed entries
+    // hydrate normally (FILESYSTEM_SEMANTICS.md invariant).
+    if let Some(existing) = inner.cache_entries.get(&node_id)
+        && existing.state == CacheState::Dirty
+    {
+        return Err(ApiError::with_details(
+            "entry_dirty",
+            "cannot hydrate over a dirty local entry; commit or dehydrate first",
+            serde_json::json!({
+                "node_id": node_id,
+                "state": serde_json::to_value(existing.state).unwrap_or(Value::Null),
+            }),
+        ));
+    }
     let entry = inner
         .cache_entries
         .entry(node_id.clone())
@@ -1330,8 +1346,27 @@ pub fn lock_acquire_payload(
     let expires_at = expires
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| acquired_at.clone());
-    let org_id = backend.lock().org_id.clone();
-
+    let mut inner = backend.lock();
+    let org_id = inner.org_id.clone();
+    // Exclusive per-node locking: at most one effective lock per node_id. A
+    // lock counts as effective while Active and not past expires_at (lazy
+    // expiry, FILESYSTEM_SEMANTICS.md). Same-owner re-acquire also conflicts
+    // for now — simplest correct behavior; renew via lock.extend instead.
+    if let Some(existing) = inner.locks.values().find(|candidate| {
+        candidate.node_id.as_deref() == Some(node_id.as_str())
+            && candidate.is_effective_at(&acquired_at)
+    }) {
+        return Err(ApiError::with_details(
+            "lock_conflict",
+            "an effective lock already exists for this node",
+            serde_json::json!({
+                "node_id": node_id,
+                "existing_lock_id": existing.lock_id,
+                "owner_user_id": existing.owner_user_id,
+                "expires_at": existing.expires_at,
+            }),
+        ));
+    }
     let lock = FileLock {
         org_id,
         lock_id: generate_id("lock_"),
@@ -1350,7 +1385,8 @@ pub fn lock_acquire_payload(
         operation_id: None,
     };
     let snapshot = lock.clone();
-    backend.lock().locks.insert(lock.lock_id.clone(), lock);
+    inner.locks.insert(lock.lock_id.clone(), lock);
+    drop(inner);
     backend.record_event(
         biohazardfs_api_types::event_types::LOCK_CHANGED,
         serde_json::json!({"lock_id": snapshot.lock_id, "node_id": node_id, "status": "active"}),
@@ -1374,12 +1410,34 @@ pub fn lock_release_payload(
     source: Source,
 ) -> Result<Value, ApiError> {
     let lock_id = require_str_param(params, "lock_id")?;
+    // Caller identity: the release is authorized only when the caller's
+    // user_id/device_id match the lock owner. Comparison is Option equality, so
+    // a scaffold lock with no recorded owner (None/None) is releasable only by
+    // a caller that also passes no identity — which is the existing
+    // acquire/release round trip. Any divergence (Some vs None, or two unequal
+    // Some values) returns lock_not_owner. For locks with a real owner the
+    // caller MUST present both fields.
+    let caller_user_id = params.get("user_id").and_then(|value| value.as_str());
+    let caller_device_id = params.get("device_id").and_then(|value| value.as_str());
     let now = timestamp();
     let mut inner = backend.lock();
     let lock = inner
         .locks
         .get_mut(lock_id)
         .ok_or_else(|| ApiError::new("lock_not_found", format!("lock {lock_id} was not found")))?;
+    if lock.owner_user_id.as_deref() != caller_user_id
+        || lock.owner_device_id.as_deref() != caller_device_id
+    {
+        return Err(ApiError::with_details(
+            "lock_not_owner",
+            "only the lock owner may release the lock",
+            serde_json::json!({
+                "lock_id": lock_id,
+                "owner_user_id": lock.owner_user_id,
+                "owner_device_id": lock.owner_device_id,
+            }),
+        ));
+    }
     if !matches!(lock.status, LockStatus::Active) {
         return Err(ApiError::with_details(
             "lock_not_active",
@@ -2461,6 +2519,201 @@ mod tests {
             after > before,
             "extend should push expiry forward: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn cache_hydrate_refuses_dirty_entry() {
+        // A dirty entry holds unuploaded local changes; hydrating over it to
+        // Ready would discard them. The caller must commit or dehydrate first.
+        let backend = test_backend();
+        backend.seed_cache_entry(CacheEntry {
+            node_id: "node_readme".to_string(),
+            version_id: None,
+            state: CacheState::Dirty,
+            content_hash: None,
+            size_bytes: 10,
+            pinned: false,
+            dirty: true,
+            last_accessed_at: None,
+        });
+
+        let err = cache_hydrate_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme"}),
+            Source::Test,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "entry_dirty");
+        let details = err.details.expect("entry_dirty carries details");
+        assert_eq!(details["node_id"], "node_readme");
+
+        // The entry is untouched: still Dirty.
+        let inner = backend.lock();
+        let entry = inner
+            .cache_entries
+            .get("node_readme")
+            .expect("dirty entry present");
+        assert_eq!(entry.state, CacheState::Dirty);
+        assert!(entry.dirty);
+    }
+
+    #[test]
+    fn cache_hydrate_advances_ready_and_absent_entries() {
+        // Ready and Absent entries hydrate normally; only Dirty is refused.
+        let backend = test_backend();
+
+        // Absent (no entry yet) -> hydrate creates it in Ready.
+        let hydrated = cache_hydrate_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme"}),
+            Source::Test,
+        )
+        .unwrap();
+        assert_eq!(hydrated["state"], "ready");
+
+        // Ready -> hydrate keeps it Ready (idempotent), still allowed.
+        let again = cache_hydrate_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme"}),
+            Source::Test,
+        )
+        .unwrap();
+        assert_eq!(again["state"], "ready");
+    }
+
+    #[test]
+    fn lock_acquire_conflicts_with_existing_effective_lock() {
+        // Exclusive per-node locking: a second acquire on a node with an
+        // effective active lock returns lock_conflict.
+        let backend = test_backend();
+        let first = lock_acquire_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme", "ttl_seconds": 600}),
+            Source::Test,
+        )
+        .unwrap();
+        let first_lock_id = first["lock_id"].as_str().unwrap().to_string();
+
+        let err = lock_acquire_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme"}),
+            Source::Test,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "lock_conflict");
+        let details = err.details.expect("conflict carries details");
+        assert_eq!(details["existing_lock_id"], first_lock_id);
+        assert!(details.get("owner_user_id").is_some());
+        assert!(details.get("expires_at").is_some());
+
+        // The first lock is untouched.
+        let inner = backend.lock();
+        let lock = inner.locks.get(&first_lock_id).expect("first lock present");
+        assert_eq!(lock.status, LockStatus::Active);
+    }
+
+    #[test]
+    fn lock_acquire_allows_node_with_only_expired_lock() {
+        // Lazy expiry: an active-but-expired lock does not block a new acquire.
+        let backend = test_backend();
+        backend.seed_lock(FileLock {
+            org_id: SCAFFOLD_ORG_ID.to_string(),
+            lock_id: "lock_expired".to_string(),
+            node_id: Some("node_readme".to_string()),
+            provisional_local_id: None,
+            path_snapshot: "/Project/README.md".to_string(),
+            owner_user_id: None,
+            owner_device_id: None,
+            kind: LockKind::Edit,
+            status: LockStatus::Active,
+            acquired_at: "2020-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2020-01-01T00:01:00Z".to_string()),
+            released_at: None,
+            broken_at: None,
+            broken_by: None,
+            operation_id: None,
+        });
+        let ok = lock_acquire_payload(
+            &backend,
+            &serde_json::json!({"node_id": "node_readme"}),
+            Source::Test,
+        )
+        .unwrap();
+        assert_eq!(ok["status"], "active");
+    }
+
+    #[test]
+    fn lock_release_rejects_non_owner() {
+        // Only the lock owner may release. A mismatched caller gets
+        // lock_not_owner and the lock stays Active.
+        let backend = test_backend();
+        backend.seed_lock(FileLock {
+            org_id: SCAFFOLD_ORG_ID.to_string(),
+            lock_id: "lock_owned".to_string(),
+            node_id: Some("node_readme".to_string()),
+            provisional_local_id: None,
+            path_snapshot: "/Project/README.md".to_string(),
+            owner_user_id: Some("usr_owner".to_string()),
+            owner_device_id: Some("dev_owner".to_string()),
+            kind: LockKind::Edit,
+            status: LockStatus::Active,
+            acquired_at: "2026-07-05T00:00:00Z".to_string(),
+            expires_at: Some("2026-07-05T01:00:00Z".to_string()),
+            released_at: None,
+            broken_at: None,
+            broken_by: None,
+            operation_id: None,
+        });
+        let err = lock_release_payload(
+            &backend,
+            &serde_json::json!({
+                "lock_id": "lock_owned",
+                "user_id": "usr_intruder",
+                "device_id": "dev_owner",
+            }),
+            Source::Test,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "lock_not_owner");
+
+        let inner = backend.lock();
+        let lock = inner.locks.get("lock_owned").expect("lock present");
+        assert_eq!(lock.status, LockStatus::Active);
+    }
+
+    #[test]
+    fn lock_release_succeeds_for_owner() {
+        // The matching owner can release.
+        let backend = test_backend();
+        backend.seed_lock(FileLock {
+            org_id: SCAFFOLD_ORG_ID.to_string(),
+            lock_id: "lock_owned".to_string(),
+            node_id: Some("node_readme".to_string()),
+            provisional_local_id: None,
+            path_snapshot: "/Project/README.md".to_string(),
+            owner_user_id: Some("usr_owner".to_string()),
+            owner_device_id: Some("dev_owner".to_string()),
+            kind: LockKind::Edit,
+            status: LockStatus::Active,
+            acquired_at: "2026-07-05T00:00:00Z".to_string(),
+            expires_at: Some("2026-07-05T01:00:00Z".to_string()),
+            released_at: None,
+            broken_at: None,
+            broken_by: None,
+            operation_id: None,
+        });
+        let ok = lock_release_payload(
+            &backend,
+            &serde_json::json!({
+                "lock_id": "lock_owned",
+                "user_id": "usr_owner",
+                "device_id": "dev_owner",
+            }),
+            Source::Test,
+        )
+        .unwrap();
+        assert_eq!(ok["status"], "released");
+        assert!(ok["released_at"].as_str().is_some());
     }
 
     #[test]

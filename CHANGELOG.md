@@ -85,5 +85,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 - Server idempotency payload check: `operations.submit` with an existing `idempotency_key` but a differing payload now returns `operation_idempotency_payload_mismatch` instead of silently replaying the prior operation.
 - Server migration checksum line-ending independence: `checksum_sql` strips `\r` before hashing so LF and CRLF checkouts produce identical checksums (already-applied dev DBs need a fresh migrate; smoke uses ephemeral containers).
 - Docs sweep: README and `docs/reference/COMMANDS.md` no longer show removed `--local-token`/`auth login --token` examples, and `--yes`/`--apply` wording reflects the env-only token policy and `apply_not_wired` behavior.
+- FUSE truncate-to-zero (and general truncation) is now durable: `setattr(size)` truncates the cache file, stages the surviving bytes in the handle's write buffer so the next flush commits a real version, and updates the inode size. `: > mount/existing.txt` and Python `open(path, "wb")` now commit a zero-byte version instead of silently keeping the old content. Sparse extension past the current length returns `ENOSYS` (documented gap). Covered by a live `fuse-smoke` assertion.
+- FUSE same-handle re-flush: a successful flush now advances every open handle's `base_version_id` to the daemon-returned version, so `write → flush → write` on one handle no longer self-conflicts.
+- Daemon `cache.hydrate` now rejects `Dirty` entries (`entry_dirty`) instead of overwriting unsynced local data.
+- Daemon lock semantics: `lock.acquire` rejects an existing effective lock on the same target (`lock_conflict`); `lock.release` checks ownership (`lock_not_owner` on mismatch).
+- Server `operations.submit` idempotency replay now compares the full semantic request (`kind`, `source`, `node_id`, `base_version_id`, `device_id`, `params`), not just `params`, so a same-key resubmission with any differing field returns `operation_idempotency_payload_mismatch`.
 
 [Unreleased]: https://github.com/Biohazard-VFX/BiohazardFS/compare/main...HEAD
