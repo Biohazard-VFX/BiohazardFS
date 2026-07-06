@@ -217,7 +217,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.assets[] | select(.name == "SHA256SUMS.txt" or .name == "builder-debug.yml" or (.name | test("^BiohazardFS-")) or (.name | test("^(latest|dev|nightly|alpha|beta)(-linux|-mac)?\\.yml$"))) | .id')"
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')"
+          asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '.assets[] | select(.name == "SHA256SUMS.txt" or .name == "builder-debug.yml" or (.name | test("^BiohazardFS-")) or (.name | test("^(latest|dev|nightly|alpha|beta)(-linux|-mac)?\\.yml$"))) | .id')"
           if [[ -n "$asset_ids" ]]; then
             while IFS= read -r asset_id; do
               [[ -z "$asset_id" ]] && continue
