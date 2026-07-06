@@ -5,10 +5,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use biohazardfs_api_types::{
-    ApiError, ContentObjectGetResponse, ContentObjectPutResponse, FileContentGetResponse,
-    FileContentPutResponse, NamespaceChildrenResponse, NamespaceNodeSummary, PRODUCT_VERSION,
+    ApiError, AuditEventSummary, AuditEventsResponse, ConflictListResponse, ConflictSummary,
+    ContentObjectGetResponse, ContentObjectPutResponse, DeviceListResponse, DeviceSummary,
+    FileContentGetResponse, FileContentPutResponse, LockAcquireResponse, LockListResponse,
+    LockReleaseResponse, LockSummary, NamespaceChildrenResponse, NamespaceNodeSummary,
+    OperationSubmitResponse, PRODUCT_VERSION, ProjectListResponse, ProjectSummary,
     SERVER_SCHEMA_VERSION, ServerHealth, ServerHealthCheck, ServerResponseEnvelope, ServerState,
-    ServerStatus, ServerVersion, Source,
+    ServerStatus, ServerVersion, Source, TrashListResponse, TrashSummary, WorksetListResponse,
+    WorksetSummary, request_id,
 };
 use biohazardfs_core::config::RuntimeConfig;
 use hmac::{Hmac, KeyInit, Mac};
@@ -30,6 +34,12 @@ const MAX_CONTENT_UPLOAD_BYTES: usize = 1024 * 1024;
 const MAX_OBJECT_RESPONSE_BYTES: usize = 1024 * 1024 + 16 * 1024;
 const DEFAULT_NAMESPACE_LIMIT: u32 = 100;
 const MAX_NAMESPACE_LIMIT: u32 = 500;
+const DEFAULT_LIST_LIMIT: u32 = 100;
+const MAX_LIST_LIMIT: u32 = 500;
+const DEFAULT_LOCK_TTL_SECONDS: u64 = 30 * 60;
+const MAX_LOCK_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_OPERATION_KIND_LEN: usize = 128;
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 const DEFAULT_OBJECT_STORE_REGION: &str = "us-east-1";
 const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -324,6 +334,31 @@ pub fn worker_payload() -> serde_json::Value {
     })
 }
 
+/// Redacted admin status envelope payload. Exposes only booleans for database
+/// and object-store configuration so the admin surface never echoes connection
+/// strings or credential material. The admin subcommand does not perform admin
+/// work yet; it reports readiness for an operator or agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminReport {
+    pub name: String,
+    pub version: String,
+    pub mode: String,
+    pub status: String,
+    pub database_configured: bool,
+    pub object_store_configured: bool,
+}
+
+pub fn admin_payload(config: &RuntimeConfig) -> AdminReport {
+    AdminReport {
+        name: "biohazardfs-server".to_string(),
+        version: PRODUCT_VERSION.to_string(),
+        mode: "admin".to_string(),
+        status: "scaffold_ready".to_string(),
+        database_configured: config.database.url_set,
+        object_store_configured: config.object_store.endpoint.is_some(),
+    }
+}
+
 pub fn object_store_check_payload_with_config(
     config: &RuntimeConfig,
 ) -> Result<ObjectStoreCheckReport, ObjectStoreError> {
@@ -403,24 +438,11 @@ fn dispatch_http_request_with_config(
     config: &RuntimeConfig,
 ) -> (u16, String) {
     let (route_path, query) = split_path_and_query(path);
-    if method != "GET"
-        && !(method == "PUT"
-            && matches!(
-                route_path,
-                "/api/v1/objects/content" | "/api/v1/files/content"
-            ))
-    {
-        return json_response(
-            405,
-            &ServerResponseEnvelope::<serde_json::Value>::error(
-                "server.request",
-                ApiError::new(
-                    "method_not_allowed",
-                    "server endpoint does not support this method",
-                ),
-                Source::Server,
-            ),
-        );
+    // handle_stream already rejects HTTP verbs outside this set; defend dispatch
+    // callers (tests, embedders) the same way. Per-route method correctness is
+    // enforced by the match arms and the is_known_server_route 405 fallback.
+    if !matches!(method, "GET" | "PUT" | "POST" | "DELETE") {
+        return method_not_allowed();
     }
 
     match route_path {
@@ -452,6 +474,100 @@ fn dispatch_http_request_with_config(
             200,
             &ServerResponseEnvelope::ok("server.status", server_status("serve"), Source::Server),
         ),
+        // Spine: locks (acquire/list/release are backed by Postgres).
+        "/api/v1/locks" if method == "GET" => locks_list_response(query, headers, config),
+        "/api/v1/locks" if method == "POST" => locks_acquire_response(body, headers, config),
+        "/api/v1/locks" if method == "DELETE" => locks_release_response(query, headers, config),
+        // Spine: conflicts (list and show share one path; show keys on conflict_id).
+        "/api/v1/conflicts" if method == "GET" => conflicts_response(query, headers, config),
+        // Spine: operations.submit; replay is periphery.
+        "/api/v1/operations" if method == "POST" => {
+            operations_submit_response(body, headers, config)
+        }
+        "/api/v1/operations/replay" if method == "POST" => {
+            not_implemented_response("server.operations.replay")
+        }
+        // Spine: trash list; restore/purge are periphery.
+        "/api/v1/trash" if method == "GET" => trash_list_response(query, headers, config),
+        "/api/v1/trash/restore" if method == "POST" => {
+            not_implemented_response("server.trash.restore")
+        }
+        "/api/v1/trash/purge" if method == "POST" => not_implemented_response("server.trash.purge"),
+        // Spine: audit.events; export is periphery.
+        "/api/v1/audit/events" if method == "GET" => audit_events_response(query, headers, config),
+        "/api/v1/audit/export" if method == "GET" => {
+            not_implemented_response("server.audit.export")
+        }
+        // Spine: devices list; revoke is periphery.
+        "/api/v1/devices" if method == "GET" => devices_list_response(query, headers, config),
+        "/api/v1/devices/revoke" if method == "POST" => {
+            not_implemented_response("server.devices.revoke")
+        }
+        // Spine: projects/worksets list; create is periphery.
+        "/api/v1/projects" if method == "GET" => projects_list_response(query, headers, config),
+        "/api/v1/projects" if method == "POST" => {
+            not_implemented_response("server.projects.create")
+        }
+        "/api/v1/worksets" if method == "GET" => worksets_list_response(query, headers, config),
+        "/api/v1/worksets" if method == "POST" => {
+            not_implemented_response("server.worksets.create")
+        }
+        // Periphery: snapshots.
+        "/api/v1/snapshots" if method == "GET" => not_implemented_response("server.snapshots.list"),
+        "/api/v1/snapshots" if method == "POST" => {
+            not_implemented_response("server.snapshots.create")
+        }
+        "/api/v1/snapshots/mount" if method == "POST" => {
+            not_implemented_response("server.snapshots.mount")
+        }
+        "/api/v1/snapshots/restore" if method == "POST" => {
+            not_implemented_response("server.snapshots.restore")
+        }
+        // Periphery: transfers.
+        "/api/v1/transfers" if method == "POST" => {
+            not_implemented_response("server.transfers.create")
+        }
+        "/api/v1/transfers/commit" if method == "POST" => {
+            not_implemented_response("server.transfers.commit")
+        }
+        // Periphery: grants.
+        "/api/v1/grants" if method == "GET" => not_implemented_response("server.grants.list"),
+        "/api/v1/grants" if method == "POST" => not_implemented_response("server.grants.set"),
+        "/api/v1/grants" if method == "DELETE" => not_implemented_response("server.grants.revoke"),
+        // Periphery: shares.
+        "/api/v1/shares" if method == "GET" => not_implemented_response("server.shares.list"),
+        "/api/v1/shares" if method == "POST" => not_implemented_response("server.shares.create"),
+        "/api/v1/shares" if method == "DELETE" => not_implemented_response("server.shares.revoke"),
+        // Periphery: publishes.
+        "/api/v1/publishes" if method == "GET" => not_implemented_response("server.publishes.list"),
+        "/api/v1/publishes" if method == "POST" => {
+            not_implemented_response("server.publishes.create")
+        }
+        "/api/v1/publishes" if method == "DELETE" => {
+            not_implemented_response("server.publishes.revoke")
+        }
+        // Periphery: invites.
+        "/api/v1/invites" if method == "GET" => not_implemented_response("server.invites.list"),
+        "/api/v1/invites" if method == "POST" => not_implemented_response("server.invites.create"),
+        "/api/v1/invites" if method == "DELETE" => {
+            not_implemented_response("server.invites.revoke")
+        }
+        // Periphery: nodes.
+        "/api/v1/nodes/stat" if method == "GET" => not_implemented_response("server.nodes.stat"),
+        "/api/v1/nodes/mkdir" if method == "POST" => not_implemented_response("server.nodes.mkdir"),
+        "/api/v1/nodes/symlink" if method == "POST" => {
+            not_implemented_response("server.nodes.symlink")
+        }
+        "/api/v1/nodes/move" if method == "POST" => not_implemented_response("server.nodes.move"),
+        "/api/v1/nodes/copy" if method == "POST" => not_implemented_response("server.nodes.copy"),
+        "/api/v1/nodes" if method == "DELETE" => not_implemented_response("server.nodes.delete"),
+        // Periphery: auth enrollment/login-token.
+        "/api/v1/auth/device/enroll" if method == "POST" => {
+            not_implemented_response("server.auth.device.enroll")
+        }
+        "/api/v1/auth/login_token" if method == "POST" => {
+            not_implemented_response("server.auth.login_token")
+        }
         "/api/v1/namespace/children" if method == "GET" => {
             namespace_children_response(query, headers, config)
         }
@@ -467,19 +583,9 @@ fn dispatch_http_request_with_config(
         "/api/v1/files/content" if method == "GET" => {
             file_content_get_response(query, headers, config)
         }
-        "/api/v1/namespace/children" | "/api/v1/objects/content" | "/api/v1/files/content" => {
-            json_response(
-                405,
-                &ServerResponseEnvelope::<serde_json::Value>::error(
-                    "server.request",
-                    ApiError::new(
-                        "method_not_allowed",
-                        "server endpoint does not support this method",
-                    ),
-                    Source::Server,
-                ),
-            )
-        }
+        // A known route path with an unsupported method (e.g. GET on a POST-only
+        // collection) is a 405, not a 404. Unknown paths fall through to 404.
+        route if is_known_server_route(route) => method_not_allowed(),
         _ => json_response(
             404,
             &ServerResponseEnvelope::<serde_json::Value>::error(
@@ -489,6 +595,79 @@ fn dispatch_http_request_with_config(
             ),
         ),
     }
+}
+
+fn method_not_allowed() -> (u16, String) {
+    json_response(
+        405,
+        &ServerResponseEnvelope::<serde_json::Value>::error(
+            "server.request",
+            ApiError::new(
+                "method_not_allowed",
+                "server endpoint does not support this method",
+            ),
+            Source::Server,
+        ),
+    )
+}
+
+fn not_implemented_response(operation: &str) -> (u16, String) {
+    json_response(
+        501,
+        &ServerResponseEnvelope::<serde_json::Value>::error(
+            operation,
+            ApiError::new(
+                "operation_not_implemented",
+                "server operation is not implemented yet",
+            ),
+            Source::Server,
+        ),
+    )
+}
+
+fn is_known_server_route(route_path: &str) -> bool {
+    matches!(
+        route_path,
+        "/healthz"
+            | "/health"
+            | "/readyz"
+            | "/ready"
+            | "/version"
+            | "/api/v1/status"
+            | "/api/v1/namespace/children"
+            | "/api/v1/objects/content"
+            | "/api/v1/files/content"
+            | "/api/v1/locks"
+            | "/api/v1/conflicts"
+            | "/api/v1/operations"
+            | "/api/v1/operations/replay"
+            | "/api/v1/trash"
+            | "/api/v1/trash/restore"
+            | "/api/v1/trash/purge"
+            | "/api/v1/audit/events"
+            | "/api/v1/audit/export"
+            | "/api/v1/devices"
+            | "/api/v1/devices/revoke"
+            | "/api/v1/projects"
+            | "/api/v1/worksets"
+            | "/api/v1/snapshots"
+            | "/api/v1/snapshots/mount"
+            | "/api/v1/snapshots/restore"
+            | "/api/v1/transfers"
+            | "/api/v1/transfers/commit"
+            | "/api/v1/grants"
+            | "/api/v1/shares"
+            | "/api/v1/publishes"
+            | "/api/v1/invites"
+            | "/api/v1/nodes"
+            | "/api/v1/nodes/stat"
+            | "/api/v1/nodes/mkdir"
+            | "/api/v1/nodes/symlink"
+            | "/api/v1/nodes/move"
+            | "/api/v1/nodes/copy"
+            | "/api/v1/auth/device/enroll"
+            | "/api/v1/auth/login_token"
+    )
 }
 
 fn namespace_children_response(
@@ -629,6 +808,1747 @@ fn content_object_get_response(
             ),
         ),
     }
+}
+
+// ===== Wave 2 spine routes =====
+// locks (acquire/list/release), conflicts (list/show), operations.submit,
+// trash.list, audit.events, devices.list, projects.list, worksets.list are
+// backed by Postgres following the record_file_content transactional template.
+// Each route resolves authenticate_subject + a scopes_allow_* helper, then runs
+// org-scoped SQL. Timestamps are formatted as explicit RFC3339 UTC in SQL so the
+// synchronous postgres driver does not need a timestamp feature gate.
+
+/// SQL projection fragment that formats a timestamptz column as RFC3339 UTC.
+/// `column` must be a hardcoded SQL identifier, never user input.
+fn ts_utc(column: &str) -> String {
+    format!("to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS {column}")
+}
+
+fn auth_required_error() -> ApiError {
+    ApiError::new("auth_required", "Authorization: Bearer token is required")
+}
+
+fn connect_for_payload(config: &RuntimeConfig, purpose: &str) -> Result<Client, (u16, ApiError)> {
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            db_unavailable_error(error.code(), purpose, "not configured"),
+        )
+    })?;
+    connect_database(database_url).map_err(|error| {
+        (
+            503,
+            db_unavailable_error(error.code(), purpose, "unavailable"),
+        )
+    })
+}
+
+fn db_unavailable_error(code: &str, purpose: &str, state: &str) -> ApiError {
+    let message = if state == "not configured" {
+        format!("database is not configured for {purpose}")
+    } else {
+        format!("database is unavailable for {purpose}")
+    };
+    ApiError::new(code, message)
+}
+
+fn parse_limit_value(value: &str) -> Result<u32, (u16, ApiError)> {
+    let parsed = value.parse::<u32>().map_err(|_| {
+        (
+            400,
+            ApiError::new("invalid_limit", "limit must be a positive integer"),
+        )
+    })?;
+    if parsed == 0 || parsed > MAX_LIST_LIMIT {
+        return Err((
+            400,
+            ApiError::new(
+                "invalid_limit",
+                format!("limit must be between 1 and {MAX_LIST_LIMIT}"),
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_opaque_id(value: &str, code: &str, label: &str) -> Result<(), (u16, ApiError)> {
+    let valid = !value.trim().is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new(code, format!("{label} is not valid for this operation")),
+        ))
+    }
+}
+
+fn validate_status_filter(status: &str, allowed: &[&str]) -> Result<(), (u16, ApiError)> {
+    if allowed.contains(&status) {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new(
+                "invalid_status",
+                "status filter is not a known status value",
+            ),
+        ))
+    }
+}
+
+fn parse_json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, (u16, ApiError)> {
+    if body.is_empty() {
+        return Err((
+            400,
+            ApiError::new("body_required", "JSON request body is required"),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        (
+            400,
+            ApiError::new(
+                "invalid_json",
+                "request body is not valid JSON for this operation",
+            ),
+        )
+    })
+}
+
+// --- existence preflight: gives clean 404s for client-supplied IDs before the
+// insert/update path would otherwise surface a FK violation as a 503. ---
+fn ensure_node_exists(
+    client: &mut Client,
+    org_id: &str,
+    node_id: &str,
+) -> Result<(), (u16, ApiError)> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM nodes WHERE org_id = $1 AND node_id = $2 AND deleted_at IS NULL",
+            &[&org_id, &node_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("metadata_store_unavailable", "could not verify node"),
+            )
+        })?;
+    if rows.is_empty() {
+        Err((
+            404,
+            ApiError::new("node_not_found", "node was not found in this organization"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_file_version_exists(
+    client: &mut Client,
+    org_id: &str,
+    version_id: &str,
+) -> Result<(), (u16, ApiError)> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM file_versions WHERE org_id = $1 AND version_id = $2",
+            &[&org_id, &version_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new(
+                    "metadata_store_unavailable",
+                    "could not verify file version",
+                ),
+            )
+        })?;
+    if rows.is_empty() {
+        Err((
+            404,
+            ApiError::new("version_not_found", "file version was not found"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_device_exists(
+    client: &mut Client,
+    org_id: &str,
+    device_id: &str,
+) -> Result<(), (u16, ApiError)> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM devices WHERE org_id = $1 AND device_id = $2",
+            &[&org_id, &device_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("metadata_store_unavailable", "could not verify device"),
+            )
+        })?;
+    if rows.is_empty() {
+        Err((
+            404,
+            ApiError::new("device_not_found", "device was not found"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// ===== Locks =====
+
+fn locks_list_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.locks.list";
+    match locks_list_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+fn locks_acquire_response(
+    body: &[u8],
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.locks.acquire";
+    match locks_acquire_payload(body, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+fn locks_release_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.locks.release";
+    match locks_release_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockListQuery {
+    node_id: Option<String>,
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_lock_list_query(query: &str) -> Result<LockListQuery, (u16, ApiError)> {
+    let mut node_id = None;
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "node" | "node_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_node_id_value(&decoded)?;
+                node_id = Some(decoded);
+            }
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(&decoded, &["active", "released", "expired", "broken"])?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(LockListQuery {
+        node_id,
+        status,
+        limit,
+    })
+}
+
+fn parse_lock_id_query(query: &str) -> Result<String, (u16, ApiError)> {
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if (key == "lock" || key == "lock_id") && !value.trim().is_empty() {
+            let decoded = percent_decode_query_value(value)?;
+            validate_opaque_id(&decoded, "invalid_lock_id", "lock_id")?;
+            return Ok(decoded);
+        }
+    }
+    Err((
+        400,
+        ApiError::new("lock_id_required", "lock_id query parameter is required"),
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LockAcquireBody {
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    provisional_local_id: Option<String>,
+    #[serde(default)]
+    path_snapshot: Option<String>,
+    #[serde(default)]
+    owner_device_id: Option<String>,
+    #[serde(default = "default_lock_kind")]
+    kind: String,
+    #[serde(default = "default_lock_ttl_seconds")]
+    ttl_seconds: u64,
+}
+
+fn default_lock_kind() -> String {
+    "edit".to_string()
+}
+
+fn default_lock_ttl_seconds() -> u64 {
+    DEFAULT_LOCK_TTL_SECONDS
+}
+
+fn validate_lock_kind(kind: &str) -> Result<(), (u16, ApiError)> {
+    if matches!(kind, "edit" | "admin" | "publish" | "restore") {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new(
+                "invalid_lock_kind",
+                "lock kind must be edit, admin, publish, or restore",
+            ),
+        ))
+    }
+}
+
+fn lock_ttl_seconds(ttl_seconds: u64) -> Result<f64, (u16, ApiError)> {
+    if ttl_seconds > MAX_LOCK_TTL_SECONDS {
+        return Err((
+            400,
+            ApiError::new(
+                "invalid_lock_ttl",
+                format!("lock ttl_seconds must be at most {MAX_LOCK_TTL_SECONDS}"),
+            ),
+        ));
+    }
+    Ok(ttl_seconds as f64)
+}
+
+fn locks_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<LockListResponse, (u16, ApiError)> {
+    let query_params = parse_lock_list_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "lock requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_lock_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read locks"),
+        ));
+    }
+    let node_filter = query_params.node_id.as_deref();
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let acquired = ts_utc("acquired_at");
+    let expires = ts_utc("expires_at");
+    let released = ts_utc("released_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT lock_id, node_id, provisional_local_id, path_snapshot, owner_user_id,
+                        owner_device_id, kind, status, {acquired}, {expires}, {released}
+                 FROM locks
+                 WHERE org_id = $1
+                   AND ($2::text IS NULL OR node_id = $2)
+                   AND ($3::text IS NULL OR status = $3)
+                 ORDER BY acquired_at DESC
+                 LIMIT $4"
+            ),
+            &[&subject.org_id, &node_filter, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("lock_store_unavailable", "could not list locks"),
+            )
+        })?;
+    let locks = rows
+        .into_iter()
+        .map(|row| LockSummary {
+            lock_id: row.get("lock_id"),
+            node_id: row.get("node_id"),
+            provisional_local_id: row.get("provisional_local_id"),
+            path_snapshot: row.get("path_snapshot"),
+            owner_user_id: row.get("owner_user_id"),
+            owner_device_id: row.get("owner_device_id"),
+            kind: row.get("kind"),
+            status: row.get("status"),
+            acquired_at: row.get("acquired_at"),
+            expires_at: row.get("expires_at"),
+            released_at: row.get("released_at"),
+        })
+        .collect();
+    Ok(LockListResponse {
+        locks,
+        limit: query_params.limit,
+    })
+}
+
+fn locks_acquire_payload(
+    body: &[u8],
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<LockAcquireResponse, (u16, ApiError)> {
+    let body = parse_json_body::<LockAcquireBody>(body)?;
+    validate_lock_kind(&body.kind)?;
+    let ttl_seconds = lock_ttl_seconds(body.ttl_seconds)?;
+    if let Some(node_id) = body.node_id.as_deref() {
+        validate_node_id_value(node_id)?;
+    }
+    if let Some(device_id) = body.owner_device_id.as_deref() {
+        validate_opaque_id(device_id, "invalid_device_id", "owner_device_id")?;
+    }
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "lock requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_lock_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot write locks"),
+        ));
+    }
+    if let Some(node_id) = body.node_id.as_deref() {
+        ensure_node_exists(&mut client, &subject.org_id, node_id)?;
+    }
+    if let Some(device_id) = body.owner_device_id.as_deref() {
+        ensure_device_exists(&mut client, &subject.org_id, device_id)?;
+    }
+    let lock_id = generated_id("lock");
+    let acquired = ts_utc("acquired_at");
+    let expires = ts_utc("expires_at");
+    let row = client
+        .query_one(
+            &format!(
+                "INSERT INTO locks
+                   (org_id, lock_id, node_id, provisional_local_id, path_snapshot,
+                    owner_user_id, owner_device_id, kind, status, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active',
+                         now() + make_interval(secs => $9))
+                 RETURNING {acquired}, {expires}"
+            ),
+            &[
+                &subject.org_id,
+                &lock_id,
+                &body.node_id,
+                &body.provisional_local_id,
+                &body.path_snapshot,
+                &subject.user_id,
+                &body.owner_device_id,
+                &body.kind,
+                &ttl_seconds,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("lock_store_unavailable", "could not acquire lock"),
+            )
+        })?;
+    Ok(LockAcquireResponse {
+        lock_id,
+        node_id: body.node_id,
+        kind: body.kind,
+        status: "active".to_string(),
+        owner_user_id: subject.user_id,
+        acquired_at: row.get("acquired_at"),
+        expires_at: row.get("expires_at"),
+    })
+}
+
+fn locks_release_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<LockReleaseResponse, (u16, ApiError)> {
+    let lock_id = parse_lock_id_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "lock requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_lock_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot release locks"),
+        ));
+    }
+    let updated = client
+        .execute(
+            "UPDATE locks
+             SET status = 'released', released_at = now()
+             WHERE org_id = $1 AND lock_id = $2 AND status = 'active'",
+            &[&subject.org_id, &lock_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("lock_store_unavailable", "could not release lock"),
+            )
+        })?;
+    if updated == 0 {
+        return Err((
+            404,
+            ApiError::new(
+                "lock_not_found",
+                "active lock was not found for this organization",
+            ),
+        ));
+    }
+    Ok(LockReleaseResponse {
+        lock_id,
+        status: "released".to_string(),
+    })
+}
+
+// ===== Conflicts =====
+
+fn conflicts_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    if has_conflict_id(query) {
+        let operation = "server.conflicts.show";
+        match conflict_show_payload(query, headers, config) {
+            Ok(payload) => json_response(
+                200,
+                &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+            ),
+            Err((status_code, error)) => json_response(
+                status_code,
+                &ServerResponseEnvelope::<serde_json::Value>::error(
+                    operation,
+                    error,
+                    Source::Server,
+                ),
+            ),
+        }
+    } else {
+        let operation = "server.conflicts.list";
+        match conflicts_list_payload(query, headers, config) {
+            Ok(payload) => json_response(
+                200,
+                &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+            ),
+            Err((status_code, error)) => json_response(
+                status_code,
+                &ServerResponseEnvelope::<serde_json::Value>::error(
+                    operation,
+                    error,
+                    Source::Server,
+                ),
+            ),
+        }
+    }
+}
+
+fn has_conflict_id(query: &str) -> bool {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .any(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "conflict" || key == "conflict_id") && !value.trim().is_empty()
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictListQuery {
+    node_id: Option<String>,
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_conflict_list_query(query: &str) -> Result<ConflictListQuery, (u16, ApiError)> {
+    let mut node_id = None;
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "node" | "node_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_node_id_value(&decoded)?;
+                node_id = Some(decoded);
+            }
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(
+                    &decoded,
+                    &["open", "resolved", "preserved_all", "dismissed"],
+                )?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(ConflictListQuery {
+        node_id,
+        status,
+        limit,
+    })
+}
+
+fn parse_conflict_id_query(query: &str) -> Result<String, (u16, ApiError)> {
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if (key == "conflict" || key == "conflict_id") && !value.trim().is_empty() {
+            let decoded = percent_decode_query_value(value)?;
+            validate_opaque_id(&decoded, "invalid_conflict_id", "conflict_id")?;
+            return Ok(decoded);
+        }
+    }
+    Err((
+        400,
+        ApiError::new(
+            "conflict_id_required",
+            "conflict_id query parameter is required",
+        ),
+    ))
+}
+
+fn conflicts_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<ConflictListResponse, (u16, ApiError)> {
+    let query_params = parse_conflict_list_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "conflict requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_conflict_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read conflicts"),
+        ));
+    }
+    let node_filter = query_params.node_id.as_deref();
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let created = ts_utc("created_at");
+    let resolved = ts_utc("resolved_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT conflict_id, node_id, path_snapshot, kind, status, base_version_id,
+                        local_version_id, remote_version_id, local_operation_id,
+                        remote_operation_id, {created}, {resolved}
+                 FROM conflicts
+                 WHERE org_id = $1
+                   AND ($2::text IS NULL OR node_id = $2)
+                   AND ($3::text IS NULL OR status = $3)
+                 ORDER BY created_at DESC
+                 LIMIT $4"
+            ),
+            &[&subject.org_id, &node_filter, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("conflict_store_unavailable", "could not list conflicts"),
+            )
+        })?;
+    let conflicts = rows
+        .into_iter()
+        .map(|row| ConflictSummary {
+            conflict_id: row.get("conflict_id"),
+            node_id: row.get("node_id"),
+            path_snapshot: row.get("path_snapshot"),
+            kind: row.get("kind"),
+            status: row.get("status"),
+            base_version_id: row.get("base_version_id"),
+            local_version_id: row.get("local_version_id"),
+            remote_version_id: row.get("remote_version_id"),
+            local_operation_id: row.get("local_operation_id"),
+            remote_operation_id: row.get("remote_operation_id"),
+            created_at: row.get("created_at"),
+            resolved_at: row.get("resolved_at"),
+        })
+        .collect();
+    Ok(ConflictListResponse {
+        conflicts,
+        limit: query_params.limit,
+    })
+}
+
+fn conflict_show_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<ConflictSummary, (u16, ApiError)> {
+    let conflict_id = parse_conflict_id_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "conflict requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_conflict_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read conflicts"),
+        ));
+    }
+    let created = ts_utc("created_at");
+    let resolved = ts_utc("resolved_at");
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT conflict_id, node_id, path_snapshot, kind, status, base_version_id,
+                        local_version_id, remote_version_id, local_operation_id,
+                        remote_operation_id, {created}, {resolved}
+                 FROM conflicts
+                 WHERE org_id = $1 AND conflict_id = $2"
+            ),
+            &[&subject.org_id, &conflict_id],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("conflict_store_unavailable", "could not read conflict"),
+            )
+        })?;
+    let Some(row) = row else {
+        return Err((
+            404,
+            ApiError::new(
+                "conflict_not_found",
+                "conflict was not found in this organization",
+            ),
+        ));
+    };
+    Ok(ConflictSummary {
+        conflict_id: row.get("conflict_id"),
+        node_id: row.get("node_id"),
+        path_snapshot: row.get("path_snapshot"),
+        kind: row.get("kind"),
+        status: row.get("status"),
+        base_version_id: row.get("base_version_id"),
+        local_version_id: row.get("local_version_id"),
+        remote_version_id: row.get("remote_version_id"),
+        local_operation_id: row.get("local_operation_id"),
+        remote_operation_id: row.get("remote_operation_id"),
+        created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
+    })
+}
+
+// ===== Operations =====
+
+fn operations_submit_response(
+    body: &[u8],
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.operations.submit";
+    match operations_submit_payload(body, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OperationSubmitBody {
+    kind: String,
+    #[serde(default = "default_operation_source")]
+    source: String,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    base_version_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+fn default_operation_source() -> String {
+    "api".to_string()
+}
+
+fn validate_operation_kind(kind: &str) -> Result<(), (u16, ApiError)> {
+    let valid = !kind.trim().is_empty()
+        && kind.len() <= MAX_OPERATION_KIND_LEN
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new("invalid_operation_kind", "operation kind is not valid"),
+        ))
+    }
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), (u16, ApiError)> {
+    let valid = !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new("invalid_idempotency_key", "idempotency_key is not valid"),
+        ))
+    }
+}
+
+fn operations_submit_payload(
+    body: &[u8],
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<OperationSubmitResponse, (u16, ApiError)> {
+    let body = parse_json_body::<OperationSubmitBody>(body)?;
+    validate_operation_kind(&body.kind)?;
+    validate_file_source(&body.source)?;
+    if let Some(node_id) = body.node_id.as_deref() {
+        validate_node_id_value(node_id)?;
+    }
+    if let Some(version_id) = body.base_version_id.as_deref() {
+        validate_opaque_id(version_id, "invalid_version_id", "base_version_id")?;
+    }
+    if let Some(device_id) = body.device_id.as_deref() {
+        validate_opaque_id(device_id, "invalid_device_id", "device_id")?;
+    }
+    if let Some(key) = body.idempotency_key.as_deref() {
+        validate_idempotency_key(key)?;
+    }
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "operation submissions")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_operation_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot submit operations",
+            ),
+        ));
+    }
+    if let Some(node_id) = body.node_id.as_deref() {
+        ensure_node_exists(&mut client, &subject.org_id, node_id)?;
+    }
+    if let Some(version_id) = body.base_version_id.as_deref() {
+        ensure_file_version_exists(&mut client, &subject.org_id, version_id)?;
+    }
+    if let Some(device_id) = body.device_id.as_deref() {
+        ensure_device_exists(&mut client, &subject.org_id, device_id)?;
+    }
+    // Idempotent replay: a resubmitted idempotency key must return the prior
+    // recorded operation rather than create a duplicate or silently fail. A
+    // replay that carries a DIFFERENT payload is rejected (409) so a reused
+    // key can never silently return the wrong operation to a caller.
+    if let Some(key) = body.idempotency_key.as_deref()
+        && let Some(existing) = lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?
+    {
+        verify_idempotency_payload_match(&existing, &body, key)?;
+        return Ok(existing.response);
+    }
+    let operation_id = generated_id("op");
+    let req_id = request_id();
+    // The synchronous postgres driver has no serde_json feature gate, so the
+    // params object is serialized to text in Rust, sent as a TEXT parameter
+    // ($11::text), then cast to jsonb server-side. Binding the String directly
+    // to a jsonb-typed parameter would fail at serialize time because String's
+    // ToSql impl does not accept the JSONB OID.
+    let params_json = serde_json::to_string(&body.params).unwrap_or_else(|_| "{}".to_string());
+    let received = ts_utc("created_at");
+    let row = client
+        .query_opt(
+            &format!(
+                "INSERT INTO operations
+                   (org_id, operation_id, actor_user_id, device_id, source, kind, status,
+                    base_version_id, node_id, idempotency_key, request_id, payload_json)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11::text::jsonb)
+                 ON CONFLICT (org_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+                 DO NOTHING
+                 RETURNING operation_id, status, idempotency_key, {received}"
+            ),
+            &[
+                &subject.org_id,
+                &operation_id,
+                &subject.user_id,
+                &body.device_id,
+                &body.source,
+                &body.kind,
+                &body.base_version_id,
+                &body.node_id,
+                &body.idempotency_key,
+                &req_id,
+                &params_json,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("operation_store_unavailable", "could not record operation"),
+            )
+        })?;
+    match row {
+        Some(row) => {
+            let operation_id: String = row.get("operation_id");
+            let status: String = row.get("status");
+            let idempotency_key: Option<String> = row.get("idempotency_key");
+            let received_at: String = row.get("created_at");
+            Ok(OperationSubmitResponse {
+                operation_id,
+                status,
+                idempotency_key,
+                received_at,
+            })
+        }
+        // Race loser: a concurrent submission with the same idempotency key
+        // won the unique index between our pre-read and this INSERT. Replay the
+        // existing operation instead of returning operation_store_unavailable.
+        // The payload mismatch check applies here too: if the concurrent winner
+        // recorded different params under the same key, this submission must
+        // still be rejected rather than return the wrong operation.
+        None => {
+            let key = body.idempotency_key.as_deref().ok_or_else(|| {
+                (
+                    503,
+                    ApiError::new(
+                        "operation_store_unavailable",
+                        "operation insert returned no row and no idempotency_key to replay",
+                    ),
+                )
+            })?;
+            let existing = lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?
+                .ok_or_else(|| {
+                    (
+                        503,
+                        ApiError::new(
+                            "operation_store_unavailable",
+                            "operation conflicted but the existing row could not be read",
+                        ),
+                    )
+                })?;
+            verify_idempotency_payload_match(&existing, &body, key)?;
+            Ok(existing.response)
+        }
+    }
+}
+
+fn lookup_operation_by_idempotency(
+    client: &mut Client,
+    org_id: &str,
+    key: &str,
+) -> Result<Option<ExistingOperation>, (u16, ApiError)> {
+    let created = ts_utc("created_at");
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT operation_id, status, idempotency_key, kind, source, node_id,
+                        base_version_id, device_id, payload_json::text AS payload_json_text,
+                        {created}
+                 FROM operations
+                 WHERE org_id = $1 AND idempotency_key = $2
+                 LIMIT 1"
+            ),
+            &[&org_id, &key],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("operation_store_unavailable", "could not look up operation"),
+            )
+        })?;
+    Ok(row.map(|row| {
+        // The synchronous postgres driver has no serde_json feature gate, so
+        // payload_json is read as text (jsonb canonical output) and parsed in
+        // Rust. Parsing failures fall back to Value::Null, which will not hash
+        // equal to any real submission, so a corrupt row fails closed as a
+        // payload mismatch rather than silently replaying.
+        let payload_text: String = row.get("payload_json_text");
+        let payload = serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null);
+        ExistingOperation {
+            response: OperationSubmitResponse {
+                operation_id: row.get("operation_id"),
+                status: row.get("status"),
+                idempotency_key: row.get("idempotency_key"),
+                received_at: row.get("created_at"),
+            },
+            kind: row.get("kind"),
+            source: row.get("source"),
+            node_id: row.get("node_id"),
+            base_version_id: row.get("base_version_id"),
+            device_id: row.get("device_id"),
+            payload,
+        }
+    }))
+}
+
+/// An existing operation located by idempotency key: the replayable response
+/// plus the stored semantic request fields needed to verify a replay carries
+/// the same identity. `payload` is the jsonb-canonical `params` value read
+/// back from `payload_json`; the scalar fields come from their TEXT columns,
+/// which round-trip exactly without jsonb normalization.
+#[derive(Debug, Clone)]
+struct ExistingOperation {
+    response: OperationSubmitResponse,
+    kind: String,
+    source: String,
+    node_id: Option<String>,
+    base_version_id: Option<String>,
+    device_id: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Stable SHA-256 digest of an operation's submitted params, used to reject
+/// idempotency replays that carry a different payload than the original
+/// submission. The canonical form is serde_json's default serialization, which
+/// sorts object keys (serde_json::Map is BTreeMap-backed unless the
+/// `preserve_order` feature is enabled, which this workspace does not), so the
+/// digest is independent of client-side key ordering and whitespace.
+fn payload_hash(params: &serde_json::Value) -> String {
+    let canonical = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+    hex_lower(&Sha256::digest(canonical.as_bytes()))
+}
+
+/// Canonical JSON value of an operation's full semantic request: every field
+/// that must be identical for an idempotency-key replay to return the original
+/// operation rather than be rejected. serde_json::Map is BTreeMap-backed in
+/// this workspace, so the serialized form sorts object keys and the value is
+/// independent of client-side key ordering and whitespace.
+fn semantic_payload_value(
+    kind: &str,
+    source: &str,
+    node_id: Option<&str>,
+    base_version_id: Option<&str>,
+    device_id: Option<&str>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "base_version_id": base_version_id,
+        "device_id": device_id,
+        "kind": kind,
+        "node_id": node_id,
+        "params": params,
+        "source": source,
+    })
+}
+
+/// Reject an idempotency replay whose full semantic request differs from the
+/// stored operation. A reused idempotency_key must return the original
+/// operation only when kind, source, node_id, base_version_id, device_id, AND
+/// params all match; otherwise a stale key reuse (e.g. same params but a
+/// different kind) would silently return the wrong operation. Both sides are
+/// reduced to a canonical JSON value and hashed through `payload_hash`, so the
+/// comparison is invariant under key reordering. The diverging field is
+/// included in the error detail when it can be identified cheaply.
+fn verify_idempotency_payload_match(
+    existing: &ExistingOperation,
+    submitted: &OperationSubmitBody,
+    idempotency_key: &str,
+) -> Result<(), (u16, ApiError)> {
+    let existing_hash = payload_hash(&semantic_payload_value(
+        &existing.kind,
+        &existing.source,
+        existing.node_id.as_deref(),
+        existing.base_version_id.as_deref(),
+        existing.device_id.as_deref(),
+        &existing.payload,
+    ));
+    let submitted_hash = payload_hash(&semantic_payload_value(
+        &submitted.kind,
+        &submitted.source,
+        submitted.node_id.as_deref(),
+        submitted.base_version_id.as_deref(),
+        submitted.device_id.as_deref(),
+        &submitted.params,
+    ));
+    if existing_hash == submitted_hash {
+        return Ok(());
+    }
+    let details = match semantic_divergence_field(existing, submitted) {
+        Some(field) => serde_json::json!({
+            "idempotency_key": idempotency_key,
+            "field": field,
+        }),
+        None => serde_json::json!({ "idempotency_key": idempotency_key }),
+    };
+    Err((
+        409,
+        ApiError::with_details(
+            "operation_idempotency_payload_mismatch",
+            "an operation with this idempotency_key already exists with a different semantic request",
+            details,
+        ),
+    ))
+}
+
+/// Identify the first semantic field that differs between a stored operation
+/// and a resubmitted body, to populate the mismatch error's `field` detail.
+/// Diagnostics-only: the match decision is the canonical-hash comparison in
+/// `verify_idempotency_payload_match`. `params` is compared through
+/// `payload_hash` so key reordering does not register as a divergence. Returns
+/// `None` only when every semantic field agrees, which for these field types
+/// implies the canonical hashes also agree.
+fn semantic_divergence_field(
+    existing: &ExistingOperation,
+    submitted: &OperationSubmitBody,
+) -> Option<&'static str> {
+    if existing.kind != submitted.kind {
+        return Some("kind");
+    }
+    if existing.source != submitted.source {
+        return Some("source");
+    }
+    if existing.node_id.as_deref() != submitted.node_id.as_deref() {
+        return Some("node_id");
+    }
+    if existing.base_version_id.as_deref() != submitted.base_version_id.as_deref() {
+        return Some("base_version_id");
+    }
+    if existing.device_id.as_deref() != submitted.device_id.as_deref() {
+        return Some("device_id");
+    }
+    if payload_hash(&existing.payload) != payload_hash(&submitted.params) {
+        return Some("params");
+    }
+    None
+}
+
+// ===== Trash =====
+
+fn trash_list_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.trash.list";
+    match trash_list_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrashListQuery {
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_trash_list_query(query: &str) -> Result<TrashListQuery, (u16, ApiError)> {
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(&decoded, &["trashed", "restored", "purged"])?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(TrashListQuery { status, limit })
+}
+
+fn trash_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<TrashListResponse, (u16, ApiError)> {
+    let query_params = parse_trash_list_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "trash requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_trash_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read trash"),
+        ));
+    }
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let deleted = ts_utc("deleted_at");
+    let purge_after = ts_utc("purge_after");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT trash_id, node_id, original_parent_node_id, original_name,
+                        deleted_version_id, deleted_by, status, {deleted}, {purge_after}
+                 FROM trash_records
+                 WHERE org_id = $1 AND ($2::text IS NULL OR status = $2)
+                 ORDER BY deleted_at DESC
+                 LIMIT $3"
+            ),
+            &[&subject.org_id, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("trash_store_unavailable", "could not list trash"),
+            )
+        })?;
+    let trash = rows
+        .into_iter()
+        .map(|row| TrashSummary {
+            trash_id: row.get("trash_id"),
+            node_id: row.get("node_id"),
+            original_parent_node_id: row.get("original_parent_node_id"),
+            original_name: row.get("original_name"),
+            deleted_version_id: row.get("deleted_version_id"),
+            deleted_by: row.get("deleted_by"),
+            status: row.get("status"),
+            deleted_at: row.get("deleted_at"),
+            purge_after: row.get("purge_after"),
+        })
+        .collect();
+    Ok(TrashListResponse {
+        trash,
+        limit: query_params.limit,
+    })
+}
+
+// ===== Audit events =====
+
+fn audit_events_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.audit.events";
+    match audit_events_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditEventsQuery {
+    event_type: Option<String>,
+    actor_user_id: Option<String>,
+    source: Option<String>,
+    limit: u32,
+}
+
+fn parse_audit_events_query(query: &str) -> Result<AuditEventsQuery, (u16, ApiError)> {
+    let mut event_type = None;
+    let mut actor_user_id = None;
+    let mut source = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "event_type" | "type" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_event_type(&decoded)?;
+                event_type = Some(decoded);
+            }
+            "actor" | "actor_user_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_opaque_id(&decoded, "invalid_actor", "actor_user_id")?;
+                actor_user_id = Some(decoded);
+            }
+            "source" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_file_source(&decoded)?;
+                source = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(AuditEventsQuery {
+        event_type,
+        actor_user_id,
+        source,
+        limit,
+    })
+}
+
+fn validate_event_type(event_type: &str) -> Result<(), (u16, ApiError)> {
+    let valid = event_type.len() <= 128
+        && event_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            400,
+            ApiError::new("invalid_event_type", "event_type is not valid"),
+        ))
+    }
+}
+
+fn audit_events_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<AuditEventsResponse, (u16, ApiError)> {
+    let query_params = parse_audit_events_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "audit requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_audit_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new(
+                "auth_scope_missing",
+                "bearer token cannot read audit events",
+            ),
+        ));
+    }
+    let event_type_filter = query_params.event_type.as_deref();
+    let actor_filter = query_params.actor_user_id.as_deref();
+    let source_filter = query_params.source.as_deref();
+    let limit = i64::from(query_params.limit);
+    let occurred = ts_utc("occurred_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT audit_event_id, event_type, actor_user_id, device_id, source, node_id,
+                        operation_id, request_id, {occurred}
+                 FROM audit_events
+                 WHERE org_id = $1
+                   AND ($2::text IS NULL OR event_type = $2)
+                   AND ($3::text IS NULL OR actor_user_id = $3)
+                   AND ($4::text IS NULL OR source = $4)
+                 ORDER BY occurred_at DESC
+                 LIMIT $5"
+            ),
+            &[
+                &subject.org_id,
+                &event_type_filter,
+                &actor_filter,
+                &source_filter,
+                &limit,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("audit_store_unavailable", "could not list audit events"),
+            )
+        })?;
+    let events = rows
+        .into_iter()
+        .map(|row| AuditEventSummary {
+            audit_event_id: row.get("audit_event_id"),
+            event_type: row.get("event_type"),
+            actor_user_id: row.get("actor_user_id"),
+            device_id: row.get("device_id"),
+            source: row.get("source"),
+            node_id: row.get("node_id"),
+            operation_id: row.get("operation_id"),
+            request_id: row.get("request_id"),
+            occurred_at: row.get("occurred_at"),
+        })
+        .collect();
+    Ok(AuditEventsResponse {
+        events,
+        limit: query_params.limit,
+    })
+}
+
+// ===== Devices =====
+
+fn devices_list_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.devices.list";
+    match devices_list_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceListQuery {
+    user_id: Option<String>,
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_device_list_query(query: &str) -> Result<DeviceListQuery, (u16, ApiError)> {
+    let mut user_id = None;
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "user" | "user_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_opaque_id(&decoded, "invalid_user_id", "user_id")?;
+                user_id = Some(decoded);
+            }
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(&decoded, &["active", "revoked", "lost"])?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(DeviceListQuery {
+        user_id,
+        status,
+        limit,
+    })
+}
+
+fn devices_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<DeviceListResponse, (u16, ApiError)> {
+    let query_params = parse_device_list_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "device requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_devices_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read devices"),
+        ));
+    }
+    let user_filter = query_params.user_id.as_deref();
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let enrolled = ts_utc("enrolled_at");
+    let last_seen = ts_utc("last_seen_at");
+    let revoked = ts_utc("revoked_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT device_id, user_id, display_name, platform, hostname, status,
+                        {enrolled}, {last_seen}, {revoked}
+                 FROM devices
+                 WHERE org_id = $1
+                   AND ($2::text IS NULL OR user_id = $2)
+                   AND ($3::text IS NULL OR status = $3)
+                 ORDER BY enrolled_at DESC
+                 LIMIT $4"
+            ),
+            &[&subject.org_id, &user_filter, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("device_store_unavailable", "could not list devices"),
+            )
+        })?;
+    let devices = rows
+        .into_iter()
+        .map(|row| DeviceSummary {
+            device_id: row.get("device_id"),
+            user_id: row.get("user_id"),
+            display_name: row.get("display_name"),
+            platform: row.get("platform"),
+            hostname: row.get("hostname"),
+            status: row.get("status"),
+            enrolled_at: row.get("enrolled_at"),
+            last_seen_at: row.get("last_seen_at"),
+            revoked_at: row.get("revoked_at"),
+        })
+        .collect();
+    Ok(DeviceListResponse {
+        devices,
+        limit: query_params.limit,
+    })
+}
+
+// ===== Projects =====
+
+fn projects_list_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.projects.list";
+    match projects_list_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimpleStatusListQuery {
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_simple_status_list_query(
+    query: &str,
+    allowed_statuses: &[&str],
+) -> Result<SimpleStatusListQuery, (u16, ApiError)> {
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(&decoded, allowed_statuses)?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(SimpleStatusListQuery { status, limit })
+}
+
+fn projects_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<ProjectListResponse, (u16, ApiError)> {
+    let query_params = parse_simple_status_list_query(query, &["active", "archived"])?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "project requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_projects_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read projects"),
+        ));
+    }
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let created = ts_utc("created_at");
+    let updated = ts_utc("updated_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT project_id, root_node_id, name, code, status, {created}, {updated}
+                 FROM projects
+                 WHERE org_id = $1 AND ($2::text IS NULL OR status = $2)
+                 ORDER BY created_at DESC
+                 LIMIT $3"
+            ),
+            &[&subject.org_id, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("project_store_unavailable", "could not list projects"),
+            )
+        })?;
+    let projects = rows
+        .into_iter()
+        .map(|row| ProjectSummary {
+            project_id: row.get("project_id"),
+            root_node_id: row.get("root_node_id"),
+            name: row.get("name"),
+            code: row.get("code"),
+            status: row.get("status"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+    Ok(ProjectListResponse {
+        projects,
+        limit: query_params.limit,
+    })
+}
+
+// ===== Worksets =====
+
+fn worksets_list_response(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    let operation = "server.worksets.list";
+    match worksets_list_payload(query, headers, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok(operation, payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(operation, error, Source::Server),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorksetListQuery {
+    project_id: Option<String>,
+    status: Option<String>,
+    limit: u32,
+}
+
+fn parse_workset_list_query(query: &str) -> Result<WorksetListQuery, (u16, ApiError)> {
+    let mut project_id = None;
+    let mut status = None;
+    let mut limit = DEFAULT_LIST_LIMIT;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "project" | "project_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_opaque_id(&decoded, "invalid_project_id", "project_id")?;
+                project_id = Some(decoded);
+            }
+            "status" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_status_filter(&decoded, &["active", "archived"])?;
+                status = Some(decoded);
+            }
+            "limit" if !value.trim().is_empty() => {
+                limit = parse_limit_value(value.trim())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(WorksetListQuery {
+        project_id,
+        status,
+        limit,
+    })
+}
+
+fn worksets_list_payload(
+    query: &str,
+    headers: &[(String, String)],
+    config: &RuntimeConfig,
+) -> Result<WorksetListResponse, (u16, ApiError)> {
+    let query_params = parse_workset_list_query(query)?;
+    let bearer = bearer_token(headers).ok_or_else(|| (401, auth_required_error()))?;
+    let mut client = connect_for_payload(config, "workset requests")?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_worksets_read(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot read worksets"),
+        ));
+    }
+    let project_filter = query_params.project_id.as_deref();
+    let status_filter = query_params.status.as_deref();
+    let limit = i64::from(query_params.limit);
+    let created = ts_utc("created_at");
+    let updated = ts_utc("updated_at");
+    let rows = client
+        .query(
+            &format!(
+                "SELECT workset_id, project_id, name, description, status, source, created_by,
+                        {created}, {updated}
+                 FROM worksets
+                 WHERE org_id = $1
+                   AND ($2::text IS NULL OR project_id = $2)
+                   AND ($3::text IS NULL OR status = $3)
+                 ORDER BY created_at DESC
+                 LIMIT $4"
+            ),
+            &[&subject.org_id, &project_filter, &status_filter, &limit],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("workset_store_unavailable", "could not list worksets"),
+            )
+        })?;
+    let worksets = rows
+        .into_iter()
+        .map(|row| WorksetSummary {
+            workset_id: row.get("workset_id"),
+            project_id: row.get("project_id"),
+            name: row.get("name"),
+            description: row.get("description"),
+            status: row.get("status"),
+            source: row.get("source"),
+            created_by: row.get("created_by"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+    Ok(WorksetListResponse {
+        worksets,
+        limit: query_params.limit,
+    })
 }
 
 fn file_content_put_payload(
@@ -1653,6 +3573,62 @@ fn scopes_allow_file_write(scopes_json: &str) -> bool {
     scopes_allow_any(scopes_json, &["file:write", "file:*", "server:write"])
 }
 
+fn scopes_allow_lock_read(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["lock:read", "lock:*", "server:read"])
+}
+
+fn scopes_allow_lock_write(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["lock:write", "lock:*", "server:write"])
+}
+
+fn scopes_allow_conflict_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &[
+            "conflict:read",
+            "conflict:*",
+            "namespace:read",
+            "server:read",
+        ],
+    )
+}
+
+fn scopes_allow_operation_write(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["operation:write", "operation:*", "server:write"],
+    )
+}
+
+fn scopes_allow_trash_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["trash:read", "trash:*", "namespace:read", "server:read"],
+    )
+}
+
+fn scopes_allow_audit_read(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["audit:read", "audit:*", "server:read"])
+}
+
+fn scopes_allow_devices_read(scopes_json: &str) -> bool {
+    scopes_allow_any(scopes_json, &["device:read", "device:*", "server:read"])
+}
+
+fn scopes_allow_projects_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["project:read", "project:*", "namespace:read", "server:read"],
+    )
+}
+
+fn scopes_allow_worksets_read(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &["workset:read", "workset:*", "namespace:read", "server:read"],
+    )
+}
+
 fn scopes_allow_any(scopes_json: &str, allowed_scopes: &[&str]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(scopes_json) else {
         return false;
@@ -2609,6 +4585,11 @@ fn migrations() -> &'static [Migration] {
             name: "token_secret_hash_unique",
             sql: include_str!("../migrations/002_token_secret_hash_unique.sql"),
         },
+        Migration {
+            version: "003",
+            name: "metadata_baseline",
+            sql: include_str!("../migrations/003_metadata_baseline.sql"),
+        },
     ]
 }
 
@@ -2626,9 +4607,21 @@ fn checksum_sql(sql: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    // Normalize CRLF -> LF before hashing so LF and CRLF checkouts of the
+    // bundled migrations produce identical checksums. Without this, a database
+    // migrated on one platform (e.g. Linux LF) would fail verify on another
+    // (e.g. Windows CRLF) because the raw SQL bytes differ. The runner applies
+    // and verifies against the same normalized bytes, so it stays internally
+    // consistent. This changes the recorded checksum of every bundled
+    // migration, so a dev database previously migrated with the raw-byte
+    // checksum needs a fresh `migrate`; smoke runs against ephemeral
+    // containers, so there is no production data to preserve.
     let mut hash = FNV_OFFSET;
-    for byte in sql.as_bytes() {
-        hash ^= u64::from(*byte);
+    for &byte in sql.as_bytes() {
+        if byte == b'\r' {
+            continue;
+        }
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("fnv1a64:{hash:016x}")
@@ -2727,14 +4720,14 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
     let method = request_line.split_whitespace().next().unwrap_or_default();
     let path = request_line.split_whitespace().nth(1).unwrap_or_default();
 
-    if method != "GET" && method != "PUT" {
+    if !matches!(method, "GET" | "PUT" | "POST" | "DELETE") {
         let (_status_code, body) = json_response(
             405,
             &ServerResponseEnvelope::<serde_json::Value>::error(
                 "server.request",
                 ApiError::new(
                     "method_not_allowed",
-                    "server accepts GET and bounded PUT requests",
+                    "server accepts GET, POST, DELETE, and bounded PUT requests",
                 ),
                 Source::Server,
             ),
@@ -2743,11 +4736,12 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
     }
 
     let (route_path, _) = split_path_and_query(path);
-    let should_read_body = method == "PUT"
+    let should_read_body = (method == "PUT"
         && matches!(
             route_path,
             "/api/v1/objects/content" | "/api/v1/files/content"
-        );
+        ))
+        || (method == "POST" && matches!(route_path, "/api/v1/locks" | "/api/v1/operations"));
     let body_bytes = if should_read_body {
         reader
             .get_mut()
@@ -2866,6 +4860,7 @@ fn reason_phrase(status_code: u16) -> &'static str {
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
@@ -3207,5 +5202,951 @@ mod tests {
         assert_eq!(summary.version, "001");
         assert_eq!(summary.name, "baseline");
         assert!(summary.checksum.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn migration_003_is_registered_with_expected_identity() {
+        let migration = migrations()
+            .iter()
+            .find(|migration| migration.version == "003")
+            .expect("migration 003 is registered");
+        assert_eq!(migration.name, "metadata_baseline");
+        assert!(migration.summary().checksum.starts_with("fnv1a64:"));
+        assert_eq!(migrations().len(), 3);
+    }
+
+    #[test]
+    fn migration_003_has_required_metadata_tables() {
+        // Normalize CRLF -> LF so the multi-line assertion below is stable on
+        // Windows checkouts, where the bundled SQL may be read via include_str!
+        // with `\r\n` line endings and the literal "\n    " substring would not
+        // match otherwise.
+        let sql = migrations()
+            .iter()
+            .find(|migration| migration.version == "003")
+            .expect("migration 003 is registered")
+            .sql
+            .replace('\r', "");
+        for table in [
+            "devices",
+            "projects",
+            "worksets",
+            "workset_rules",
+            "retention_policies",
+            "snapshots",
+            "locks",
+            "conflicts",
+            "grants",
+            "shares",
+            "publishes",
+            "invites",
+            "trash_records",
+        ] {
+            let needle = format!("CREATE TABLE {table}");
+            assert!(sql.contains(&needle), "migration 003 missing {table}");
+        }
+        // New tables stay org-scoped like 001.
+        assert!(sql.contains("REFERENCES organizations(org_id) ON DELETE RESTRICT"));
+        // Snapshots reuse the lowercase status text convention from 001.
+        assert!(
+            sql.contains("CHECK (status IN ('creating', 'ready', 'failed', 'expired', 'purged'))")
+        );
+        // Locks keep the node_id optional for offline provisional IDs.
+        assert!(sql.contains("node_id TEXT,\n    provisional_local_id TEXT"));
+        // No raw secrets or DOWN section in the new migration.
+        assert!(!sql.contains("password"));
+        assert!(!sql.contains("secret"));
+    }
+
+    fn no_database_config() -> RuntimeConfig {
+        // from_lookup never reads config files; returning None for every env
+        // key yields database.url_set = false and no object-store endpoint,
+        // so authenticated spine routes fail closed at the connect step.
+        RuntimeConfig::from_lookup(|_| None)
+    }
+
+    fn dispatch_with(
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> (u16, String) {
+        dispatch_http_request_with_config(method, path, headers, body, &no_database_config())
+    }
+
+    fn assert_server_envelope(ok: bool, body: &str, operation: &str) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_str(body).expect("valid json");
+        assert_eq!(value["ok"], ok, "operation {operation}: {body}");
+        assert_eq!(
+            value["operation"], operation,
+            "operation {operation}: {body}"
+        );
+        assert_eq!(
+            value["meta"]["schema_version"], SERVER_SCHEMA_VERSION,
+            "operation {operation}: {body}"
+        );
+        value
+    }
+
+    #[test]
+    fn dispatch_locks_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/locks", &[], &[]);
+        assert_eq!(status, 401);
+        let value = assert_server_envelope(false, &body, "server.locks.list");
+        assert_eq!(value["error"]["code"], "auth_required");
+    }
+
+    #[test]
+    fn dispatch_locks_list_with_bearer_fails_closed_without_database() {
+        let headers = vec![(
+            "Authorization".to_string(),
+            "Bearer smoke-lock-token".to_string(),
+        )];
+        let (status, body) = dispatch_with("GET", "/api/v1/locks", &headers, &[]);
+        assert_eq!(status, 503);
+        let value = assert_server_envelope(false, &body, "server.locks.list");
+        // Auth runs before any store write, so the bearer secret is never echoed.
+        assert_eq!(value["error"]["code"], "database_url_missing");
+        assert!(!body.contains("smoke-lock-token"));
+    }
+
+    #[test]
+    fn dispatch_locks_acquire_requires_bearer_after_body_parse() {
+        let body = br#"{"kind":"edit"}"#;
+        let (status, body) = dispatch_with("POST", "/api/v1/locks", &[], body);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.locks.acquire");
+    }
+
+    #[test]
+    fn dispatch_locks_acquire_rejects_invalid_kind_before_auth() {
+        let body = br#"{"kind":"nope"}"#;
+        let (status, body) = dispatch_with("POST", "/api/v1/locks", &[], body);
+        assert_eq!(status, 400);
+        let value = assert_server_envelope(false, &body, "server.locks.acquire");
+        assert_eq!(value["error"]["code"], "invalid_lock_kind");
+    }
+
+    #[test]
+    fn dispatch_locks_acquire_rejects_oversized_ttl() {
+        let body = br#"{"kind":"edit","ttl_seconds":99999999}"#;
+        let (status, _body) = dispatch_with("POST", "/api/v1/locks", &[], body);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn dispatch_locks_release_requires_lock_id() {
+        let (status, body) = dispatch_with("DELETE", "/api/v1/locks", &[], &[]);
+        assert_eq!(status, 400);
+        let value = assert_server_envelope(false, &body, "server.locks.release");
+        assert_eq!(value["error"]["code"], "lock_id_required");
+    }
+
+    #[test]
+    fn dispatch_locks_release_requires_bearer_with_lock_id() {
+        let (status, body) = dispatch_with("DELETE", "/api/v1/locks?lock_id=lock_abc", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.locks.release");
+    }
+
+    #[test]
+    fn dispatch_conflicts_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/conflicts", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.conflicts.list");
+    }
+
+    #[test]
+    fn dispatch_conflicts_show_routes_by_conflict_id() {
+        let (status, body) =
+            dispatch_with("GET", "/api/v1/conflicts?conflict_id=conf_xyz", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.conflicts.show");
+    }
+
+    #[test]
+    fn dispatch_operations_submit_requires_bearer_after_body_parse() {
+        let body = br#"{"kind":"file.write"}"#;
+        let (status, body) = dispatch_with("POST", "/api/v1/operations", &[], body);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.operations.submit");
+    }
+
+    #[test]
+    fn dispatch_operations_submit_rejects_invalid_kind() {
+        let body = br#"{"kind":"bad kind"}"#;
+        let (status, body) = dispatch_with("POST", "/api/v1/operations", &[], body);
+        assert_eq!(status, 400);
+        let value = assert_server_envelope(false, &body, "server.operations.submit");
+        assert_eq!(value["error"]["code"], "invalid_operation_kind");
+    }
+
+    #[test]
+    fn dispatch_trash_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/trash", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.trash.list");
+    }
+
+    #[test]
+    fn dispatch_audit_events_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/audit/events", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.audit.events");
+    }
+
+    #[test]
+    fn dispatch_devices_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/devices", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.devices.list");
+    }
+
+    #[test]
+    fn dispatch_projects_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/projects", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.projects.list");
+    }
+
+    #[test]
+    fn dispatch_worksets_list_requires_bearer() {
+        let (status, body) = dispatch_with("GET", "/api/v1/worksets", &[], &[]);
+        assert_eq!(status, 401);
+        assert_server_envelope(false, &body, "server.worksets.list");
+    }
+
+    #[test]
+    fn periphery_routes_return_operation_not_implemented() {
+        for (method, path, operation) in [
+            ("POST", "/api/v1/snapshots", "server.snapshots.create"),
+            ("POST", "/api/v1/snapshots/mount", "server.snapshots.mount"),
+            (
+                "POST",
+                "/api/v1/snapshots/restore",
+                "server.snapshots.restore",
+            ),
+            ("GET", "/api/v1/snapshots", "server.snapshots.list"),
+            ("POST", "/api/v1/transfers", "server.transfers.create"),
+            (
+                "POST",
+                "/api/v1/transfers/commit",
+                "server.transfers.commit",
+            ),
+            ("POST", "/api/v1/devices/revoke", "server.devices.revoke"),
+            ("POST", "/api/v1/projects", "server.projects.create"),
+            ("POST", "/api/v1/worksets", "server.worksets.create"),
+            ("POST", "/api/v1/trash/restore", "server.trash.restore"),
+            ("POST", "/api/v1/trash/purge", "server.trash.purge"),
+            (
+                "POST",
+                "/api/v1/operations/replay",
+                "server.operations.replay",
+            ),
+            ("GET", "/api/v1/audit/export", "server.audit.export"),
+            ("GET", "/api/v1/grants", "server.grants.list"),
+            ("POST", "/api/v1/grants", "server.grants.set"),
+            ("DELETE", "/api/v1/grants", "server.grants.revoke"),
+            ("GET", "/api/v1/shares", "server.shares.list"),
+            ("POST", "/api/v1/shares", "server.shares.create"),
+            ("DELETE", "/api/v1/shares", "server.shares.revoke"),
+            ("GET", "/api/v1/publishes", "server.publishes.list"),
+            ("POST", "/api/v1/publishes", "server.publishes.create"),
+            ("DELETE", "/api/v1/publishes", "server.publishes.revoke"),
+            ("GET", "/api/v1/invites", "server.invites.list"),
+            ("POST", "/api/v1/invites", "server.invites.create"),
+            ("DELETE", "/api/v1/invites", "server.invites.revoke"),
+            ("GET", "/api/v1/nodes/stat", "server.nodes.stat"),
+            ("POST", "/api/v1/nodes/mkdir", "server.nodes.mkdir"),
+            ("POST", "/api/v1/nodes/symlink", "server.nodes.symlink"),
+            ("POST", "/api/v1/nodes/move", "server.nodes.move"),
+            ("POST", "/api/v1/nodes/copy", "server.nodes.copy"),
+            ("DELETE", "/api/v1/nodes", "server.nodes.delete"),
+            (
+                "POST",
+                "/api/v1/auth/device/enroll",
+                "server.auth.device.enroll",
+            ),
+            (
+                "POST",
+                "/api/v1/auth/login_token",
+                "server.auth.login_token",
+            ),
+        ] {
+            let (status, body) = dispatch_with(method, path, &[], &[]);
+            assert_eq!(status, 501, "{method} {path}: {body}");
+            let value = assert_server_envelope(false, &body, operation);
+            assert_eq!(
+                value["error"]["code"], "operation_not_implemented",
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_route_with_wrong_method_returns_method_not_allowed() {
+        // GET on a POST-only collection is a 405, not a 404.
+        let (status, body) = dispatch_with("GET", "/api/v1/operations", &[], &[]);
+        assert_eq!(status, 405);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "method_not_allowed");
+    }
+
+    #[test]
+    fn spine_scope_helpers_distinguish_read_and_write() {
+        assert!(scopes_allow_lock_read(r#"["lock:read"]"#));
+        assert!(scopes_allow_lock_write(r#"["lock:write"]"#));
+        assert!(!scopes_allow_lock_write(r#"["lock:read"]"#));
+        assert!(scopes_allow_conflict_read(r#"["conflict:read"]"#));
+        assert!(scopes_allow_conflict_read(r#"["namespace:read"]"#));
+        assert!(!scopes_allow_conflict_read(r#"["lock:read"]"#));
+        assert!(scopes_allow_operation_write(r#"["operation:write"]"#));
+        assert!(!scopes_allow_operation_write(r#"["operation:read"]"#));
+        assert!(scopes_allow_trash_read(r#"["trash:read"]"#));
+        assert!(scopes_allow_audit_read(r#"["audit:read"]"#));
+        assert!(scopes_allow_devices_read(r#"["device:read"]"#));
+        assert!(scopes_allow_projects_read(r#"["project:read"]"#));
+        assert!(scopes_allow_worksets_read(r#"["workset:read"]"#));
+        // Every scope helper honors the wildcard.
+        assert!(scopes_allow_lock_read(r#"["*"]"#));
+        assert!(scopes_allow_lock_write(r#"["*"]"#));
+        assert!(scopes_allow_operation_write(r#"["*"]"#));
+    }
+
+    #[test]
+    fn lock_acquire_body_defaults_edit_kind_and_ttl() {
+        let body: LockAcquireBody = serde_json::from_str(r#"{}"#).expect("defaults apply");
+        assert_eq!(body.kind, "edit");
+        assert_eq!(body.ttl_seconds, DEFAULT_LOCK_TTL_SECONDS);
+        assert!(body.node_id.is_none());
+    }
+
+    #[test]
+    fn lock_ttl_seconds_enforces_upper_bound() {
+        assert!(lock_ttl_seconds(0).is_ok());
+        assert!(lock_ttl_seconds(MAX_LOCK_TTL_SECONDS).is_ok());
+        let error = lock_ttl_seconds(MAX_LOCK_TTL_SECONDS + 1).expect_err("oversized ttl rejected");
+        assert_eq!(error.1.code, "invalid_lock_ttl");
+    }
+
+    #[test]
+    fn idempotency_key_validator_rejects_garbage() {
+        assert!(validate_idempotency_key("abc_123-456").is_ok());
+        // empty
+        assert_eq!(
+            validate_idempotency_key("").expect_err("empty key").1.code,
+            "invalid_idempotency_key"
+        );
+        // disallowed characters
+        assert_eq!(
+            validate_idempotency_key("bad key!")
+                .expect_err("bad charset")
+                .1
+                .code,
+            "invalid_idempotency_key"
+        );
+    }
+
+    #[test]
+    fn payload_hash_is_key_order_independent() {
+        // serde_json::Map is BTreeMap-backed in this workspace, so the canonical
+        // serialization sorts keys and the digest is stable under reordering.
+        let a = payload_hash(&serde_json::json!({"foo": "bar", "count": 3}));
+        let b = payload_hash(&serde_json::json!({"count": 3, "foo": "bar"}));
+        assert_eq!(a, b);
+        // SHA-256 hex digest is 64 lowercase characters.
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn payload_hash_distinguishes_different_payloads() {
+        let a = payload_hash(&serde_json::json!({"foo": "bar"}));
+        let b = payload_hash(&serde_json::json!({"foo": "baz"}));
+        assert_ne!(a, b);
+        // SHA-256 hex digest is 64 chars; the empty-params digest is non-empty.
+        assert_eq!(payload_hash(&serde_json::json!({})).len(), 64);
+    }
+
+    fn existing_operation_fixture(payload: serde_json::Value) -> ExistingOperation {
+        ExistingOperation {
+            response: OperationSubmitResponse {
+                operation_id: "op_existing".to_string(),
+                status: "pending".to_string(),
+                idempotency_key: Some("key-existing".to_string()),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            kind: "file.write".to_string(),
+            source: "api".to_string(),
+            node_id: Some("node-1".to_string()),
+            base_version_id: None,
+            device_id: None,
+            payload,
+        }
+    }
+
+    // Default submission body whose semantic fields mirror `existing_operation_fixture`
+    // so a test can flip a single field and assert a targeted mismatch.
+    fn operation_submit_body_fixture(params: serde_json::Value) -> OperationSubmitBody {
+        OperationSubmitBody {
+            kind: "file.write".to_string(),
+            source: "api".to_string(),
+            device_id: None,
+            node_id: Some("node-1".to_string()),
+            base_version_id: None,
+            idempotency_key: Some("key-existing".to_string()),
+            params,
+        }
+    }
+
+    #[test]
+    fn idempotency_payload_match_allows_identical_request() {
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let body = operation_submit_body_fixture(serde_json::json!({"foo": "bar"}));
+        assert!(
+            verify_idempotency_payload_match(&existing, &body, "key-existing").is_ok(),
+            "identical semantic request must replay cleanly"
+        );
+    }
+
+    #[test]
+    fn idempotency_payload_match_rejects_mismatched_params() {
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let body = operation_submit_body_fixture(serde_json::json!({"foo": "baz"}));
+        let (status, error) = verify_idempotency_payload_match(&existing, &body, "key-existing")
+            .expect_err("mismatched params must be rejected");
+        assert_eq!(status, 409);
+        assert_eq!(error.code, "operation_idempotency_payload_mismatch");
+        let details = error.details.expect("details carry the diverging field");
+        assert_eq!(details["idempotency_key"], "key-existing");
+        assert_eq!(details["field"], "params");
+    }
+
+    #[test]
+    fn idempotency_payload_match_rejects_mismatched_kind() {
+        // SAFETY: replaying the same idempotency_key with the SAME params but a
+        // DIFFERENT kind must be rejected, not silently replayed. Before the
+        // full semantic comparison covered kind, this returned the original
+        // operation instead of a 409.
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let mut body = operation_submit_body_fixture(serde_json::json!({"foo": "bar"}));
+        body.kind = "file.delete".to_string();
+        let (status, error) = verify_idempotency_payload_match(&existing, &body, "key-existing")
+            .expect_err("mismatched kind must be rejected");
+        assert_eq!(status, 409);
+        assert_eq!(error.code, "operation_idempotency_payload_mismatch");
+        let details = error.details.expect("details carry the diverging field");
+        assert_eq!(details["idempotency_key"], "key-existing");
+        assert_eq!(details["field"], "kind");
+    }
+
+    #[test]
+    fn checksum_sql_is_line_ending_independent() {
+        // LF and CRLF variants of the same SQL must produce identical
+        // checksums so cross-platform checkouts verify against the same DB.
+        let lf = checksum_sql("CREATE TABLE foo (\n    id INTEGER\n);\n");
+        let crlf = checksum_sql("CREATE TABLE foo (\r\n    id INTEGER\r\n);\r\n");
+        assert_eq!(lf, crlf);
+        // A lone CR inside the content is also normalized away.
+        let with_cr = checksum_sql("SELECT 'a\rb'\n;");
+        let without_cr = checksum_sql("SELECT 'ab'\n;");
+        assert_eq!(with_cr, without_cr);
+        assert!(lf.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn operation_kind_validator_rejects_garbage() {
+        assert!(validate_operation_kind("file.write").is_ok());
+        assert_eq!(
+            validate_operation_kind("").expect_err("empty kind").1.code,
+            "invalid_operation_kind"
+        );
+        assert_eq!(
+            validate_operation_kind("bad kind")
+                .expect_err("spaces")
+                .1
+                .code,
+            "invalid_operation_kind"
+        );
+    }
+
+    #[test]
+    fn list_limit_parser_enforces_bounds() {
+        assert_eq!(parse_limit_value("1").expect("min"), 1);
+        assert_eq!(parse_limit_value("100").expect("default"), 100);
+        assert_eq!(
+            parse_limit_value("0").expect_err("zero").1.code,
+            "invalid_limit"
+        );
+        assert_eq!(
+            parse_limit_value(&(MAX_LIST_LIMIT + 1).to_string())
+                .expect_err("over max")
+                .1
+                .code,
+            "invalid_limit",
+            "limit above max is rejected"
+        );
+        // MAX_LIST_LIMIT itself must be allowed.
+        assert_eq!(
+            parse_limit_value(&MAX_LIST_LIMIT.to_string()).expect("max"),
+            MAX_LIST_LIMIT
+        );
+    }
+
+    #[test]
+    fn opaque_id_validator_rejects_path_traversal() {
+        assert!(validate_opaque_id("lock_abc123", "invalid_lock_id", "lock_id").is_ok());
+        // path-like and injection characters are rejected before reaching SQL.
+        assert_eq!(
+            validate_opaque_id("../etc/passwd", "invalid_lock_id", "lock_id")
+                .expect_err("path traversal")
+                .1
+                .code,
+            "invalid_lock_id"
+        );
+        assert_eq!(
+            validate_opaque_id("a'b OR 1=1", "invalid_lock_id", "lock_id")
+                .expect_err("sql injection")
+                .1
+                .code,
+            "invalid_lock_id"
+        );
+    }
+
+    #[test]
+    fn status_filter_validator_bounds_known_values() {
+        assert!(validate_status_filter("active", &["active", "released"]).is_ok());
+        assert_eq!(
+            validate_status_filter("deleted", &["active", "released"])
+                .expect_err("unknown status")
+                .1
+                .code,
+            "invalid_status"
+        );
+    }
+
+    #[test]
+    fn admin_payload_is_redacted_and_secret_safe() {
+        let config = RuntimeConfig::from_lookup(|key| match key {
+            biohazardfs_core::config::ENV_DATABASE_URL => {
+                Some("postgres://user:super-secret@db.example/biohazard".to_string())
+            }
+            biohazardfs_core::config::ENV_OBJECT_STORE_SECRET_ACCESS_KEY => {
+                Some("object-store-secret".to_string())
+            }
+            _ => None,
+        });
+        let report = admin_payload(&config);
+        assert!(report.database_configured);
+        assert_eq!(report.mode, "admin");
+        let text = serde_json::to_string(&report).expect("admin report serializes");
+        assert!(text.contains("database_configured"));
+        assert!(!text.contains("super-secret"));
+        assert!(!text.contains("object-store-secret"));
+        assert!(!text.contains("db.example"));
+    }
+
+    #[test]
+    fn admin_payload_reports_unconfigured_dependencies() {
+        let report = admin_payload(&no_database_config());
+        assert!(!report.database_configured);
+        assert!(!report.object_store_configured);
+    }
+
+    #[test]
+    fn known_server_route_table_covers_wave2_paths() {
+        // The route table must honestly register every Wave 2 path so the
+        // dispatch returns 501 (periphery) or a real envelope (spine) instead
+        // of a 404 for these documented operations.
+        for path in [
+            "/api/v1/locks",
+            "/api/v1/conflicts",
+            "/api/v1/operations",
+            "/api/v1/operations/replay",
+            "/api/v1/trash",
+            "/api/v1/trash/restore",
+            "/api/v1/trash/purge",
+            "/api/v1/audit/events",
+            "/api/v1/audit/export",
+            "/api/v1/devices",
+            "/api/v1/devices/revoke",
+            "/api/v1/projects",
+            "/api/v1/worksets",
+            "/api/v1/snapshots",
+            "/api/v1/snapshots/mount",
+            "/api/v1/snapshots/restore",
+            "/api/v1/transfers",
+            "/api/v1/transfers/commit",
+            "/api/v1/grants",
+            "/api/v1/shares",
+            "/api/v1/publishes",
+            "/api/v1/invites",
+            "/api/v1/nodes",
+            "/api/v1/nodes/stat",
+            "/api/v1/nodes/mkdir",
+            "/api/v1/nodes/symlink",
+            "/api/v1/nodes/move",
+            "/api/v1/nodes/copy",
+            "/api/v1/auth/device/enroll",
+            "/api/v1/auth/login_token",
+        ] {
+            assert!(is_known_server_route(path), "route table missing {path}");
+        }
+        assert!(!is_known_server_route("/api/v1/missing"));
+        assert!(!is_known_server_route("/api/v1/locks/extra"));
+    }
+
+    fn unique_live_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // Numeric-only suffix is safe to interpolate into seed SQL; it cannot
+        // carry SQL metacharacters.
+        format!(
+            "{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn live_db_url() -> Option<String> {
+        let url = std::env::var("BIOHAZARDFS_TEST_DATABASE_URL").ok()?;
+        // The synchronous Postgres client requires explicit plaintext mode until
+        // server TLS support lands; refuse anything else so the test fails
+        // loudly instead of producing a confusing connect error.
+        assert!(
+            url.contains("sslmode=disable"),
+            "BIOHAZARDFS_TEST_DATABASE_URL must set sslmode=disable"
+        );
+        Some(url)
+    }
+
+    fn live_test_config(database_url: &str) -> RuntimeConfig {
+        RuntimeConfig::from_lookup(|key| {
+            if key == biohazardfs_core::config::ENV_DATABASE_URL {
+                Some(database_url.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Live-Postgres integration check for the Wave 2 spine. Ignored by default
+    /// because it needs a real database; run it with:
+    ///
+    /// `BIOHAZARDFS_TEST_DATABASE_URL='postgres://...?sslmode=disable' cargo test -p biohazardfs-server -- --ignored`
+    ///
+    /// The scripts/ci/server-db-smoke.sh harness is the canonical live
+    /// coverage; this test exists so a developer can reproduce the exact
+    /// safety invariants cargo cannot see: only active locks release, missing
+    /// referenced nodes are rejected, idempotent operation replay returns the
+    /// same operation id, and scope enforcement holds through the full stack.
+    /// The SQL round-trip also exercises the to_char/make_interval/jsonb-cast
+    /// expressions used by the spine.
+    #[test]
+    #[ignore]
+    fn live_db_spine_routes_and_safety_invariants() {
+        let Some(database_url) = live_db_url() else {
+            eprintln!(
+                "skipping live DB test: set BIOHAZARDFS_TEST_DATABASE_URL to a sslmode=disable Postgres URL"
+            );
+            return;
+        };
+        run_migrations(&database_url).expect("apply bundled migrations");
+        let mut client = connect_database(&database_url).expect("connect to test database");
+
+        let suffix = unique_live_suffix();
+        let org_id = format!("org_live_{suffix}");
+        let user_id = format!("usr_live_{suffix}");
+        let dir_node = format!("node_dir_{suffix}");
+        let file_node = format!("node_file_{suffix}");
+        let admin_token_id = format!("tok_admin_{suffix}");
+        let reader_token_id = format!("tok_reader_{suffix}");
+        let admin_bearer = format!("live-admin-{suffix}");
+        let reader_bearer = format!("live-reader-{suffix}");
+        let admin_hash = secret_hash_for_token(&admin_bearer);
+        let reader_hash = secret_hash_for_token(&reader_bearer);
+        let admin_scopes = r#"["*"]"#;
+        let reader_scopes = r#"["lock:read"]"#;
+
+        client
+            .execute(
+                "INSERT INTO organizations (org_id, slug, display_name, status)
+                 VALUES ($1, $2, $3, 'active')",
+                &[&org_id, &org_id, &org_id],
+            )
+            .expect("seed organization");
+        client
+            .execute(
+                "INSERT INTO users (org_id, user_id, display_name, email, status)
+                 VALUES ($1, $2, $3, $4, 'active')",
+                &[
+                    &org_id,
+                    &user_id,
+                    &user_id,
+                    &format!("live-{suffix}@local.invalid"),
+                ],
+            )
+            .expect("seed user");
+        client
+            .execute(
+                "INSERT INTO nodes (org_id, node_id, parent_node_id, name, kind, owner_user_id, created_by, updated_by)
+                 VALUES ($1, $2, NULL, 'dir', 'directory', $3, $3, $3)",
+                &[&org_id, &dir_node, &user_id],
+            )
+            .expect("seed directory node");
+        client
+            .execute(
+                "INSERT INTO nodes (org_id, node_id, parent_node_id, name, kind, owner_user_id, created_by, updated_by)
+                 VALUES ($1, $2, $3, 'file.txt', 'file', $4, $4, $4)",
+                &[&org_id, &file_node, &dir_node, &user_id],
+            )
+            .expect("seed file node");
+        client
+            .execute(
+                "INSERT INTO tokens (org_id, token_id, user_id, kind, scopes, status, secret_hash)
+                 VALUES ($1, $2, $3, 'api', $4::text::jsonb, 'active', $5)",
+                &[
+                    &org_id,
+                    &admin_token_id,
+                    &user_id,
+                    &admin_scopes,
+                    &admin_hash,
+                ],
+            )
+            .expect("seed admin token");
+        client
+            .execute(
+                "INSERT INTO tokens (org_id, token_id, user_id, kind, scopes, status, secret_hash)
+                 VALUES ($1, $2, $3, 'api', $4::text::jsonb, 'active', $5)",
+                &[
+                    &org_id,
+                    &reader_token_id,
+                    &user_id,
+                    &reader_scopes,
+                    &reader_hash,
+                ],
+            )
+            .expect("seed reader token");
+
+        let config = live_test_config(&database_url);
+        let admin_auth = vec![(
+            "Authorization".to_string(),
+            format!("Bearer {admin_bearer}"),
+        )];
+        let reader_auth = vec![(
+            "Authorization".to_string(),
+            format!("Bearer {reader_bearer}"),
+        )];
+
+        // Acquire returns RFC3339 UTC timestamps and an active lock.
+        let acquire_body =
+            format!(r#"{{"node_id":"{file_node}","kind":"edit","ttl_seconds":300}}"#);
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/locks",
+            &admin_auth,
+            acquire_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 200, "acquire should succeed: {body}");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("envelope json");
+        assert_eq!(value["operation"], "server.locks.acquire");
+        assert_eq!(value["data"]["status"], "active");
+        assert!(
+            value["data"]["acquired_at"]
+                .as_str()
+                .is_some_and(|ts| ts.ends_with('Z'))
+        );
+        assert!(
+            !body.contains(&admin_bearer),
+            "envelope must not echo the bearer"
+        );
+        let lock_id = value["data"]["lock_id"].as_str().unwrap().to_string();
+
+        // List contains the just-acquired lock.
+        let (status, body) =
+            dispatch_http_request_with_config("GET", "/api/v1/locks", &admin_auth, &[], &config);
+        assert_eq!(status, 200);
+        assert!(
+            body.contains(&lock_id),
+            "list must contain the acquired lock"
+        );
+
+        // Release transitions to released.
+        let (status, body) = dispatch_http_request_with_config(
+            "DELETE",
+            &format!("/api/v1/locks?lock_id={lock_id}"),
+            &admin_auth,
+            &[],
+            &config,
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("\"released\""));
+
+        // SAFETY: a second release of a now-non-active lock is a 404, never a
+        // silent success.
+        let (status, body) = dispatch_http_request_with_config(
+            "DELETE",
+            &format!("/api/v1/locks?lock_id={lock_id}"),
+            &admin_auth,
+            &[],
+            &config,
+        );
+        assert_eq!(status, 404, "double release must be 404: {body}");
+
+        // SAFETY: acquiring against a missing node is rejected before insert.
+        let (status, _body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/locks",
+            &admin_auth,
+            br#"{"node_id":"node_missing","kind":"edit"}"#,
+            &config,
+        );
+        assert_eq!(status, 404, "acquire against missing node must be 404");
+
+        // Idempotent operation replay returns the same operation id and the
+        // payload_json round-trips as valid jsonb.
+        let op_body = format!(
+            r#"{{"kind":"file.write","node_id":"{file_node}","idempotency_key":"idem-{suffix}","params":{{"foo":"bar"}}}}"#
+        );
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            op_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 200, "submit should succeed: {body}");
+        let op_id1 =
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["operation_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            op_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 200);
+        let op_id2 =
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["data"]["operation_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert_eq!(
+            op_id1, op_id2,
+            "idempotent replay must return the same operation id"
+        );
+
+        // SAFETY: replaying the same idempotency_key with DIFFERENT params must
+        // be rejected (409) rather than silently return the prior operation.
+        let mismatch_body = format!(
+            r#"{{"kind":"file.write","node_id":"{file_node}","idempotency_key":"idem-{suffix}","params":{{"foo":"qux"}}}}"#
+        );
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            mismatch_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 409, "mismatched payload must be 409: {body}");
+        assert!(body.contains("operation_idempotency_payload_mismatch"));
+        assert!(
+            body.contains(&format!("idem-{suffix}")),
+            "details must echo the idempotency key without the bearer"
+        );
+
+        // SAFETY: replaying the same idempotency_key with the SAME params and
+        // node but a DIFFERENT kind must also be rejected. Before the semantic
+        // comparison covered kind, this silently returned the original op.
+        let kind_orig_body = format!(
+            r#"{{"kind":"file.write","node_id":"{file_node}","idempotency_key":"idem-kind-{suffix}","params":{{"foo":"bar"}}}}"#
+        );
+        let (status, _body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            kind_orig_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 200, "original kind submit should succeed: {_body}");
+        let kind_mismatch_body = format!(
+            r#"{{"kind":"file.delete","node_id":"{file_node}","idempotency_key":"idem-kind-{suffix}","params":{{"foo":"bar"}}}}"#
+        );
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            kind_mismatch_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 409, "mismatched kind must be 409: {body}");
+        assert!(body.contains("operation_idempotency_payload_mismatch"));
+        assert!(
+            body.contains(r#""field":"kind""#),
+            "details must identify kind as the diverging field: {body}"
+        );
+
+        // Read endpoints return org-scoped 200 envelopes with the contract shape.
+        for (method, path, operation, data_key) in [
+            (
+                "GET",
+                "/api/v1/conflicts",
+                "server.conflicts.list",
+                "conflicts",
+            ),
+            ("GET", "/api/v1/trash", "server.trash.list", "trash"),
+            (
+                "GET",
+                "/api/v1/audit/events",
+                "server.audit.events",
+                "events",
+            ),
+            ("GET", "/api/v1/devices", "server.devices.list", "devices"),
+            (
+                "GET",
+                "/api/v1/projects",
+                "server.projects.list",
+                "projects",
+            ),
+            (
+                "GET",
+                "/api/v1/worksets",
+                "server.worksets.list",
+                "worksets",
+            ),
+        ] {
+            let (status, body) =
+                dispatch_http_request_with_config(method, path, &admin_auth, &[], &config);
+            assert_eq!(status, 200, "{method} {path}: {body}");
+            let value: serde_json::Value = serde_json::from_str(&body).expect("envelope json");
+            assert_eq!(value["operation"], operation);
+            assert!(
+                value["data"][data_key].is_array(),
+                "{operation}: {data_key} must be an array"
+            );
+        }
+
+        // Scope enforcement through the full stack: a read-only token can list
+        // locks but cannot acquire one.
+        let (status, _body) =
+            dispatch_http_request_with_config("GET", "/api/v1/locks", &reader_auth, &[], &config);
+        assert_eq!(status, 200, "reader token can list locks");
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/locks",
+            &reader_auth,
+            br#"{"kind":"edit"}"#,
+            &config,
+        );
+        assert_eq!(status, 403, "reader token cannot acquire: {body}");
+        assert!(body.contains("auth_scope_missing"));
     }
 }

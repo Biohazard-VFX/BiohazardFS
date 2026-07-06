@@ -386,17 +386,19 @@ Rules:
 
 ## First implementation slice
 
-The first implementation should prove safety before broad filesystem support:
+The first implementation proves safety before broad filesystem support. Current status:
 
-1. Normalize and validate paths.
-2. Enforce case-insensitive sibling uniqueness in mock namespace.
-3. Model placeholder/cached/pinned/dirty/conflicted states.
-4. Implement full-file hydrate into cache with verification.
-5. Implement dehydrate that cannot remove dirty/pinned data.
-6. Implement durable dirty-state records in local SQLite.
-7. Implement cache quota checks and `cache_full` error path.
-8. Implement lock-state checks in mock write path.
-9. Implement conflict record creation for simulated divergent writes.
-10. Implement crash/restart recovery tests for dirty local state.
+1. Normalize and validate paths — IMPLEMENTED in `core::path` (`normalize_relative_path`, `validate_file_name`).
+2. Enforce case-insensitive sibling uniqueness — IMPLEMENTED via `case_insensitive_sibling_key`, enforced by `daemon.file.write` and the FUSE `create` path.
+3. Model placeholder/cached/pinned/dirty/conflicted states — IMPLEMENTED as the `core::cache::CacheState` machine, where `Dirty -> Evicting` and `Dirty -> Absent` are rejected at the transition layer.
+4. Implement full-file hydrate into cache — IMPLEMENTED in `WorkspaceFs`: `open` fetches the whole file via `daemon.file.read` before reply. Verification is partial: the daemon-supplied `content_hash` is stored on the cache entry but not independently recomputed from the hydrated bytes.
+5. Implement dehydrate that cannot remove dirty/pinned data — IMPLEMENTED. The `cache.dehydrate` spine refuses dirty and pinned entries and routes `Ready -> Evicting -> Absent` through the legal transition path.
+6. Implement durable dirty-state records in local SQLite — SCAFFOLD. Dirty state lives in the in-memory `DaemonBackend` only; it does not survive daemon restart.
+7. Implement cache quota checks and `cache_full` error path — SCAFFOLD. `CacheStats` carries a `quota_bytes` field but the daemon surfaces it as `None`; there is no quota enforcement and no `cache_full` path yet.
+8. Implement lock-state checks in mock write path — IMPLEMENTED at the daemon `lock.*` spine (`list`/`acquire`/`release`/`status`/`extend`, with lazy expiry). The FUSE write path does not yet consult lock state before committing a write.
+9. Implement conflict record creation for divergent writes — SCAFFOLD. `daemon.file.write` rejects a stale `base_version_id` with `version_conflict`, and `conflict.list`/`show` expose conflicts against the in-memory store, but no path yet creates a `Conflict` record on divergence.
+10. Implement crash/restart recovery tests for dirty local state — PLANNED.
+
+Beyond this slice, the `WorkspaceFs` write path is IMPLEMENTED: `create`, `write`, `flush`, and `fsync` buffer per-handle and push one complete blob per flush through `daemon.file.write`, with dirty-data-never-lost enforced by restoring the buffer and returning `EIO` whenever the daemon does not acknowledge the version. Directory and symlink mutations are SCAFFOLD-boundary: `mkdir` and `symlink` return `EROFS`, and `unlink`, `rmdir`, and `rename` return `EIO`, pending promotion of `daemon.file.delete` / `daemon.file.move` and FUSE-side operation-token minting for destructive and data-moving methods.
 
 Do not claim MVP write support until dirty data survives daemon restart, cache-full behavior is safe, deletes go to trash, and divergent writes preserve all versions.

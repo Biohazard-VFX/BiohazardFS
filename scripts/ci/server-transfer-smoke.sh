@@ -287,7 +287,7 @@ PY
 
 BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
   env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
-  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci object get --sha256 "$CLI_HASH" --output /tmp/biohazardfs-transfer-cli-output.txt \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci object get --sha256 "$CLI_HASH" --out /tmp/biohazardfs-transfer-cli-output.txt \
   >/tmp/biohazardfs-transfer-cli-get.json
 
 cat >/tmp/biohazardfs-transfer-cli-file-input.txt <<'EOF_CLI_FILE_INPUT'
@@ -313,7 +313,7 @@ PY
 
 BIOHAZARDFS_SERVER_TOKEN="$SMOKE_TOKEN" \
   env -u BIOHAZARDFS_DATABASE_URL -u BIOHAZARDFS_SERVER_PUBLIC_URL \
-  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci file get --node "$CLI_NODE_ID" --output /tmp/biohazardfs-transfer-cli-file-output.txt \
+  target/debug/biohazardfs --config "$CONFIG_FILE" --profile ci file get --node "$CLI_NODE_ID" --out /tmp/biohazardfs-transfer-cli-file-output.txt \
   >/tmp/biohazardfs-transfer-cli-file-get.json
 
 python3 - <<PY

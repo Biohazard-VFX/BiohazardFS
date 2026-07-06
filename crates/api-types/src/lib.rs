@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod known_methods;
+
 pub const COMMAND_SCHEMA_VERSION: &str = "2026-07-commands-v1";
 pub const DAEMON_SCHEMA_VERSION: &str = "2026-07-daemon-v1";
 pub const EVENT_SCHEMA_VERSION: &str = "2026-07-events-v1";
@@ -442,6 +444,283 @@ pub enum DaemonState {
 pub struct CommandSchemaSummary {
     pub commands: Vec<String>,
     pub note: String,
+}
+
+// ----- Event stream envelope (DAEMON_API.md "Event stream"; EVENT_SCHEMA_VERSION) -----
+
+/// One-way structured event carried over the daemon event stream (NDJSON over
+/// IPC, SSE/NDJSON over dev loopback). The discriminator is `type` on the wire.
+/// Clients must tolerate unknown event types by resyncing through state/list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventEnvelope {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub id: String,
+    pub timestamp: String,
+    pub data: Value,
+    pub meta: EventMeta,
+}
+
+impl EventEnvelope {
+    pub fn new(event_type: impl Into<String>, data: Value) -> Self {
+        Self {
+            event_type: event_type.into(),
+            id: request_id(),
+            timestamp: timestamp(),
+            data,
+            meta: EventMeta::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventMeta {
+    pub request_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub schema_version: String,
+}
+
+impl Default for EventMeta {
+    fn default() -> Self {
+        Self {
+            request_id: None,
+            actor_id: None,
+            device_id: None,
+            schema_version: EVENT_SCHEMA_VERSION.to_string(),
+        }
+    }
+}
+
+/// Initial event family names (DAEMON_API.md). Stable dotted strings.
+pub mod event_types {
+    pub const DAEMON_STARTED: &str = "daemon.started";
+    pub const DAEMON_STOPPING: &str = "daemon.stopping";
+    pub const DAEMON_HEALTH_CHANGED: &str = "daemon.health_changed";
+    pub const AUTH_CHANGED: &str = "auth.changed";
+    pub const MOUNT_ATTACHED: &str = "mount.attached";
+    pub const MOUNT_DETACHED: &str = "mount.detached";
+    pub const MOUNT_HEALTH_CHANGED: &str = "mount.health_changed";
+    pub const FILE_CHANGED: &str = "file.changed";
+    pub const CACHE_STATE_CHANGED: &str = "cache.state_changed";
+    pub const CACHE_QUOTA_WARNING: &str = "cache.quota_warning";
+    pub const TRANSFER_QUEUED: &str = "transfer.queued";
+    pub const TRANSFER_PROGRESS: &str = "transfer.progress";
+    pub const TRANSFER_COMPLETED: &str = "transfer.completed";
+    pub const TRANSFER_FAILED: &str = "transfer.failed";
+    pub const LOCK_CHANGED: &str = "lock.changed";
+    pub const CONFLICT_DETECTED: &str = "conflict.detected";
+    pub const CONFLICT_RESOLVED: &str = "conflict.resolved";
+    pub const SNAPSHOT_CREATED: &str = "snapshot.created";
+    pub const SNAPSHOT_MOUNTED: &str = "snapshot.mounted";
+    pub const AUDIT_EVENT_RECORDED: &str = "audit.event_recorded";
+    pub const WARNING_RAISED: &str = "warning.raised";
+}
+
+// ----- Mutation safety + dry-run operation tokens (COMMANDS.md / DAEMON_API.md) -----
+
+/// How strongly a method mutates state. Drives dry-run operation-token rules
+/// under the `AgentSafe` mutation profile: destructive/admin/data-moving
+/// methods require a token binding the validated params and plan hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationClassification {
+    Read,
+    LowRisk,
+    Destructive,
+    Admin,
+    DataMoving,
+}
+
+/// Fresh installs default to `AgentSafe`; first-run setup may choose `HumanFriendly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationProfile {
+    #[default]
+    AgentSafe,
+    HumanFriendly,
+}
+
+/// Dry-run operation token binding validated params, actor, device, source,
+/// classification, plan hash, and expiry. Applying with changed params must fail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationToken {
+    pub operation_token: String,
+    pub method: String,
+    pub params_hash: String,
+    pub plan_hash: String,
+    pub actor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub source: Source,
+    pub classification: MutationClassification,
+    pub expires_at: String,
+}
+
+// ----- Server control-plane response DTOs (Wave 2 metadata routes) -----
+// These mirror docs/architecture/METADATA_SCHEMA.md field names and are
+// returned inside ServerResponseEnvelope<T> by the server spine routes.
+// Timestamps are explicit RFC3339 UTC strings; nullable timestamps use
+// Option<String> so absent values are explicit on the wire.
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockSummary {
+    pub lock_id: String,
+    pub node_id: Option<String>,
+    pub provisional_local_id: Option<String>,
+    pub path_snapshot: Option<String>,
+    pub owner_user_id: String,
+    pub owner_device_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub acquired_at: String,
+    pub expires_at: Option<String>,
+    pub released_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockAcquireResponse {
+    pub lock_id: String,
+    pub node_id: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub owner_user_id: String,
+    pub acquired_at: String,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockReleaseResponse {
+    pub lock_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockListResponse {
+    pub locks: Vec<LockSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictSummary {
+    pub conflict_id: String,
+    pub node_id: Option<String>,
+    pub path_snapshot: Option<String>,
+    pub kind: String,
+    pub status: String,
+    pub base_version_id: Option<String>,
+    pub local_version_id: Option<String>,
+    pub remote_version_id: Option<String>,
+    pub local_operation_id: Option<String>,
+    pub remote_operation_id: Option<String>,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictListResponse {
+    pub conflicts: Vec<ConflictSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationSubmitResponse {
+    pub operation_id: String,
+    pub status: String,
+    pub idempotency_key: Option<String>,
+    pub received_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrashSummary {
+    pub trash_id: String,
+    pub node_id: String,
+    pub original_parent_node_id: Option<String>,
+    pub original_name: String,
+    pub deleted_version_id: Option<String>,
+    pub deleted_at: String,
+    pub deleted_by: Option<String>,
+    pub status: String,
+    pub purge_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrashListResponse {
+    pub trash: Vec<TrashSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventSummary {
+    pub audit_event_id: String,
+    pub event_type: String,
+    pub actor_user_id: Option<String>,
+    pub device_id: Option<String>,
+    pub source: String,
+    pub node_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub request_id: Option<String>,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventsResponse {
+    pub events: Vec<AuditEventSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSummary {
+    pub device_id: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub platform: Option<String>,
+    pub hostname: Option<String>,
+    pub status: String,
+    pub enrolled_at: String,
+    pub last_seen_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceListResponse {
+    pub devices: Vec<DeviceSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub root_node_id: Option<String>,
+    pub name: String,
+    pub code: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectSummary>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorksetSummary {
+    pub workset_id: String,
+    pub project_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub source: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorksetListResponse {
+    pub worksets: Vec<WorksetSummary>,
+    pub limit: u32,
 }
 
 pub fn timestamp() -> String {

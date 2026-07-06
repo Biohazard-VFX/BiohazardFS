@@ -66,26 +66,27 @@ S3-compatible object storage + PostgreSQL metadata
 
 ## Current status
 
-The repo is still in planning/scaffolding mode, but the runnable foundation now covers the Linux client loop, the Electron workspace shell, and the first self-hosted server/storage smoke paths.
+The repo is still pre-release scaffold: in-memory daemon state, deferred local SQLite, Linux-first FUSE, and no published installers. The runnable foundation now spans the full CLI command tree, the daemon method registry, the server control-plane spine, a Linux read-write FUSE mount, and the Electron workspace cards.
+
+Three honest status levels apply throughout the codebase:
+
+- **IMPLEMENTED** — real behavior, exercised by tests.
+- **SCAFFOLD** — typed, wired, and exercised through a tested seam, but backed by an in-memory/mock backend or returning `method_not_implemented` / `operation_not_implemented`.
+- **PLANNED** — in the spec, not yet in code.
 
 Current completed foundations:
 
 - Rust workspace scaffold for core, shared API types, CLI, daemon, FUSE adapter, and server/control-plane crates
-- runnable `biohazardfs` CLI scaffold with JSON envelopes, config inspection/validation, daemon calls, command schema introspection, and server-backed namespace/object/file transfer commands
-- runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC-like HTTP and local-token auth
-- runnable Electron + React + TypeScript + Tailwind-compatible Biohazard Workspace shell
-- Linux client smoke path that verifies daemon, CLI, config redaction, workspace listing, and Electron launch together
-- runnable `biohazardfs-server` foundation with health/readiness/version/status endpoints, worker/config commands, Postgres migrations, RustFS/S3-compatible object-store checks, and content/file transfer APIs
-- server smoke paths for API health, database migrations, object-store bucket setup, and end-to-end object/file transfers through Postgres plus RustFS
+- Layer 0 domain model in `biohazardfs-api-types` / `biohazardfs-core`: the canonical method/operation/command registry (`known_methods`), mutation classification, and the event envelope shared by the daemon, server, and CLI so the three surfaces cannot drift
+- runnable `biohazardfs` CLI (IMPLEMENTED) with the full command tree — mount, file, cache, transfer, snapshot, lock, conflict, workset, invite, share, grant, publish, audit, admin, auth, schema, mcp, plus status/version/doctor/smoke — JSON/ndjson/text output, field-mask/pagination/provenance globals, schema introspection (`schema list`, `schema command`, `commands`), and an agent-safe mutation gate (`--dry-run` mints a CLI-side operation token and plan; `--yes` returns `apply_not_wired` (exit 7) without dispatching — daemon-issued operation tokens and `--apply <token>` are planned)
+- runnable `biohazardfsd` daemon (SCAFFOLD) over dev-loopback JSON-RPC-like HTTP with local-token auth; the full method registry is wired, with read/low-risk spine methods running against an in-memory backend and destructive/admin/data-moving periphery methods returning `method_not_implemented` after the operation-token check
+- runnable `biohazardfs-fuse` Linux adapter: a read-only source mount (`mount`, IMPLEMENTED) and a read-write workspace mount (`mount-workspace`, SCAFFOLD) that hydrates files on open via `file.read` and commits writes on flush/fsync via `file.write`, with dirty/pinned data never silently lost
+- runnable Electron + React + TypeScript + Tailwind Biohazard Workspace shell (SCAFFOLD) rendering live daemon state through Daemon, Workspace, Cache, Transfer, Conflict, Lock, and Onboarding cards; read-only monitoring, no mutating actions yet
+- runnable `biohazardfs-server` foundation with health/readiness/version/status endpoints, worker/config commands, Postgres migrations (including the metadata baseline for devices, projects, worksets, locks, conflicts, snapshots, grants, shares, publishes, invites, trash, and retention), RustFS/S3-compatible object-store checks, content/file transfer APIs, and DB-backed spine routes for locks, conflicts, operations, trash, audit, devices, projects, and worksets; periphery routes return `operation_not_implemented`
+- Linux smoke paths covering the daemon/CLI/Electron client loop, server API and Postgres migrations, RustFS bucket setup, end-to-end object/file transfers, and both FUSE mounts (read-only and read-write)
 - Docker server image, dev Compose stack, and Helm chart scaffolds
 - strict CI gates: the Linux job runs Rust, Electron, shell, workflow, Dockerfile, Docker/Compose, Helm, and smoke checks; Windows and macOS run Rust check/test gates
-- product spec
-- CLI/agent contract
-- local daemon API contract
-- metadata schema contract
-- filesystem/cache semantics contract
-- packaging/release contract
-- initial agent skill stubs
+- product spec, CLI/agent contract, local daemon API contract, metadata schema contract, filesystem/cache semantics contract, packaging/release contract, and initial agent skill stubs
 
 Start with:
 
@@ -142,6 +143,7 @@ scripts/ci/server-smoke.sh
 scripts/ci/server-db-smoke.sh
 scripts/ci/object-store-smoke.sh
 scripts/ci/server-transfer-smoke.sh
+scripts/ci/fuse-smoke.sh
 ```
 
 Future public artifacts will target:
@@ -154,7 +156,7 @@ Future public artifacts will target:
 
 The CLI defaults to structured JSON for implemented scaffold commands and calls the daemon through the same JSON-RPC-like method envelope described in `docs/architecture/DAEMON_API.md`. The current loopback HTTP transport is development/test-only; production transport is still intended to be platform IPC discovered from an owner-only descriptor.
 
-Currently runnable:
+Currently runnable (representative; JSON by default):
 
 ```bash
 biohazardfs status
@@ -165,15 +167,25 @@ biohazardfs daemon workspace-list --path plates
 biohazardfs config path
 biohazardfs config show --redacted
 biohazardfs config validate
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object put ./file.bin
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <hash> --output ./file.bin
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot001.exr
-BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --output ./shot001.exr
+biohazardfs mount status
+biohazardfs cache status
+biohazardfs lock list
+biohazardfs audit events --limit 50
+biohazardfs snapshot list --limit 20
+biohazardfs auth status
 biohazardfs schema list
 biohazardfs schema command daemon.status
 biohazardfs commands
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs namespace children
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object put ./file.bin
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs object get --sha256 <hash> --out ./file.bin
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file put ./shot001.exr --name shot001.exr
+BIOHAZARDFS_SERVER_TOKEN=<token> biohazardfs file get --node <node-id> --out ./shot001.exr
 ```
+
+`--output <json|ndjson|text>` is the global response-format flag. `object get` and `file get` write a downloaded blob to a local file with `--out <path>` (renamed from the earlier `--output`); the CLI refuses to overwrite an existing path.
+
+The wider command tree (transfer, conflict, workset, invite, share, grant, publish, admin, auth credentials, schema event/error/config/all, mcp serve) parses and dispatches against the same envelope. Read and low-risk commands run against the in-memory daemon backend and return honest state (often an empty list, e.g. `snapshot list` or `conflict list`, until state is seeded); destructive, admin, and data-moving commands require `--dry-run` or `--yes`: `--dry-run` mints a CLI-side operation token and plan (exit 7), and `--yes` returns `apply_not_wired` (exit 7) without dispatching, because the daemon-issued operation-token flow is not wired yet. The daemon methods those commands target still return `method_not_implemented` until their backing is promoted.
 
 Server/control-plane scaffold commands:
 
@@ -188,17 +200,16 @@ biohazardfs-server --config ./config.toml --profile dev object-store check
 biohazardfs-server --config ./config.toml --profile dev object-store ensure-bucket
 ```
 
-Planned examples:
+Planned command surface still includes the server-mediated apply flow for operation tokens (today the CLI mints them), the `config doctor` diagnostic, and a redacted `smoke run --format json`. The stdio MCP surface (`biohazardfs mcp serve`) is already wired for `initialize`, `ping`, `tools/list`, and `tools/call` against the same command registry.
 
-```bash
-biohazardfs auth status
-biohazardfs mount status
-biohazardfs file history /Project/Shot010/scene.nk
-biohazardfs cache pin /Project/Shot010
-biohazardfs snapshot list --limit 20
-biohazardfs audit events --path /Project/Shot010 --limit 50
-biohazardfs mcp
-```
+## FUSE mounts (Linux)
+
+`biohazardfs-fuse` ships two mounts, both Linux-only and foreground-only:
+
+- `mount --source <dir> --mountpoint <dir>` — read-only virtual view of an existing workspace/source tree (IMPLEMENTED; verified by live-mount smoke).
+- `mount-workspace --daemon-endpoint <host:port> --cache-dir <dir> --mountpoint <dir>` — read-write BiohazardFS workspace backed by the local daemon (SCAFFOLD). The local daemon token is read from `BIOHAZARDFS_LOCAL_TOKEN` (env only), never argv. Files hydrate on open via `file.read`; writes buffer per file handle and commit one blob per flush/fsync via `file.write`; dirty and pinned data is never silently lost.
+
+The read-write mount has real gaps today: `mkdir`, `symlink`, `unlink`, `rmdir`, and `rename` return `EROFS`/`EIO` because the daemon-side `file.delete`/`file.move` and directory-create methods are still periphery, and the FUSE layer cannot yet mint the operation tokens those destructive/data-moving methods require. See [`docs/architecture/FILESYSTEM_SEMANTICS.md`](docs/architecture/FILESYSTEM_SEMANTICS.md).
 
 See [`docs/reference/COMMANDS.md`](docs/reference/COMMANDS.md).
 
@@ -223,6 +234,7 @@ scripts/ci/server-smoke.sh
 scripts/ci/server-db-smoke.sh
 scripts/ci/object-store-smoke.sh
 scripts/ci/server-transfer-smoke.sh
+scripts/ci/fuse-smoke.sh
 ```
 
 The dev Compose scaffold uses Postgres plus RustFS, matching BiohazardFS's self-hosted storage direction:

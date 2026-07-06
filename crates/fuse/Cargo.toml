@@ -9,7 +9,11 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+biohazardfs-api-types = { path = "../api-types" }
+biohazardfs-core = { path = "../core" }
+biohazardfs-daemon = { path = "../daemon" }
 clap.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"

@@ -330,3 +330,230 @@ pre {
   overflow: auto;
   padding: 1rem;
 }
+
+.hero-actions {
+  margin-top: 1.2rem;
+}
+
+.banner {
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  font-weight: 600;
+  padding: 0.9rem 1.2rem;
+}
+
+.banner.offline {
+  background: color-mix(in oklch, var(--destructive) 12%, var(--card));
+  border-color: color-mix(in oklch, var(--destructive) 35%, var(--border));
+  color: var(--foreground);
+}
+
+.note {
+  color: var(--muted-foreground);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  margin: 0.6rem 0 0;
+}
+
+.note.good {
+  color: var(--foreground);
+}
+
+.note.warn,
+.note.error {
+  border-radius: 12px;
+  color: var(--foreground);
+  padding: 0.55rem 0.7rem;
+}
+
+.note.warn {
+  background: color-mix(in oklch, var(--chart-1) 14%, transparent);
+}
+
+.note.error {
+  background: color-mix(in oklch, var(--destructive) 12%, transparent);
+}
+
+.error-code {
+  background: var(--muted);
+  border-radius: 6px;
+  color: var(--muted-foreground);
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.35rem;
+  vertical-align: middle;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-sm {
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  padding: 0.45rem 0.8rem;
+}
+
+.btn-sm.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--foreground);
+}
+
+.entry-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  list-style: none;
+  margin: 0.9rem 0 0;
+  padding: 0;
+}
+
+.entry {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  justify-content: space-between;
+  padding: 0.6rem 0.75rem;
+}
+
+.entry-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.entry-path {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.entry-tags,
+.entry-meta {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.entry-meta {
+  color: var(--muted-foreground);
+}
+
+.entry-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.tag {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.2rem 0.5rem;
+  text-transform: uppercase;
+}
+
+.tag.pinned,
+.tag.download {
+  background: color-mix(in oklch, var(--chart-1) 22%, transparent);
+  color: var(--foreground);
+}
+
+.tag.upload {
+  background: color-mix(in oklch, var(--chart-2) 22%, transparent);
+  color: var(--foreground);
+}
+
+.tag.dirty,
+.tag.locked {
+  background: color-mix(in oklch, var(--destructive) 20%, transparent);
+  color: var(--destructive);
+}
+
+.tag.unlocked {
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+
+.entry.is-locked {
+  border-color: color-mix(in oklch, var(--destructive) 35%, var(--border));
+}
+
+.entry.is-unlocked {
+  background: var(--muted);
+}
+
+.progress {
+  background: var(--muted);
+  border-radius: 999px;
+  height: 1.4rem;
+  min-width: 12rem;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+}
+
+.progress-bar {
+  background: color-mix(in oklch, var(--chart-2) 70%, transparent);
+  height: 100%;
+  transition: width 120ms ease-out;
+}
+
+.progress-label {
+  align-items: center;
+  bottom: 0;
+  color: var(--foreground);
+  display: flex;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-weight: 700;
+  justify-content: center;
+  left: 0;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.inline-form {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.input {
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--foreground);
+  flex: 1 1 18rem;
+  font-family: var(--font-mono);
+  font-size: 0.92rem;
+  min-width: 0;
+  padding: 0.6rem 0.8rem;
+}
+
+.input:focus {
+  border-color: var(--ring);
+  outline: none;
+}
+
+.card.onboarding {
+  border-color: color-mix(in oklch, var(--chart-1) 35%, var(--border));
+}
+
+.card.diagnostics pre {
+  max-height: 22rem;
+}

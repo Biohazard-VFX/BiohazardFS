@@ -87,6 +87,54 @@ async function workspaceList(pathName = '') {
   return daemonRpc('workspace.list', { path: pathName });
 }
 
+// Artist-facing surfaces. Each thin handler routes a generic daemon RPC and
+// returns the daemon response envelope untouched. The renderer renders every
+// response defensively; unknown/error envelopes are surfaced, never crashed on.
+
+async function cacheStatus() {
+  return daemonRpc('cache.status');
+}
+
+async function cacheList() {
+  return daemonRpc('cache.list');
+}
+
+async function cachePin(params: { path: string }) {
+  return daemonRpc('cache.pin', params);
+}
+
+async function cacheDehydrate(params: { path: string }) {
+  return daemonRpc('cache.dehydrate', params);
+}
+
+async function transferList() {
+  return daemonRpc('transfer.list');
+}
+
+async function transferPause(params: { transfer_id?: string }) {
+  return daemonRpc('transfer.pause', params);
+}
+
+async function transferResume(params: { transfer_id?: string }) {
+  return daemonRpc('transfer.resume', params);
+}
+
+async function conflictList() {
+  return daemonRpc('conflict.list');
+}
+
+async function conflictPreserveAll() {
+  return daemonRpc('conflict.preserve_all');
+}
+
+async function lockList() {
+  return daemonRpc('lock.list');
+}
+
+async function configSet(params: { key: string; value: string }) {
+  return daemonRpc('config.set', params);
+}
+
 function rendererEntry(): string {
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (IS_DEV && devServerUrl?.startsWith('http://127.0.0.1:')) {
@@ -117,6 +165,21 @@ async function createWindow(): Promise<BrowserWindow> {
 ipcMain.handle('daemon:status', daemonStatus);
 ipcMain.handle('workspace:status', workspaceStatus);
 ipcMain.handle('workspace:list', (_event, pathName: string) => workspaceList(pathName));
+ipcMain.handle('cache:status', cacheStatus);
+ipcMain.handle('cache:list', cacheList);
+ipcMain.handle('cache:pin', (_event, params: { path: string }) => cachePin(params));
+ipcMain.handle('cache:dehydrate', (_event, params: { path: string }) => cacheDehydrate(params));
+ipcMain.handle('transfer:list', transferList);
+ipcMain.handle('transfer:pause', (_event, params: { transfer_id?: string }) =>
+  transferPause(params),
+);
+ipcMain.handle('transfer:resume', (_event, params: { transfer_id?: string }) =>
+  transferResume(params),
+);
+ipcMain.handle('conflict:list', conflictList);
+ipcMain.handle('conflict:preserveAll', conflictPreserveAll);
+ipcMain.handle('lock:list', lockList);
+ipcMain.handle('config:set', (_event, params: { key: string; value: string }) => configSet(params));
 ipcMain.handle('app:versions', () => ({
   app: app.getVersion(),
   electron: process.versions.electron,

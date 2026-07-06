@@ -120,10 +120,10 @@ assert second['ok'] is True, second
 assert first['operation'] == 'server.migrate', first
 assert second['operation'] == 'server.migrate', second
 assert first['data']['status'] == 'applied', first
-assert first['data']['current_version'] == '002', first
-assert len(first['data']['applied_migrations']) == 2, first
+assert first['data']['current_version'] == '003', first
+assert len(first['data']['applied_migrations']) == 3, first
 assert second['data']['status'] == 'up_to_date', second
-assert len(second['data']['already_applied_migrations']) == 2, second
+assert len(second['data']['already_applied_migrations']) == 3, second
 assert config['ok'] is True, config
 assert config['operation'] == 'server.config', config
 assert config['data']['database']['url_set'] is True, config
@@ -146,7 +146,20 @@ TABLES="$(docker exec "$CONTAINER_ID" psql -U biohazardfs -d biohazardfs -Atc "
       'file_versions',
       'operations',
       'upload_sessions',
-      'audit_events'
+      'audit_events',
+      'devices',
+      'projects',
+      'worksets',
+      'workset_rules',
+      'retention_policies',
+      'snapshots',
+      'locks',
+      'conflicts',
+      'grants',
+      'shares',
+      'publishes',
+      'invites',
+      'trash_records'
     );
 ")"
 
@@ -163,6 +176,19 @@ expected = {
     'operations',
     'upload_sessions',
     'audit_events',
+    'devices',
+    'projects',
+    'worksets',
+    'workset_rules',
+    'retention_policies',
+    'snapshots',
+    'locks',
+    'conflicts',
+    'grants',
+    'shares',
+    'publishes',
+    'invites',
+    'trash_records',
 }
 missing = expected - actual
 assert not missing, f"missing migration tables: {sorted(missing)}"

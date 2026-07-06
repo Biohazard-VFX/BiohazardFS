@@ -111,18 +111,24 @@ name = "biohazardfs-daemon"
 version = "0.1.0"
 dependencies = [
  "biohazardfs-api-types",
+ "biohazardfs-core",
  "clap",
  "serde",
  "serde_json",
+ "time",
 ]
 
 [[package]]
 name = "biohazardfs-fuse"
 version = "0.1.0"
 dependencies = [
+ "biohazardfs-api-types",
+ "biohazardfs-core",
+ "biohazardfs-daemon",
  "clap",
  "fuser",
  "libc",
+ "serde_json",
 ]
 
 [[package]]
