@@ -5,6 +5,12 @@
   "description": "Biohazard Workspace Electron shell for BiohazardFS",
   "packageManager": "pnpm@10.33.0",
   "main": "dist/electron/main.js",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "pnpm run build:electron && pnpm run build:renderer",
