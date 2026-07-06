@@ -559,6 +559,9 @@ struct OpenHandle {
     writable: bool,
     write_buffer: Option<Vec<u8>>,
     base_version_id: Option<String>,
+    ever_dirty: bool,
+    dirty_generation: u64,
+    in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -695,8 +698,10 @@ impl WorkspaceFs {
     }
 
     /// On-disk path for an inode's dirty journal entry.
-    fn dirty_journal_path(&self, inode: u64) -> PathBuf {
-        self.cache_dir.join("dirty").join(format!("inode-{inode}"))
+    fn dirty_journal_path(&self, inode: u64, fh: u64) -> PathBuf {
+        self.cache_dir
+            .join("dirty")
+            .join(format!("inode-{inode}-fh-{fh}"))
     }
 
     /// Best-effort durable persistence of unsynced dirty bytes. Survives
@@ -705,11 +710,12 @@ impl WorkspaceFs {
     /// path will push journaled bytes on daemon reconnect. Best-effort on
     /// purpose: a journal-write failure is logged and the bytes are lost rather
     /// than crashing the mount on top of artist data.
-    fn journal_dirty(&self, inode: u64, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let path = self.dirty_journal_path(inode);
+    ///
+    /// Empty buffers are meaningful: a zero-byte create or truncate-to-zero is
+    /// a real version, not “no data”. Write an empty journal file as the marker
+    /// instead of skipping it.
+    fn journal_dirty(&self, inode: u64, fh: u64, bytes: &[u8]) {
+        let path = self.dirty_journal_path(inode, fh);
         let Some(parent) = path.parent() else {
             eprintln!("biohazardfs-fuse: dirty journal path has no parent for inode {inode}");
             return;
@@ -724,8 +730,8 @@ impl WorkspaceFs {
     }
 
     /// Remove the journal entry once the bytes have reached the daemon.
-    fn clear_dirty_journal(&self, inode: u64) {
-        let _ = fs::remove_file(self.dirty_journal_path(inode));
+    fn clear_dirty_journal(&self, inode: u64, fh: u64) {
+        let _ = fs::remove_file(self.dirty_journal_path(inode, fh));
     }
 
     /// Perform a daemon RPC and unpack the envelope. The HTTP lock is held only
@@ -892,6 +898,9 @@ impl WorkspaceFs {
             if !handle.writable {
                 return Err(Errno::EACCES);
             }
+            if handle.in_flight {
+                return Err(Errno::EBUSY);
+            }
             // Seed the buffer from the hydrated cache file on first write (or
             // re-seed from the committed cache state after a prior flush), then
             // overlay this write. This is what makes a non-truncating edit to an
@@ -901,13 +910,15 @@ impl WorkspaceFs {
             // zero-padded buffer. Still one complete blob per flush; no
             // streaming, no partials.
             accumulate_write(handle, &self.cache_dir, offset, data);
+            handle.ever_dirty = true;
+            handle.dirty_generation = handle.dirty_generation.saturating_add(1);
             handle.write_buffer.as_deref().map(Vec::from)
         };
         if let Some(bytes) = dirty_snapshot {
             // Best-effort: a journal-write failure is logged inside
             // `journal_dirty` and the bytes remain in memory for flush. The
             // clone above is the consistent snapshot persisted here.
-            self.journal_dirty(ino, &bytes);
+            self.journal_dirty(ino, fh, &bytes);
         }
         Ok(data.len())
     }
@@ -924,10 +935,14 @@ impl WorkspaceFs {
             if handle.inode != ino {
                 return Err(Errno::EBADF);
             }
+            if handle.in_flight {
+                return Err(Errno::EBUSY);
+            }
             let bytes = match handle.write_buffer.take() {
                 Some(bytes) => bytes,
                 None => return Ok(()),
             };
+            handle.in_flight = true;
             // Capture the optimistic-concurrency base captured at open time.
             // The daemon rejects the write with `version_conflict` if the
             // node's current version has moved on (another writer flushed
@@ -935,7 +950,9 @@ impl WorkspaceFs {
             // version. Only sent on the node_id path; a freshly created file
             // has no current version to pin.
             let base_version_id = handle.base_version_id.clone();
+            let dirty_generation = handle.dirty_generation;
             let entry = state.inodes.get(&ino).ok_or(Errno::EIO)?.clone();
+            let was_unbound = entry.node_id.is_none();
             let content_hex = encode_hex(&bytes);
             let params = if let Some(node_id) = &entry.node_id {
                 let mut params = serde_json::json!({
@@ -964,6 +981,8 @@ impl WorkspaceFs {
                 bytes,
                 params,
                 cache_path: entry.cache_path(&self.cache_dir),
+                was_unbound,
+                dirty_generation,
             }
         };
 
@@ -995,26 +1014,90 @@ impl WorkspaceFs {
                 // Persist the committed bytes to the local cache so a subsequent
                 // open/read sees them without a round-trip.
                 if fs::write(&prepared.cache_path, &prepared.bytes).is_err() {
-                    // The daemon truth is safe; the local cache write failed.
-                    // Surface EIO so the artist knows the cache is inconsistent.
+                    // The daemon accepted the version but the local cache write
+                    // failed. Do NOT restore the buffer as if it were
+                    // uncommitted: that would make retry create a duplicate or
+                    // resend a stale base. Mirror daemon identity/version, mark
+                    // cache failed for local recovery, unblock the handle, and
+                    // return EIO so the artist sees the local cache problem.
+                    let mut state = self.lock_state();
+                    let parent_inode = state.inodes.get(&ino).map(|entry| entry.parent_inode);
+                    if let Some(entry) = state.inodes.get_mut(&ino) {
+                        if let Some(node_id) = &node_id {
+                            entry.node_id = Some(node_id.clone());
+                        }
+                        entry.cache_state = CacheState::Failed;
+                        entry.content_hash = content_hash;
+                        entry.size_bytes = size_bytes;
+                        if version_id.is_some() {
+                            entry.current_version_id = version_id.clone();
+                        }
+                        entry.mtime = SystemTime::now();
+                    }
+                    for (handle_id, handle) in state.handles.iter_mut() {
+                        if handle.inode != ino {
+                            continue;
+                        }
+                        if *handle_id != fh && handle.in_flight {
+                            // Another handle's RPC owns its in-flight state;
+                            // do not unblock or rewrite its buffer from this
+                            // handle's cache-failure recovery path. If it is a
+                            // pre-bind dirty handle, mark the base stale now so
+                            // a later restored retry cannot become an
+                            // unconditional overwrite of the version this RPC
+                            // just committed.
+                            if handle.base_version_id.is_none() && handle.ever_dirty {
+                                handle.base_version_id = Some("ver_stale_precreate".to_string());
+                            }
+                            continue;
+                        }
+                        if *handle_id == fh {
+                            handle.in_flight = false;
+                            // The committing handle's bytes are daemon truth;
+                            // no local retry should resend them against a
+                            // failed cache. Disable the handle until reopen.
+                            handle.write_buffer = None;
+                            handle.writable = false;
+                            handle.ever_dirty = false;
+                            if let Some(base) = &version_id {
+                                handle.base_version_id = Some(base.clone());
+                            }
+                        } else if handle.write_buffer.is_some() || handle.ever_dirty {
+                            // Preserve other acknowledged dirty handles. Mark
+                            // pre-bind/no-base handles stale so a later flush
+                            // fails visibly instead of silently clobbering the
+                            // daemon-accepted version.
+                            if handle.base_version_id.is_none() {
+                                handle.base_version_id = Some("ver_stale_precreate".to_string());
+                            }
+                        } else {
+                            // Clean handles cannot safely continue against a
+                            // failed cache snapshot; force reopen/rehydrate.
+                            handle.writable = false;
+                            if let Some(base) = &version_id {
+                                handle.base_version_id = Some(base.clone());
+                            }
+                        }
+                    }
+                    if let (Some(parent_inode), Some(node_id)) = (parent_inode, node_id.clone())
+                        && let Some(cache) = state.children.get_mut(&parent_inode)
+                    {
+                        cache.by_node.insert(node_id, ino);
+                    }
+                    drop(state);
+                    self.clear_dirty_journal(ino, fh);
                     return Err(Errno::EIO);
                 }
 
-                // The bytes reached the daemon and the cache; any earlier dirty
-                // journal entry is obsolete.
-                self.clear_dirty_journal(ino);
-
                 let mut state = self.lock_state();
                 let parent_inode = state.inodes.get(&ino).map(|entry| entry.parent_inode);
-                // Round-3 FIX 2: the daemon advanced the node's current version
-                // on this commit. Mirror it onto the inode AND every open
-                // handle bound to it. Without this, write→flush→write→flush on
-                // the SAME handle re-sends the prior base_version_id (captured
-                // at open time) and the daemon rejects the second commit with
-                // version_conflict against the version we just committed — a
-                // self-inflicted conflict on a single handle. The calling
-                // handle's buffer was already taken above; other open handles
-                // keep their own buffers but now pin the fresh base.
+                // The daemon advanced the node's current version on this
+                // commit. Mirror it onto the inode so future opens capture the
+                // fresh base. Also advance ONLY the committing handle's base:
+                // write→flush→write→flush on the same handle is a valid
+                // continuation and must not self-conflict, but other handles
+                // opened against the prior version must stay pinned to their
+                // open-time base so the daemon rejects stale overwrites.
                 let next_base = version_id.clone();
                 if let Some(entry) = state.inodes.get_mut(&ino) {
                     if let Some(node_id) = &node_id {
@@ -1029,17 +1112,60 @@ impl WorkspaceFs {
                     entry.mtime = SystemTime::now();
                 }
                 if let Some(next_base) = next_base {
-                    for handle in state.handles.values_mut() {
-                        if handle.inode == ino {
-                            handle.base_version_id = Some(next_base.clone());
+                    if let Some(handle) = state.handles.get_mut(&fh) {
+                        handle.base_version_id = Some(next_base.clone());
+                        if handle.dirty_generation == prepared.dirty_generation
+                            && handle.write_buffer.is_none()
+                        {
+                            // Clear generation N while writes are still blocked
+                            // by in_flight=true, then unblock the handle. This
+                            // prevents a generation N+1 write from journaling to
+                            // the same path and then being deleted by the old
+                            // flush's cleanup.
+                            self.clear_dirty_journal(ino, fh);
+                            handle.ever_dirty = false;
+                        }
+                        handle.in_flight = false;
+                    } else {
+                        // The handle was released while the RPC was in flight.
+                        // No newer write can be staged on it now, so the
+                        // committed generation's journal is obsolete.
+                        self.clear_dirty_journal(ino, fh);
+                    }
+                    if prepared.was_unbound {
+                        for (handle_id, handle) in state.handles.iter_mut() {
+                            if *handle_id == fh
+                                || handle.inode != ino
+                                || handle.base_version_id.is_some()
+                            {
+                                continue;
+                            }
+                            if !handle.ever_dirty && handle.write_buffer.is_none() {
+                                // A clean handle opened before the first daemon
+                                // bind can continue from the newly-created
+                                // version.
+                                handle.base_version_id = Some(next_base.clone());
+                            } else {
+                                // A dirty handle buffered bytes before the file
+                                // had a daemon version. Do not silently promote
+                                // it to the fresh base; force a conflict if it
+                                // tries to flush so it cannot clobber the first
+                                // committed version without re-opening.
+                                handle.base_version_id = Some("ver_stale_precreate".to_string());
+                            }
                         }
                     }
+                } else if let Some(handle) = state.handles.get_mut(&fh) {
+                    // Protocol violation (file.write ok without version_id),
+                    // but never leave the handle permanently busy.
+                    handle.in_flight = false;
                 }
                 if let (Some(parent_inode), Some(node_id)) = (parent_inode, node_id)
                     && let Some(cache) = state.children.get_mut(&parent_inode)
                 {
                     cache.by_node.insert(node_id, ino);
                 }
+                drop(state);
                 Ok(())
             }
             Err(error) => {
@@ -1066,9 +1192,10 @@ impl WorkspaceFs {
                 // Persist the unsent bytes to the durable dirty journal so they
                 // survive release/restart; a daemon-reconnect replay path will
                 // push them. Done before re-locking state so the borrow is clean.
-                self.journal_dirty(ino, &prepared.bytes);
+                self.journal_dirty(ino, fh, &prepared.bytes);
                 let mut state = self.lock_state();
                 if let Some(handle) = state.handles.get_mut(&fh) {
+                    handle.in_flight = false;
                     handle.write_buffer = Some(prepared.bytes);
                 }
                 if let Some(entry) = state.inodes.get_mut(&ino)
@@ -1094,9 +1221,9 @@ impl WorkspaceFs {
     /// version. `fh` is the handle the kernel passed (Some for ftruncate, None
     /// for path-style truncate): with a handle the buffer is staged on it;
     /// without one the truncation folds into any open writable handle for the
-    /// inode — the kernel follows a path-style truncate with a flush on its
-    /// internally-opened handle — and if no handle is open the bytes are
-    /// journaled so a later open+flush commits them rather than dropping them.
+    /// inode. If no handle is available, return ENOSYS before changing cache
+    /// state; there is not yet a replay path that could commit a journal-only
+    /// truncate to the daemon.
     ///
     /// Sparse extension past the current cache length is unimplemented: the
     /// MVP commits one complete blob per flush, so an extension would zero-pad
@@ -1109,67 +1236,59 @@ impl WorkspaceFs {
         fh: Option<u64>,
         new_size: u64,
     ) -> std::result::Result<(), Errno> {
-        // Gather the cache path under lock; the truncation I/O runs without
-        // the state lock so other inodes' FUSE ops keep progressing (matches
-        // buffer_write's local-IO discipline — the state lock is never held
-        // across disk or RPC work).
+        let new_len = usize::try_from(new_size).map_err(|_| Errno::EOVERFLOW)?;
+
+        // Hold the state lock from target selection through staging. Otherwise
+        // release() could remove the selected handle after cache I/O but before
+        // stage_handle_truncation(), leaving a reported-success truncate with
+        // no buffer that can ever flush to the daemon. This is local cache I/O
+        // only (no RPC), and the critical section is intentionally small.
+        let mut state = self.lock_state();
         let cache_path = {
-            let state = self.lock_state();
             let entry = state.inodes.get(&ino).ok_or(Errno::ENOENT)?;
             if entry.kind != FileType::RegularFile {
                 return Err(Errno::EISDIR);
             }
             inode_cache_path(&self.cache_dir, ino)
         };
+        // Prefer the kernel-provided fh; fall back to any open writable handle
+        // for the inode so a path-style truncate still reaches a flush.
+        let target_handle = if fh.is_some_and(|id| {
+            state
+                .handles
+                .get(&id)
+                .is_some_and(|handle| handle.inode == ino)
+        }) {
+            fh
+        } else {
+            state
+                .handles
+                .iter()
+                .find(|(_, handle)| handle.inode == ino && handle.writable)
+                .map(|(id, _)| *id)
+        }
+        .ok_or(Errno::ENOSYS)?;
 
-        let new_len = usize::try_from(new_size).map_err(|_| Errno::EOVERFLOW)?;
+        if state
+            .handles
+            .get(&target_handle)
+            .is_some_and(|handle| handle.in_flight)
+        {
+            return Err(Errno::EBUSY);
+        }
+
         let truncated = truncate_cache_file(&cache_path, new_len)?;
 
-        // Stage the truncation on a handle so flush commits it; advance the
-        // inode size so getattr reflects the new length even before the flush
-        // lands.
-        let journal_pending = {
-            let mut state = self.lock_state();
-            if let Some(entry) = state.inodes.get_mut(&ino) {
-                entry.size_bytes = truncated.len() as u64;
-                entry.cache_state = CacheState::Ready;
-            }
-            // Prefer the kernel-provided fh; fall back to any open writable
-            // handle for the inode so a path-style truncate still reaches a
-            // flush. The immutable lookups below end at the expression boundary
-            // (NLL), so the mutable staging borrow that follows is clean.
-            let target = if fh.is_some_and(|id| {
-                state
-                    .handles
-                    .get(&id)
-                    .is_some_and(|handle| handle.inode == ino)
-            }) {
-                fh
-            } else {
-                state
-                    .handles
-                    .iter()
-                    .find(|(_, handle)| handle.inode == ino && handle.writable)
-                    .map(|(id, _)| *id)
-            };
-            match target {
-                Some(id) => {
-                    if let Some(handle) = state.handles.get_mut(&id) {
-                        stage_handle_truncation(handle, new_len, &truncated);
-                    }
-                    None
-                }
-                None => Some(truncated),
-            }
-        };
-
-        if let Some(bytes) = journal_pending {
-            // No open handle is carrying the truncation. Persist the bytes to
-            // the durable dirty journal so a future open+flush commits them;
-            // today the replay path is the documented follow-up, but the bytes
-            // survive release/restart rather than being dropped.
-            self.journal_dirty(ino, &bytes);
+        if let Some(entry) = state.inodes.get_mut(&ino) {
+            entry.size_bytes = truncated.len() as u64;
+            entry.cache_state = CacheState::Ready;
         }
+        let handle = state.handles.get_mut(&target_handle).ok_or(Errno::EIO)?;
+        stage_handle_truncation(handle, new_len, &truncated);
+        handle.ever_dirty = true;
+        handle.dirty_generation = handle.dirty_generation.saturating_add(1);
+        drop(state);
+        self.journal_dirty(ino, target_handle, &truncated);
         Ok(())
     }
 }
@@ -1178,6 +1297,8 @@ struct PreparedCommit {
     bytes: Vec<u8>,
     params: Value,
     cache_path: PathBuf,
+    was_unbound: bool,
+    dirty_generation: u64,
 }
 
 impl Filesystem for WorkspaceFs {
@@ -1395,10 +1516,16 @@ impl Filesystem for WorkspaceFs {
                     writable,
                     write_buffer,
                     base_version_id,
+                    ever_dirty: truncating,
+                    dirty_generation: if truncating { 1 } else { 0 },
+                    in_flight: false,
                 },
             );
             handle_id
         };
+        if truncating {
+            self.journal_dirty(ino.0, handle, &[]);
+        }
         reply.opened(FileHandle(handle), FopenFlags::empty());
     }
 
@@ -1514,13 +1641,21 @@ impl Filesystem for WorkspaceFs {
         // took it), so this only fires on the failure path.
         let dirty_bytes = {
             let mut state = self.lock_state();
+            if state
+                .handles
+                .get(&fh.0)
+                .is_some_and(|handle| handle.in_flight)
+            {
+                reply.error(Errno::EBUSY);
+                return;
+            }
             state
                 .handles
                 .remove(&fh.0)
                 .and_then(|handle| handle.write_buffer)
         };
         if let Some(bytes) = dirty_bytes {
-            self.journal_dirty(ino.0, &bytes);
+            self.journal_dirty(ino.0, fh.0, &bytes);
         }
         reply.ok();
     }
@@ -1615,10 +1750,14 @@ impl Filesystem for WorkspaceFs {
                     write_buffer: Some(Vec::new()),
                     // Freshly created file: no daemon version to pin yet.
                     base_version_id: None,
+                    ever_dirty: true,
+                    dirty_generation: 1,
+                    in_flight: false,
                 },
             );
             (inode, handle_id, attr)
         };
+        self.journal_dirty(_inode, handle, &[]);
         reply.created(
             &TTL,
             &attr,
@@ -2321,6 +2460,9 @@ mod tests {
             writable: true,
             write_buffer: None,
             base_version_id: None,
+            ever_dirty: false,
+            dirty_generation: 0,
+            in_flight: false,
         };
         accumulate_write(&mut handle, &dir, 3, b"X");
         assert_eq!(handle.write_buffer.as_deref(), Some(b"abcXef".as_slice()));
@@ -2337,6 +2479,9 @@ mod tests {
             writable: true,
             write_buffer: None,
             base_version_id: None,
+            ever_dirty: false,
+            dirty_generation: 0,
+            in_flight: false,
         };
         accumulate_write(&mut handle, &dir, 0, b"hello");
         assert_eq!(handle.write_buffer.as_deref(), Some(b"hello".as_slice()));
@@ -2361,20 +2506,20 @@ mod tests {
         };
 
         // Non-empty bytes are journaled.
-        mount.journal_dirty(7, b"persist me");
-        let path = mount.dirty_journal_path(7);
+        mount.journal_dirty(7, 70, b"persist me");
+        let path = mount.dirty_journal_path(7, 70);
         assert_eq!(std::fs::read(&path).unwrap(), b"persist me");
 
         // Clearing removes the entry once the daemon has the bytes.
-        mount.clear_dirty_journal(7);
+        mount.clear_dirty_journal(7, 70);
         assert!(!path.exists(), "journal entry cleared after commit");
 
-        // Empty bytes are not journaled (no spurious empty entries).
-        mount.journal_dirty(8, b"");
-        assert!(
-            !mount.dirty_journal_path(8).exists(),
-            "empty bytes must not be journaled"
-        );
+        // Empty bytes are still a meaningful dirty version: zero-byte create
+        // and truncate-to-zero must leave a durable marker.
+        mount.journal_dirty(8, 80, b"");
+        let empty_path = mount.dirty_journal_path(8, 80);
+        assert!(empty_path.exists(), "empty dirty version leaves a marker");
+        assert_eq!(std::fs::read(&empty_path).unwrap(), b"");
     }
 
     #[test]
@@ -2577,6 +2722,9 @@ mod tests {
                     writable: true,
                     write_buffer: Some(payload.clone()),
                     base_version_id: None,
+                    ever_dirty: true,
+                    dirty_generation: 1,
+                    in_flight: false,
                 },
             );
             (inode, handle)
@@ -2684,6 +2832,9 @@ mod tests {
                 writable: true,
                 write_buffer: Some(payload.clone()),
                 base_version_id: None,
+                ever_dirty: true,
+                dirty_generation: 1,
+                in_flight: false,
             },
         );
         let fs = WorkspaceFs {
@@ -2705,7 +2856,7 @@ mod tests {
 
         // The dirty bytes are also persisted to the durable journal so a later
         // release cannot drop the only copy.
-        let journal_path = fs.dirty_journal_path(inode);
+        let journal_path = fs.dirty_journal_path(inode, 1);
         let journaled = std::fs::read(&journal_path).expect("dirty journal written on failure");
         assert_eq!(journaled, payload);
     }
@@ -2943,7 +3094,7 @@ mod tests {
 
         // No journal entry before the first acknowledged write.
         assert!(
-            !fs.dirty_journal_path(inode).exists(),
+            !fs.dirty_journal_path(inode, handle).exists(),
             "no journal entry before any write"
         );
 
@@ -2954,7 +3105,7 @@ mod tests {
 
         // The dirty journal holds the acknowledged bytes — they survive FUSE
         // process death before flush (clear_dirty_journal runs on flush Ok).
-        let journal = fs.dirty_journal_path(inode);
+        let journal = fs.dirty_journal_path(inode, handle);
         let bytes = std::fs::read(&journal).expect("dirty journal written on write");
         assert_eq!(bytes, b"acknowledged");
 
@@ -3092,6 +3243,9 @@ mod tests {
                     writable: true,
                     write_buffer: Some(b"stale write".to_vec()),
                     base_version_id: Some("ver_stale".to_string()),
+                    ever_dirty: true,
+                    dirty_generation: 1,
+                    in_flight: false,
                 },
             );
             handle_id
@@ -3266,6 +3420,9 @@ mod tests {
                 writable: true,
                 write_buffer: None,
                 base_version_id: Some("ver_open".to_string()),
+                ever_dirty: false,
+                dirty_generation: 0,
+                in_flight: false,
             },
         );
         let fs = WorkspaceFs {
@@ -3454,6 +3611,186 @@ mod tests {
         );
     }
 
+    /// A successful flush must advance only the committing handle. Other open
+    /// handles were opened against the old base and must keep that old base so
+    /// the daemon can reject stale overwrites. Repro covered here: two handles
+    /// open version v1; handle A flushes v2; handle B then flushes edits based
+    /// on v1. If commit_handle updates every handle to v2, B is incorrectly
+    /// accepted and clobbers A. Correct behavior is version_conflict -> EIO.
+    #[test]
+    fn workspace_flush_does_not_advance_other_open_handles() {
+        let (addr, backend, _handle) = start_test_daemon("ws_two_handle_base");
+        let cache = workspace_test_dir("two-handle-base-cache");
+        let mount = workspace_test_dir("two-handle-base-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_two_handle_base".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Create the file (v1) with content abcdef.
+        let (inode, create_handle) =
+            seed_uncommitted_handle(&fs, "race.txt", b"abcdef".to_vec(), None);
+        fs.commit_handle(inode, create_handle)
+            .expect("create commit");
+        let (node_id, v1) = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            (
+                entry.node_id.clone().expect("node bound"),
+                entry.current_version_id.clone().expect("v1 set"),
+            )
+        };
+
+        // Two independent writable opens against v1.
+        let handle_a = seed_handle_on(&fs, inode, Some(v1.clone()));
+        let handle_b = seed_handle_on(&fs, inode, Some(v1.clone()));
+
+        // B buffers stale edits first, but does not flush yet.
+        fs.buffer_write(inode, handle_b, 0, b"222")
+            .expect("stale handle write buffered");
+
+        // A flushes a newer version.
+        fs.buffer_write(inode, handle_a, 0, b"111")
+            .expect("winner write buffered");
+        fs.commit_handle(inode, handle_a)
+            .expect("winner commit succeeds");
+        let v2 = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            entry.current_version_id.clone().expect("v2 set")
+        };
+        assert_ne!(v1, v2);
+
+        // The committing handle advances to v2 for a valid same-handle
+        // continuation, but the stale handle remains pinned to v1.
+        {
+            let state = fs.lock_state();
+            assert_eq!(
+                state
+                    .handles
+                    .get(&handle_a)
+                    .and_then(|handle| handle.base_version_id.as_deref()),
+                Some(v2.as_str())
+            );
+            assert_eq!(
+                state
+                    .handles
+                    .get(&handle_b)
+                    .and_then(|handle| handle.base_version_id.as_deref()),
+                Some(v1.as_str()),
+                "non-committing handle must keep its open-time base"
+            );
+        }
+
+        // B's stale flush must conflict rather than clobbering A's bytes.
+        let errno = fs
+            .commit_handle(inode, handle_b)
+            .expect_err("stale handle must conflict");
+        assert_eq!(i32::from(errno), libc::EIO);
+
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            inner
+                .file_contents
+                .get(&node_id)
+                .map(|bytes| bytes.as_slice()),
+            Some(&b"111def"[..]),
+            "winner bytes remain daemon truth; stale bytes did not clobber"
+        );
+    }
+
+    /// If one handle creates/binds a previously local-only inode, another
+    /// already-dirty handle from before the bind must not be silently promoted
+    /// to the new base. Its bytes were based on the pre-daemon local state and
+    /// must conflict rather than clobbering the first committed version.
+    #[test]
+    fn workspace_first_bind_marks_dirty_precreate_handles_stale() {
+        let (addr, backend, _handle) = start_test_daemon("ws_precreate_stale");
+        let cache = workspace_test_dir("precreate-stale-cache");
+        let mount = workspace_test_dir("precreate-stale-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_precreate_stale".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        let (inode, first_handle) =
+            seed_uncommitted_handle(&fs, "new-race.txt", b"first".to_vec(), None);
+        let second_handle = {
+            let mut state = fs.lock_state();
+            let handle = state.next_handle;
+            state.next_handle += 1;
+            state.handles.insert(
+                handle,
+                OpenHandle {
+                    inode,
+                    writable: true,
+                    write_buffer: Some(b"second".to_vec()),
+                    base_version_id: None,
+                    ever_dirty: true,
+                    dirty_generation: 1,
+                    in_flight: false,
+                },
+            );
+            handle
+        };
+
+        fs.commit_handle(inode, first_handle)
+            .expect("first bind succeeds");
+        let (node_id, v1) = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            (
+                entry.node_id.clone().expect("node bound"),
+                entry.current_version_id.clone().expect("v1 set"),
+            )
+        };
+        {
+            let state = fs.lock_state();
+            let stale = state.handles.get(&second_handle).expect("second handle");
+            assert_eq!(
+                stale.base_version_id.as_deref(),
+                Some("ver_stale_precreate"),
+                "dirty pre-bind handle is marked stale, not promoted to v1"
+            );
+        }
+
+        let errno = fs
+            .commit_handle(inode, second_handle)
+            .expect_err("dirty pre-bind handle must conflict");
+        assert_eq!(i32::from(errno), libc::EIO);
+
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            inner
+                .nodes
+                .get(&node_id)
+                .and_then(|node| node.current_version_id.as_deref()),
+            Some(v1.as_str())
+        );
+        assert_eq!(
+            inner
+                .file_contents
+                .get(&node_id)
+                .map(|bytes| bytes.as_slice()),
+            Some(&b"first"[..]),
+            "first committed bytes remain daemon truth"
+        );
+    }
+
     /// Seed a writable handle bound to an existing inode with the given
     /// optimistic-concurrency base (simulates open() of an existing file for
     /// the FIX 4 edit leg). Returns the handle id.
@@ -3468,6 +3805,9 @@ mod tests {
                 writable: true,
                 write_buffer: None,
                 base_version_id,
+                ever_dirty: false,
+                dirty_generation: 0,
+                in_flight: false,
             },
         );
         handle
@@ -3518,6 +3858,9 @@ mod tests {
                 writable: true,
                 write_buffer: Some(bytes),
                 base_version_id,
+                ever_dirty: true,
+                dirty_generation: 1,
+                in_flight: false,
             },
         );
         (inode, handle)
@@ -3563,6 +3906,9 @@ mod tests {
                 writable: true,
                 write_buffer: None,
                 base_version_id,
+                ever_dirty: false,
+                dirty_generation: 0,
+                in_flight: false,
             },
         );
         (inode, handle)
