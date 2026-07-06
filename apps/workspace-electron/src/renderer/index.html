@@ -3,7 +3,30 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Biohazard Workspace</title>
+    <title>BiohazardFS</title>
+    <link
+      rel="preload"
+      href="/assets/fonts/ArchivGrotesk-Regular.otf"
+      as="font"
+      type="font/otf"
+      crossorigin
+    />
+    <script>
+      // Apply the persisted theme before first paint to avoid a flash. The
+      // renderer mirrors the user's choice (light/dark/system) to localStorage;
+      // 'system' resolves against the OS color-scheme here.
+      (function () {
+        try {
+          var t = localStorage.getItem('biohazardfs.theme') || 'dark';
+          var dark =
+            t === 'dark' ||
+            (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (_e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

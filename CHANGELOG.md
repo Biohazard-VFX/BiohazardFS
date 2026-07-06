@@ -18,6 +18,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Added
 
+- Biohazard Workspace desktop UI rebuilt as a LucidLink-style client: sidebar navigation (Files, Activity, Cache, Conflicts, Settings) with live status badges and a cache-usage footer, topbar with sync-status pill and filter, status bar, and five views with loading/empty/error states. Real shadcn/ui (Radix) primitives replace the hand-rolled scaffold CSS. The raw daemon-diagnostics dump moved into Settings → Diagnostics, out of the default artist flow. All daemon IPC, loopback/token safety, and the renderer's defensive parsing + sync guards (dirty-file dehydration guard, clear-all-local-cache refuse-while-dirty, keep-last-good on dropout, lock default-to-locked) are preserved and now unit-tested. Dark theme by default; accent `#dd4132`.
+- Vitest added for the Electron renderer with unit coverage of the safety-critical pure helpers (`isDirtyEntry`, `keepLastGood`, `computeProgress`, `formatBytes`, `extractData`/`extractError`, `entryList`, `stateLabel`).
+- Archiv Grotesk wired as the primary UI typeface for the dev/preview build.
+
+### Known follow-ups (not in this change)
+
+- Archiv Grotesk is currently the Trial cut, single weight. It must be replaced with a properly licensed multi-weight cut (or an OFL alternative such as Inter/Geist) before any public/alpha artifact ships.
+- Tray/menu-bar residency, close-to-tray, and quit-guard-while-uploading remain a follow-up slice; this change ships the full desktop window only.
+
 - Rust workspace scaffold for core, API types, CLI, daemon, and filesystem adapter crates.
 - Runnable `biohazardfs` CLI scaffold with JSON response envelopes and daemon status integration.
 - Runnable `biohazardfsd` daemon scaffold with explicit dev-loopback JSON-RPC, local-token auth, loopback-only enforcement, and daemon status/health methods.

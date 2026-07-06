@@ -103,6 +103,11 @@ if [[ "${BIOHAZARDFS_SKIP_ELECTRON_BUILD:-0}" != "1" ]]; then
   pnpm --dir apps/workspace-electron run build
 fi
 
+if [[ "${BIOHAZARDFS_SKIP_ELECTRON_LAUNCH:-0}" == "1" ]]; then
+  echo "BIOHAZARDFS_SKIP_ELECTRON_LAUNCH=1; skipping Electron launch smoke" >&2
+  exit 0
+fi
+
 if command -v xvfb-run >/dev/null 2>&1; then
   # GitHub-hosted Linux runners do not configure Electron's chrome-sandbox helper.
   # Keep renderer sandbox enabled in app code, but disable Chromium's host sandbox for this smoke launch.
