@@ -76,10 +76,16 @@ MVP targets:
 
 ### UX
 
-- Default mount name: `Biohazard`.
-- Windows: choose drive letter, default to next available.
-- macOS: mount appears in Finder sidebar automatically if possible.
-- Linux/macOS: choose mount location.
+The desktop dashboard UX is specified in `docs/product/DASHBOARD_UX.md` and is a product requirement, not a visual afterthought.
+
+- Biohazard Workspace is a multi-studio workspace manager, not a single-project dashboard.
+- A freelancer can connect to multiple studios at once, e.g. Biohazard VFX, another studio, and a personal/self-hosted workspace.
+- Each connected studio is a separate local connection profile with its own auth, device registration, mount config, cache policy, sync state, and health.
+- MVP uses one mounted drive/location per studio; projects/workspaces/folders appear inside that studio mount according to current permissions.
+- Default mount name for Biohazard's own studio profile: `Biohazard` or `Biohazard VFX` depending on context and collision rules.
+- Windows: choose drive letter per connected studio, default to next available.
+- macOS: each connected studio mount appears in Finder sidebar automatically if possible.
+- Linux/macOS: choose mount location per connected studio.
 - Users see authorized root hierarchy; unauthorized folders are hidden.
 - Native Explorer/Finder status badges/placeholders are MVP requirements.
 - App should feel like a small, beautiful utility that lives in tray/menu bar.
@@ -137,13 +143,16 @@ Acceptable auth flows:
 
 Ideal freelancer flow:
 
-1. Admin provisions invite/download link.
+1. Admin provisions invite/download link for a studio/org connection.
 2. Freelancer installs Biohazard Workspace.
 3. Invite/token is already embedded or pasted.
-4. User enters name if needed.
-5. Mount appears with assigned workset.
+4. User authenticates or identifies themselves and registers the workstation/device.
+5. App runs workstation preflight: daemon, filesystem support, server reachability, cache path/space, invite validity, and OS permissions.
+6. App mounts one stable drive/location for that studio.
+7. App loads the user's current BiohazardFS-native access and shows available workspaces/projects/folders.
+8. User can open the studio drive or current work from `My Work`.
 
-Devices must be revocable individually.
+Invites should join the user/device to a studio, not permanently bind them to one specific project/workset/folder, because project access can change during production. Devices must be revocable individually.
 
 ### Permissions/access
 
@@ -165,7 +174,7 @@ Permissions should support at least:
 - expiry windows
 - download/share limits
 
-Kitsu should be the source of truth for assignments when integrated, but BiohazardFS must work without Kitsu.
+For MVP, BiohazardFS-native permissions are the source of truth for what a freelancer sees. Kitsu and other production systems may later automate or suggest BiohazardFS grants, but BiohazardFS must work without Kitsu and must not require a new invite for every project/folder access change.
 
 ### Versioning, audit, snapshots, and conflict model
 
