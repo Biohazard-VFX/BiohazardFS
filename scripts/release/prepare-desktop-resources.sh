@@ -9,6 +9,9 @@ TARGET_ARCH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --)
+      shift
+      ;;
     --target-platform)
       TARGET_PLATFORM="${2:-}"
       shift 2
