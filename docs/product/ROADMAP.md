@@ -12,3 +12,15 @@ Status legend: **IMPLEMENTED** (real behavior, tested), **SCAFFOLD** (typed + wi
 8. Windows native placeholder spike. — **PLANNED.** Windows runs Rust check/test in CI only; no FUSE-on-Windows driver yet.
 9. macOS native placeholder spike. — **PLANNED.** macOS runs Rust check/test in CI only; no FUSE-for-macOS integration yet.
 10. Kitsu worksets and folder templates. — **PLANNED.** Server `worksets.list` spine exists against the metadata baseline; Kitsu integration has not started.
+
+## LucidLink parity gates
+
+The product spec defines LucidLink parity as a user-visible workflow target, not an implementation clone. These gates are the practical roadmap checkpoints before BiohazardFS can claim production-ready parity:
+
+1. **Mounted workspace parity** — native OS mount on Linux plus at least one artist platform target; authorized namespace appears immediately; ordinary DCC/editor apps can open files from the mount.
+2. **Hydration/cache parity** — on-demand hydrate, explicit pin/make-available-offline, remove-local-copy, cache location/limit controls, safe cache-full behavior, and persistent dirty/offline state across daemon restart.
+3. **Collaboration parity** — newly added files appear quickly for permitted collaborators with honest upload/availability state; saves upload without manual sync choreography; users do not coordinate versions through side channels.
+4. **Version/conflict/lock parity** — every committed write is immutable, divergent edits preserve both sides, conflicts are surfaced in mount + app, and binary/scene-file locks prevent avoidable collisions.
+5. **Onboarding parity** — install, authenticate via invite/device/token, mount assigned workspace/workset, and open the linked folder in under 10 minutes for a nontechnical freelancer.
+6. **Admin/recovery parity** — admin can revoke devices, manage users/permissions/worksets, inspect audit/version history, recover deleted/overwritten work, and share deep links without exposing storage/database credentials.
+7. **Self-hosted parity extension** — all of the above must run against self-hosted PostgreSQL plus S3-compatible object storage, with hosted LucidLink-style convenience but studio-controlled infrastructure.

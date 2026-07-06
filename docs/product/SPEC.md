@@ -10,6 +10,30 @@ BiohazardFS is an open-source LucidLink-style virtual sync filesystem for VFX pr
 
 BiohazardFS is built for Biohazard first and should later become a public Apache-2.0-licensed product other studios can self-host and use commercially.
 
+### LucidLink feature-parity target
+
+"Feature parity with LucidLink" does **not** mean cloning LucidLink's implementation, branding, pricing, or hosted business model. It means BiohazardFS must satisfy the same production workflow promise that made LucidLink usable for VFX teams: artists and collaborators work from one shared cloud-backed workspace that behaves like a normal local drive, without manually coordinating uploads, downloads, duplicated files, or side-channel version handoffs.
+
+For BiohazardFS, LucidLink parity means these user-visible capabilities are required before claiming production-ready MVP:
+
+1. **Native mounted workspace** — the workspace appears as an ordinary drive/location in the OS file manager: a drive letter on Windows, Finder-visible mount on macOS, and a normal mount path on Linux.
+2. **Instant namespace visibility** — authorized files and folders appear immediately as placeholders/metadata, without pre-downloading the whole project.
+3. **Open-from-cloud workflow** — artists can open project files directly from the mounted workspace in DCC/editing tools without first copying them to a local working folder.
+4. **Hydrate/cache on demand** — file content is fetched when opened, previewed, played, pinned, or prefetched. MVP may hydrate full files for DCC safety; future parity should support range/streaming reads for video/editorial playback.
+5. **No manual sync choreography** — users should not need to ask "did you upload/download the right version?" Normal saves, uploads, cache state, and transfer progress are owned by the client/daemon/server.
+6. **Shared live filespace** — once a file is added to the workspace, collaborators with permission see it in the same namespace quickly. While a large upload is still in progress, other users should see honest availability/progress state and must never mistake incomplete bytes for a committed complete version.
+7. **Local-drive feel in production apps** — Adobe, DaVinci Resolve, Final Cut, Nuke, Blender, Houdini, and similar tools should see normal filesystem paths and basic POSIX/OS file semantics, within the limits documented for each platform adapter.
+8. **Pinned/offline safety** — users can mark files/folders "Make available offline" so key work can continue through weak connectivity. Dirty/unuploaded work survives process restart and reconnects safely.
+9. **Cache management that nontechnical users understand** — cache location, cache size, pinned/offline state, remove-local-copy, and cache-full behavior are visible and safe in Biohazard Workspace.
+10. **Single-source collaboration semantics** — committed writes create immutable versions; divergent edits preserve both sides; binary/scene-file locks prevent avoidable collisions; conflicts are visible in the mounted workspace and app.
+11. **Fast collaborator onboarding** — a freelancer can install, authenticate with an invite/device/token flow, mount the assigned workspace or workset, and open the right folder in under 10 minutes.
+12. **Deep links to workspace paths** — the product supports shareable/openable links to a file or folder inside a mounted workspace/workset, so an admin can send a collaborator directly to the correct project subtree.
+13. **Admin controls** — admins can manage users/devices/workspaces/worksets, revoke devices, set permissions, inspect audit/version history, and recover from mistakes without touching object-store/database credentials.
+14. **Production reliability baseline** — the system must fail closed rather than corrupting or silently losing data: interrupted uploads resume or preserve dirty state, cache-full pauses/fails safely, server commits only verified content, and clients clearly report degraded/offline/error states.
+15. **Self-hosted and customizable** — unlike LucidLink's hosted product, BiohazardFS parity includes first-class self-hosting on PostgreSQL plus S3-compatible object storage, with studio-specific integrations such as Kitsu optional rather than hard-coded.
+
+The earliest dev builds may implement these through full-file hydrate and conservative blocking behavior. A production MVP cannot claim LucidLink parity until the mounted workspace, onboarding, cache/offline safety, shared namespace, version/conflict/lock behavior, and admin recovery paths are all real end-to-end on at least Linux plus one artist platform target.
+
 ## 2. Opinionated stack
 
 BiohazardFS should be opinionated but not Biohazard-only.
