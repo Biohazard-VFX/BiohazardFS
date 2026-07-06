@@ -291,7 +291,7 @@ Commands:
 ```bash
 biohazardfs auth status
 biohazardfs auth enroll --code <device-or-invite-code>
-biohazardfs auth login --token <token>
+BIOHAZARDFS_TOKEN=<token> biohazardfs auth login
 biohazardfs auth logout --yes
 biohazardfs auth whoami
 biohazardfs auth credentials path
@@ -411,15 +411,15 @@ biohazardfs-fuse mount --source /path/to/workspace --mountpoint /path/to/mountpo
 Read-write daemon-backed workspace mount (Linux; the FUSE write path):
 
 ```bash
-biohazardfs-fuse mount-workspace \
+BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs-fuse mount-workspace \
   --daemon-endpoint 127.0.0.1:47666 \
-  --local-token "$BIOHAZARDFS_LOCAL_TOKEN" \
   --cache-dir /path/to/cache \
   --mountpoint /path/to/mountpoint
 ```
 
 Rules:
 
+- For `mount-workspace`: the local daemon token is read from `BIOHAZARDFS_LOCAL_TOKEN` (env only); there is no `--local-token` flag, so tokens never appear in process listings or shell history.
 - For `mount`: the source and mountpoint must already exist and resolve to directories. The adapter canonicalizes both paths before mounting.
 - For `mount`: the mounted view is read-only; write, unlink, and rmdir requests are denied with a read-only filesystem error. Directory entries are indexed from regular files and directories under the source root; symlinks and special files are skipped in the MVP to preserve path containment.
 - For `mount-workspace`: files hydrate from the daemon via `file.read` on open, writes buffer per file handle, and one complete blob is pushed per flush/fsync via `file.write`. Dirty data is never lost: a write that has not flushed is not acked to the daemon, and dehydrate/evict refuse dirty or pinned cache entries.
@@ -739,7 +739,7 @@ biohazardfs admin retention set --json '{...}' --dry-run
 biohazardfs admin support-bundle create --redacted --yes
 ```
 
-Status: every `admin *` subcommand is wired but SCAFFOLD: the daemon backing for the entire `admin.*` group returns `method_not_implemented`. All admin methods are Admin-class, so under the agent-safe profile they require `--dry-run` (mints a CLI plan, exit 7) or `--yes` (dispatches; the daemon then reports `operation_token_required` until the token handoff lands, and `method_not_implemented` once it does).
+Status: every `admin *` subcommand is wired but SCAFFOLD: the daemon backing for the entire `admin.*` group returns `method_not_implemented`. All admin methods are Admin-class, so under the agent-safe profile they require `--dry-run` (mints a CLI plan, exit 7) or `--yes` (returns `apply_not_wired`, exit 7, and does NOT dispatch to the daemon — the daemon-issued operation-token handoff is not wired yet, so the CLI cannot produce a daemon-valid token and declines to call).
 
 ## Error codes
 
@@ -795,7 +795,7 @@ The CLI command tree in `crates/cli/src/main.rs` wires the full canonical namesp
 ### Implemented (real behavior, tested)
 
 - Standard JSON response envelope, `--output json|ndjson|text`, ndjson streaming over list-shaped reads, `--fields`/`--cursor` pagination, `--source`/`--request-id` provenance, and the seven global mutation/provenance/output flags.
-- Mutation gating under the agent-safe profile: read/low-risk proceed; destructive/admin/data-moving commands require `--dry-run` (CLI mints an operation token + plan, exit 7) or `--yes`. Exit codes 5 (conflict/lock) and 8 (unsupported platform / feature disabled) are mapped.
+- Mutation gating under the agent-safe profile: read/low-risk proceed; destructive/admin/data-moving commands take `--dry-run` (CLI mints an operation token + plan, exit 7) or `--yes` (returns `apply_not_wired`, exit 7, without dispatching — the daemon-issued operation-token handoff is not wired). Exit codes 5 (conflict/lock) and 8 (unsupported platform / feature disabled) are mapped.
 - `schema list` / `commands` (registry from `known_methods`), `schema command`, `schema event`, `schema error`, `schema config`, `schema all` — resolved CLI-local, no daemon required.
 - `version`, `status`, shallow `doctor`, `config path`, `config show --redacted`, `config validate` — CLI-local, read resolved TOML.
 - Server-backed `namespace children`, `object put`/`object get`, `file put`/`file get` (content-object and current-version primitives; `--out` writes the local file).
@@ -810,7 +810,7 @@ The CLI command tree in `crates/cli/src/main.rs` wires the full canonical namesp
 - Auth mutations (`auth.enroll`, `auth.login`, `auth.logout`, `auth.credentials rotate`), `config.set`/`config.migrate`, `mount.attach`/`mount.detach`/`mount.repair`, and `daemon.shutdown`/`daemon.restart`/`daemon.logs` are periphery.
 - `daemon start`, `smoke run`, and `doctor --json-deep` return typed stubs (`method_not_implemented`) with pointers to where the real behavior will land.
 - `mcp serve` `tools/call` validates the tool name but returns a JSON-RPC error instructing the caller to use the matching CLI subcommand; tool execution is not wired through the CLI tree.
-- The CLI→daemon operation-token handoff is not wired: the CLI mints dry-run tokens locally, and the daemon validates only tokens it issued itself, so `--yes` on destructive/admin/data-moving methods surfaces `operation_token_required` from the daemon. Read and low-risk mutations execute end-to-end.
+- The CLI→daemon operation-token handoff is not wired: the CLI mints dry-run tokens locally, and the daemon validates only tokens it issued itself, so `--yes` on destructive/admin/data-moving methods returns `apply_not_wired` (exit 7) at the CLI without dispatching — the CLI cannot produce a daemon-valid token and declines to call (which would otherwise reject with `operation_token_required`). Read and low-risk mutations execute end-to-end.
 
 ### Planned (in the spec, not yet in code)
 

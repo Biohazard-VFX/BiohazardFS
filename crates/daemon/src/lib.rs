@@ -216,9 +216,13 @@ pub fn dispatch_rpc(backend: &DaemonBackend, request: &DaemonRequest) -> Respons
             format!("unknown daemon method {method}"),
         )),
         Some(descriptor) => {
-            if let Err(error) =
-                ensure_operation_token(backend, &method, &params, descriptor.classification)
-            {
+            if let Err(error) = ensure_operation_token(
+                backend,
+                &method,
+                &params,
+                descriptor.classification,
+                source.clone(),
+            ) {
                 Err(error)
             } else {
                 // dispatch_method takes `source` by value (it records audit
@@ -368,15 +372,16 @@ fn dispatch_method(
 }
 
 /// Operation-token policy check. Under AgentSafe, only Read/LowRisk methods
-/// proceed without a token; Destructive/Admin/DataMoving methods must present
-/// a token whose params hash matches. The check runs before the dispatch
-/// table, so periphery destructive methods surface the same policy error as
-/// spine ones would.
+/// proceed without a token; Destructive/Admin/DataMoving methods must present a
+/// token whose method/classification/source and params hash all match. The
+/// check runs before the dispatch table, so periphery destructive methods
+/// surface the same policy error as spine ones would.
 fn ensure_operation_token(
     backend: &DaemonBackend,
     method: &str,
     params: &Value,
     classification: MutationClassification,
+    source: Source,
 ) -> Result<(), ApiError> {
     use MutationClassification::*;
     match classification {
@@ -384,7 +389,13 @@ fn ensure_operation_token(
         Destructive | Admin | DataMoving => {
             match params.get("operation_token").and_then(Value::as_str) {
                 Some(token) => {
-                    backend.validate_operation_token(token, params)?;
+                    backend.validate_operation_token(
+                        token,
+                        method,
+                        classification,
+                        source,
+                        params,
+                    )?;
                     Ok(())
                 }
                 None => Err(operation_token_required_error(method, classification)),
@@ -947,11 +958,13 @@ mod tests {
     fn destructive_method_runs_periphery_arm_with_valid_token() {
         let backend = DaemonBackend::new("127.0.0.1:47666");
         let params = serde_json::json!({"node_id": "node_readme"});
+        // Issue with the same source dispatch will use (Test) so the binding
+        // check passes and the periphery arm runs.
         let token = backend.issue_operation_token(
             "file.delete",
             &params,
             MutationClassification::Destructive,
-            Source::Agent,
+            Source::Test,
         );
         let mut with_token = params.clone();
         with_token["operation_token"] = Value::String(token.operation_token.clone());
@@ -969,11 +982,12 @@ mod tests {
     fn destructive_method_rejects_drifted_token() {
         let backend = DaemonBackend::new("127.0.0.1:47666");
         let params = serde_json::json!({"node_id": "node_readme"});
+        // Issue with the dispatch source so the only divergence is the params.
         let token = backend.issue_operation_token(
             "file.delete",
             &params,
             MutationClassification::Destructive,
-            Source::Agent,
+            Source::Test,
         );
         let drifted = serde_json::json!({
             "node_id": "node_root",
@@ -990,6 +1004,33 @@ mod tests {
         let details = response.error.unwrap().details.unwrap();
         assert!(details.get("expected").is_some());
         assert!(details.get("actual").is_some());
+    }
+
+    #[test]
+    fn destructive_method_rejects_token_issued_for_different_method() {
+        // Token binding: a token issued for cache.evict (destructive) must not
+        // authorize file.delete even if params/source/classification line up.
+        let backend = DaemonBackend::new("127.0.0.1:47666");
+        let params = serde_json::json!({"node_id": "node_readme"});
+        let token = backend.issue_operation_token(
+            "cache.evict",
+            &params,
+            MutationClassification::Destructive,
+            Source::Test,
+        );
+        let mut with_token = params.clone();
+        with_token["operation_token"] = Value::String(token.operation_token.clone());
+        let request = make_request("file.delete", with_token);
+        let response = dispatch_rpc(&backend, &request);
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|e| e.code.as_str()),
+            Some("operation_token_mismatch")
+        );
+        let details = response.error.unwrap().details.unwrap();
+        assert_eq!(details["field"], "method");
+        assert_eq!(details["expected"], "cache.evict");
+        assert_eq!(details["actual"], "file.delete");
     }
 
     #[test]

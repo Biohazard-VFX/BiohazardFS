@@ -489,6 +489,12 @@ pub struct WorkspaceMountConfig {
 /// truth for identity; the inode number is the FUSE handle. A file created
 /// locally that has not yet been flushed has `node_id = None` and a
 /// provisional local inode only — the daemon assigns the node id on `file.write`.
+///
+/// `current_version_id` mirrors the daemon's current version for the node. It
+/// is captured from `file.list` / `file.read` and used at open time as the
+/// optimistic-concurrency base for `file.write` (see `OpenHandle::base_version_id`).
+/// `None` for directories, freshly created files, and any daemon response that
+/// omits the field.
 #[derive(Debug, Clone)]
 struct InodeState {
     inode: u64,
@@ -503,6 +509,7 @@ struct InodeState {
     cache_state: CacheState,
     content_hash: Option<String>,
     size_bytes: u64,
+    current_version_id: Option<String>,
 }
 
 impl InodeState {
@@ -534,11 +541,24 @@ struct ChildrenCache {
 /// close() of a duplicated descriptor, so a dup-then-write pattern can flush
 /// before the write lands — the buffer must be re-allocatable, not treated as
 /// read-only.
+///
+/// `write_buffer` is seeded with `Some(Vec::new())` on `create()` and on
+/// `open(O_TRUNC)`: a truncating open that never writes must still commit a
+/// zero-byte version (`: > $MNT/new.txt`), and flush is a no-op when the
+/// buffer is `None`. A non-truncating writable open leaves the buffer `None`
+/// so the first write seeds from the hydrated cache file (the round-1
+/// partial-overwrite fix); `accumulate_write` uses `get_or_insert_with`, so a
+/// later write extends the seeded empty buffer instead of re-seeding.
+///
+/// `base_version_id` captures the daemon's current version at open time, used
+/// as the optimistic-concurrency base for `file.write` so the daemon can reject
+/// a stale writer (`version_conflict`). `None` for freshly created files.
 #[derive(Debug)]
 struct OpenHandle {
     inode: u64,
     writable: bool,
     write_buffer: Option<Vec<u8>>,
+    base_version_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -647,6 +667,7 @@ impl WorkspaceFs {
                 cache_state: CacheState::Ready,
                 content_hash: None,
                 size_bytes: 0,
+                current_version_id: None,
             },
         );
         state.children.insert(ROOT_INODE, ChildrenCache::default());
@@ -761,31 +782,9 @@ impl WorkspaceFs {
                 "file.list response missing entries array",
             ))?;
 
-        let mut discovered: Vec<(String, String, FileType, u16, Option<String>)> =
-            Vec::with_capacity(entries.len());
+        let mut discovered: Vec<ListedEntry> = Vec::with_capacity(entries.len());
         for entry in entries {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or(RpcError::Protocol("file.list entry missing name"))?;
-            let node_id = entry
-                .get("node_id")
-                .and_then(|v| v.as_str())
-                .ok_or(RpcError::Protocol("file.list entry missing node_id"))?;
-            let kind = parse_kind(entry.get("kind").and_then(|v| v.as_str()).unwrap_or("file"));
-            let mode = parse_mode(
-                entry.get("mode").and_then(|v| v.as_str()),
-                if kind == FileType::Directory {
-                    DEFAULT_DIR_MODE
-                } else {
-                    DEFAULT_FILE_MODE
-                },
-            );
-            let target = entry
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            discovered.push((name.to_string(), node_id.to_string(), kind, mode, target));
+            discovered.push(parse_list_entry(entry)?);
         }
 
         let mut state = self.lock_state();
@@ -796,8 +795,29 @@ impl WorkspaceFs {
             .unwrap_or_default();
         let mut next_inode = state.next_inode;
         let mut refreshed = ChildrenCache::default();
-        for (name, node_id, kind, mode, target) in discovered {
+        for entry in discovered {
+            let ListedEntry {
+                name,
+                node_id,
+                kind,
+                mode,
+                target,
+                size_bytes,
+                current_version_id,
+            } = entry;
             let inode = if let Some(&existing) = prior.by_node.get(&node_id) {
+                // Refresh size + version from daemon truth on a re-fetch. The
+                // fetched flag makes this rare (the cache is populated once per
+                // directory), but when it does run the daemon is the source of
+                // truth for the file's current size and version. A locally
+                // Dirty, unflushed file has no node_id and so never matches
+                // here — its unsynced state is preserved.
+                if let Some(state_entry) = state.inodes.get_mut(&existing) {
+                    state_entry.size_bytes = size_bytes;
+                    if current_version_id.is_some() {
+                        state_entry.current_version_id = current_version_id.clone();
+                    }
+                }
                 existing
             } else {
                 let allocated = next_inode;
@@ -821,7 +841,8 @@ impl WorkspaceFs {
                             CacheState::Ready
                         },
                         content_hash: None,
-                        size_bytes: 0,
+                        size_bytes,
+                        current_version_id,
                     },
                 );
                 allocated
@@ -833,6 +854,62 @@ impl WorkspaceFs {
         state.next_inode = next_inode;
         state.children.insert(parent_inode, refreshed);
         Ok(())
+    }
+
+    /// Accumulate `data` at `offset` into the handle's buffer and persist the
+    /// resulting snapshot to the durable dirty journal. Extracted from the
+    /// FUSE `write` callback so the journaling behavior is testable without a
+    /// live FUSE channel (a `ReplyWrite` cannot be built in-process).
+    ///
+    /// FIX 3: `write()` returns success to the kernel before `flush` ever
+    /// runs, so the acknowledged bytes live only in the in-memory buffer until
+    /// flush. If the FUSE process dies in that window the bytes are lost. We
+    /// mirror the full buffer to `<cache_dir>/dirty/inode-<N>` after every
+    /// extend so the bytes survive process death; a successful flush already
+    /// clears the journal (`commit_handle` Ok path).
+    ///
+    /// Perf: one journal write (full-buffer `fs::write`) per FUSE write, plus a
+    /// transient clone of the buffer so the state lock is not held across the
+    /// disk write (the documented RPC-discipline extends to local I/O here to
+    /// keep other inodes' FUSE ops progressing). OS-crash fsync hardening is a
+    /// documented follow-up; today the journal survives process death, not
+    /// power loss.
+    fn buffer_write(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: usize,
+        data: &[u8],
+    ) -> std::result::Result<usize, Errno> {
+        let dirty_snapshot = {
+            let mut state = self.lock_state();
+            let Some(handle) = state.handles.get_mut(&fh) else {
+                return Err(Errno::EBADF);
+            };
+            if handle.inode != ino {
+                return Err(Errno::EBADF);
+            }
+            if !handle.writable {
+                return Err(Errno::EACCES);
+            }
+            // Seed the buffer from the hydrated cache file on first write (or
+            // re-seed from the committed cache state after a prior flush), then
+            // overlay this write. This is what makes a non-truncating edit to an
+            // existing file preserve prior content: the writable open starts
+            // with no buffer, and the first write loads the current cache bytes
+            // so a write at an offset overlays instead of committing a sparse
+            // zero-padded buffer. Still one complete blob per flush; no
+            // streaming, no partials.
+            accumulate_write(handle, &self.cache_dir, offset, data);
+            handle.write_buffer.as_deref().map(Vec::from)
+        };
+        if let Some(bytes) = dirty_snapshot {
+            // Best-effort: a journal-write failure is logged inside
+            // `journal_dirty` and the bytes remain in memory for flush. The
+            // clone above is the consistent snapshot persisted here.
+            self.journal_dirty(ino, &bytes);
+        }
+        Ok(data.len())
     }
 
     /// Push the handle's write buffer to the daemon as one complete blob. This
@@ -851,10 +928,24 @@ impl WorkspaceFs {
                 Some(bytes) => bytes,
                 None => return Ok(()),
             };
+            // Capture the optimistic-concurrency base captured at open time.
+            // The daemon rejects the write with `version_conflict` if the
+            // node's current version has moved on (another writer flushed
+            // first), so a stale handle cannot silently clobber a newer
+            // version. Only sent on the node_id path; a freshly created file
+            // has no current version to pin.
+            let base_version_id = handle.base_version_id.clone();
             let entry = state.inodes.get(&ino).ok_or(Errno::EIO)?.clone();
             let content_hex = encode_hex(&bytes);
             let params = if let Some(node_id) = &entry.node_id {
-                serde_json::json!({ "node_id": node_id, "content_hex": content_hex })
+                let mut params = serde_json::json!({
+                    "node_id": node_id,
+                    "content_hex": content_hex,
+                });
+                if let Some(base) = &base_version_id {
+                    params["base_version_id"] = serde_json::Value::String(base.clone());
+                }
+                params
             } else {
                 let parent_node_id = state
                     .inodes
@@ -892,6 +983,14 @@ impl WorkspaceFs {
                     .get("size_bytes")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(prepared.bytes.len() as u64);
+                // The daemon advances the node's current version on every
+                // accepted write. Mirror it so the next open captures a fresh
+                // optimistic-concurrency base (FIX 4) and the inode reflects
+                // daemon truth.
+                let version_id = data
+                    .get("version_id")
+                    .and_then(|value| value.as_str())
+                    .map(String::from);
 
                 // Persist the committed bytes to the local cache so a subsequent
                 // open/read sees them without a round-trip.
@@ -914,6 +1013,9 @@ impl WorkspaceFs {
                     entry.cache_state = CacheState::Ready;
                     entry.content_hash = content_hash;
                     entry.size_bytes = size_bytes;
+                    if version_id.is_some() {
+                        entry.current_version_id = version_id;
+                    }
                     entry.mtime = SystemTime::now();
                 }
                 if let (Some(parent_inode), Some(node_id)) = (parent_inode, node_id)
@@ -927,10 +1029,22 @@ impl WorkspaceFs {
                 // Daemon unreachable / rejected the write. Restore the buffer so
                 // a later flush/retry can push it, and mark the entry Dirty when
                 // reachable so cache state reflects unsynced work. Always EIO:
-                // the artist must see the write failure.
+                // the artist must see the write failure. A `version_conflict`
+                // means the base captured at open is stale — another writer
+                // flushed first. The artist must re-open and re-edit; the
+                // restored buffer + journal let a retry push after re-hydration.
+                let conflict = matches!(
+                    &error,
+                    RpcError::Daemon(api_error) if api_error.code == "version_conflict"
+                );
                 eprintln!(
-                    "biohazardfs-fuse: file.write push failed for inode {ino}: {}",
-                    error.message()
+                    "biohazardfs-fuse: file.write push failed for inode {ino}: {}{}",
+                    error.message(),
+                    if conflict {
+                        " (version_conflict: base_version_id is stale — re-open and re-edit)"
+                    } else {
+                        ""
+                    }
                 );
                 // Persist the unsent bytes to the durable dirty journal so they
                 // survive release/restart; a daemon-reconnect replay path will
@@ -1098,6 +1212,14 @@ impl Filesystem for WorkspaceFs {
                             .and_then(|value| value.as_str())
                             .map(String::from);
                         entry.size_bytes = content.len() as u64;
+                        // Mirror the daemon's current version so the handle
+                        // built below pins the right optimistic-concurrency
+                        // base (FIX 4). Falls back to None when the daemon
+                        // omits the field.
+                        entry.current_version_id = data
+                            .get("version_id")
+                            .and_then(|value| value.as_str())
+                            .map(String::from);
                         entry.mtime = SystemTime::now();
                     }
                 }
@@ -1130,6 +1252,22 @@ impl Filesystem for WorkspaceFs {
             let mut state = self.lock_state();
             let write_mode = flags.acc_mode() != OpenAccMode::O_RDONLY;
             let writable = write_mode || truncating;
+            // Pin the daemon's current version as the optimistic-concurrency
+            // base for the next flush. Read from the inode (populated by
+            // file.list or file.read above) so every open — including O_TRUNC,
+            // cache-Ready, and post-create re-opens — captures the version
+            // known at open time. None for freshly created files.
+            let base_version_id = state
+                .inodes
+                .get(&ino.0)
+                .and_then(|entry| entry.current_version_id.clone());
+            // O_TRUNC must commit a zero-byte version even when the artist
+            // never writes (`: > $MNT/existing.txt`), so seed an empty buffer.
+            // A non-truncating writable open leaves the buffer None so the
+            // first write seeds from the hydrated cache file (round-1
+            // partial-overwrite fix). accumulate_write's get_or_insert_with
+            // extends a seeded empty buffer rather than re-seeding.
+            let write_buffer = if truncating { Some(Vec::new()) } else { None };
             let handle_id = state.next_handle;
             state.next_handle += 1;
             state.handles.insert(
@@ -1137,10 +1275,8 @@ impl Filesystem for WorkspaceFs {
                 OpenHandle {
                     inode: ino.0,
                     writable,
-                    // No buffer until the first write seeds it from the hydrated
-                    // cache file. This keeps flush a no-op for opens that never
-                    // write, and prevents sparse-buffer corruption on partial writes.
-                    write_buffer: None,
+                    write_buffer,
+                    base_version_id,
                 },
             );
             handle_id
@@ -1208,28 +1344,10 @@ impl Filesystem for WorkspaceFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        let mut state = self.lock_state();
-        let Some(handle) = state.handles.get_mut(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        if handle.inode != ino.0 {
-            reply.error(Errno::EBADF);
-            return;
+        match self.buffer_write(ino.0, fh.0, offset as usize, data) {
+            Ok(written) => reply.written(written as u32),
+            Err(errno) => reply.error(errno),
         }
-        if !handle.writable {
-            reply.error(Errno::EACCES);
-            return;
-        }
-        // Seed the buffer from the hydrated cache file on first write (or
-        // re-seed from the committed cache state after a prior flush), then
-        // overlay this write. This is what makes a non-truncating edit to an
-        // existing file preserve prior content: the writable open starts with
-        // no buffer, and the first write loads the current cache bytes so a
-        // write at an offset overlays instead of committing a sparse zero-padded
-        // buffer. Still one complete blob per flush; no streaming, no partials.
-        accumulate_write(handle, &self.cache_dir, offset as usize, data);
-        reply.written(data.len() as u32);
     }
 
     fn flush(
@@ -1354,6 +1472,7 @@ impl Filesystem for WorkspaceFs {
                 cache_state: CacheState::Absent,
                 content_hash: None,
                 size_bytes: 0,
+                current_version_id: None,
             };
             let attr = build_attr(&entry, uid, gid);
             state.inodes.insert(inode, entry);
@@ -1370,7 +1489,14 @@ impl Filesystem for WorkspaceFs {
                 OpenHandle {
                     inode,
                     writable: true,
-                    write_buffer: None,
+                    // create() must commit a zero-byte version even when the
+                    // artist never writes (`: > $MNT/new.txt`). Seed an empty
+                    // buffer so flush has something to push; accumulate_write's
+                    // get_or_insert_with extends this rather than re-seeding
+                    // from a non-existent cache file.
+                    write_buffer: Some(Vec::new()),
+                    // Freshly created file: no daemon version to pin yet.
+                    base_version_id: None,
                 },
             );
             (inode, handle_id, attr)
@@ -1690,6 +1816,73 @@ fn parse_kind(raw: &str) -> FileType {
     }
 }
 
+/// One parsed `file.list` entry. Kept as a struct (not a tuple) so adding a
+/// field later cannot silently re-order positional bindings at the fetch site.
+#[derive(Debug, Clone)]
+struct ListedEntry {
+    name: String,
+    node_id: String,
+    kind: FileType,
+    mode: u16,
+    target: Option<String>,
+    size_bytes: u64,
+    current_version_id: Option<String>,
+}
+
+/// Parse one `file.list` entry into a [`ListedEntry`].
+///
+/// `size_bytes` and `current_version_id` are read defensively: an older daemon
+/// that does not advertise them yields `0` / `None`, matching the pre-fix
+/// behavior for absent fields rather than breaking the mount. A daemon that
+/// does advertise them is honored — this is the path that lets the kernel see
+/// the real file size from `lookup`/`getattr` (FIX 1) and bind the
+/// optimistic-concurrency base version (FIX 4).
+fn parse_list_entry(entry: &Value) -> std::result::Result<ListedEntry, RpcError> {
+    let name = entry
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or(RpcError::Protocol("file.list entry missing name"))?;
+    let node_id = entry
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .ok_or(RpcError::Protocol("file.list entry missing node_id"))?;
+    let kind = parse_kind(
+        entry
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("file"),
+    );
+    let mode = parse_mode(
+        entry.get("mode").and_then(|value| value.as_str()),
+        if kind == FileType::Directory {
+            DEFAULT_DIR_MODE
+        } else {
+            DEFAULT_FILE_MODE
+        },
+    );
+    let target = entry
+        .get("target")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let size_bytes = entry
+        .get("size_bytes")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let current_version_id = entry
+        .get("current_version_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    Ok(ListedEntry {
+        name: name.to_string(),
+        node_id: node_id.to_string(),
+        kind,
+        mode,
+        target,
+        size_bytes,
+        current_version_id,
+    })
+}
+
 fn parse_mode(raw: Option<&str>, default: u16) -> u16 {
     raw.and_then(|value| {
         let trimmed = value.trim_start_matches("0o");
@@ -1943,6 +2136,7 @@ mod tests {
             inode,
             writable: true,
             write_buffer: None,
+            base_version_id: None,
         };
         accumulate_write(&mut handle, &dir, 3, b"X");
         assert_eq!(handle.write_buffer.as_deref(), Some(b"abcXef".as_slice()));
@@ -1958,6 +2152,7 @@ mod tests {
             inode,
             writable: true,
             write_buffer: None,
+            base_version_id: None,
         };
         accumulate_write(&mut handle, &dir, 0, b"hello");
         assert_eq!(handle.write_buffer.as_deref(), Some(b"hello".as_slice()));
@@ -2180,6 +2375,7 @@ mod tests {
                     cache_state: CacheState::Absent,
                     content_hash: None,
                     size_bytes: 0,
+                    current_version_id: None,
                 },
             );
             state
@@ -2196,6 +2392,7 @@ mod tests {
                     inode,
                     writable: true,
                     write_buffer: Some(payload.clone()),
+                    base_version_id: None,
                 },
             );
             (inode, handle)
@@ -2273,6 +2470,7 @@ mod tests {
                 cache_state: CacheState::Absent,
                 content_hash: None,
                 size_bytes: 0,
+                current_version_id: None,
             },
         );
         let parent_node = "node_root".to_string();
@@ -2291,6 +2489,7 @@ mod tests {
                 cache_state: CacheState::Ready,
                 content_hash: None,
                 size_bytes: 0,
+                current_version_id: None,
             }
         });
         let payload = b"do not lose me".to_vec();
@@ -2300,6 +2499,7 @@ mod tests {
                 inode,
                 writable: true,
                 write_buffer: Some(payload.clone()),
+                base_version_id: None,
             },
         );
         let fs = WorkspaceFs {
@@ -2343,6 +2543,516 @@ mod tests {
         let prepared = prepare_cache_dir(&target).expect("creates nested cache dir");
         assert!(prepared.is_absolute());
         assert!(prepared.is_dir());
+    }
+
+    // ----- FIX 1: preexisting files advertise daemon size_bytes at lookup -----
+
+    /// `parse_list_entry` must read `size_bytes` defensively: present → honored,
+    /// absent → 0. This is the load-bearing FUSE-side parse for FIX 1 (the
+    /// kernel sees the real size from lookup, not 0).
+    #[test]
+    fn parse_list_entry_reads_size_bytes_defensively() {
+        let with_size = serde_json::json!({
+            "node_id": "node_a",
+            "name": "plate.exr",
+            "kind": "file",
+            "current_version_id": "ver_1",
+            "size_bytes": 4096,
+            "mode": "0o644",
+        });
+        let parsed = parse_list_entry(&with_size).expect("parse");
+        assert_eq!(parsed.size_bytes, 4096);
+        assert_eq!(parsed.current_version_id.as_deref(), Some("ver_1"));
+        assert_eq!(parsed.kind, FileType::RegularFile);
+        assert_eq!(parsed.mode, 0o644);
+
+        // An older daemon that omits size_bytes / current_version_id yields the
+        // documented defensive defaults rather than an error.
+        let without_size = serde_json::json!({
+            "node_id": "node_b",
+            "name": "legacy.txt",
+            "kind": "file",
+        });
+        let parsed = parse_list_entry(&without_size).expect("parse");
+        assert_eq!(parsed.size_bytes, 0);
+        assert!(parsed.current_version_id.is_none());
+
+        // Missing identity fields are still a protocol error.
+        assert!(parse_list_entry(&serde_json::json!({"name": "x"})).is_err());
+        assert!(parse_list_entry(&serde_json::json!({"node_id": "n"})).is_err());
+    }
+
+    /// End-to-end FIX 1: a preexisting daemon file (created by a prior session)
+    /// advertises its real size through `lookup`/`getattr` with no write. The
+    /// kernel caches the attr from lookup, so a 0-byte size there makes
+    /// `stat`/`dd`/Python read empty even though open hydrates content.
+    #[test]
+    fn workspace_getattr_reports_daemon_size_bytes_without_write() {
+        let (addr, _backend, _handle) = start_test_daemon("ws_fix1");
+        // Session A creates and commits a 1024-byte file.
+        let cache_a = workspace_test_dir("fix1-cache-a");
+        let mount_a = workspace_test_dir("fix1-mount-a");
+        let fs_a = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr.clone(),
+            local_token: "ws_fix1".to_string(),
+            cache_dir: cache_a,
+            mountpoint: mount_a,
+            foreground: false,
+        })
+        .expect("connect A");
+        let payload = vec![0x78u8; 1024];
+        let (inode_a, handle_a) = seed_uncommitted_handle(
+            &fs_a,
+            "sized.txt",
+            payload.clone(),
+            /*base_version_id*/ None,
+        );
+        fs_a.commit_handle(inode_a, handle_a)
+            .expect("create commit");
+        let node_id = {
+            let state = fs_a.lock_state();
+            state
+                .inodes
+                .get(&inode_a)
+                .and_then(|entry| entry.node_id.clone())
+                .expect("node bound after commit")
+        };
+
+        // Session B lists the root fresh. The daemon advertises size_bytes for
+        // the preexisting file; the FUSE layer must read it into InodeState so
+        // getattr (build_attr) returns the real size at lookup time.
+        let cache_b = workspace_test_dir("fix1-cache-b");
+        let mount_b = workspace_test_dir("fix1-mount-b");
+        let fs_b = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix1".to_string(),
+            cache_dir: cache_b,
+            mountpoint: mount_b,
+            foreground: false,
+        })
+        .expect("connect B");
+        fs_b.ensure_children_fetched(ROOT_INODE)
+            .expect("fetch root");
+
+        let (uid, gid, attr) = {
+            let state = fs_b.lock_state();
+            let child_inode = state
+                .children
+                .get(&ROOT_INODE)
+                .and_then(|cache| cache.by_name.get(OsStr::new("sized.txt")))
+                .copied()
+                .expect("preexisting file listed");
+            let entry = state.inodes.get(&child_inode).expect("inode entry");
+            assert_eq!(entry.node_id.as_deref(), Some(node_id.as_str()));
+            assert_eq!(
+                entry.size_bytes, 1024,
+                "lookup must advertise the daemon-reported size, not 0"
+            );
+            (
+                state.uid,
+                state.gid,
+                build_attr(entry, state.uid, state.gid),
+            )
+        };
+        // getattr returns entry.size_bytes via build_attr.
+        let _ = (uid, gid);
+        assert_eq!(attr.size, 1024);
+        assert_eq!(attr.blocks, 1);
+    }
+
+    // ----- FIX 2: zero-byte create / O_TRUNC is durable -----
+
+    /// `: > $MNT/new.txt` must commit a zero-byte version. create() (and
+    /// open(O_TRUNC)) seed write_buffer with Some(Vec::new()) so flush has
+    /// something to push even when no write syscall lands. Here we simulate
+    /// create()+flush and assert the daemon recorded the file at zero bytes.
+    #[test]
+    fn workspace_zero_byte_create_commits_to_daemon() {
+        let (addr, backend, _handle) = start_test_daemon("ws_fix2");
+        let cache = workspace_test_dir("fix2-cache");
+        let mount = workspace_test_dir("fix2-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix2".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // create() seeds an EMPTY buffer (FIX 2). No write() syscall follows.
+        let (inode, handle) = seed_uncommitted_handle(&fs, "empty.txt", Vec::new(), None);
+        fs.commit_handle(inode, handle)
+            .expect("zero-byte commit succeeds");
+
+        let node_id = {
+            let state = fs.lock_state();
+            state
+                .inodes
+                .get(&inode)
+                .and_then(|entry| entry.node_id.clone())
+                .expect("node bound after zero-byte flush")
+        };
+
+        // The daemon truth: a zero-byte content entry and a current version.
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let recorded = inner
+            .file_contents
+            .get(&node_id)
+            .cloned()
+            .expect("file recorded in daemon content store");
+        assert!(recorded.is_empty(), "daemon recorded zero bytes");
+        assert!(
+            inner
+                .nodes
+                .get(&node_id)
+                .and_then(|node| node.current_version_id.as_ref())
+                .is_some(),
+            "daemon advanced the current version"
+        );
+        drop(inner);
+
+        // file.list surfaces the new file (zero bytes advertised).
+        let listed = biohazardfs_daemon::backend::file_list_payload(
+            &backend,
+            &serde_json::json!({ "parent_node_id": "node_root" }),
+        )
+        .expect("file.list");
+        let names: Vec<String> = listed["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name").to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "empty.txt"),
+            "daemon file.list includes the zero-byte file"
+        );
+    }
+
+    // ----- FIX 3: acknowledged writes journaled before flush -----
+
+    /// `write()` returns success before flush, so the acknowledged bytes live
+    /// only in memory until flush. After the fix, buffer_write persists the
+    /// full buffer to the durable dirty journal on every write — the journal
+    /// file holds the bytes before any flush.
+    #[test]
+    fn workspace_write_journals_dirty_bytes_before_flush() {
+        let (addr, _backend, _handle) = start_test_daemon("ws_fix3");
+        let cache = workspace_test_dir("fix3-cache");
+        let mount = workspace_test_dir("fix3-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix3".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Simulate open() of an existing file: a writable handle with no buffer
+        // yet (non-truncating open) and a known base version.
+        let (inode, handle) = seed_writable_open(&fs, "existing.txt", Some("ver_open".to_string()));
+
+        // No journal entry before the first acknowledged write.
+        assert!(
+            !fs.dirty_journal_path(inode).exists(),
+            "no journal entry before any write"
+        );
+
+        let written = fs
+            .buffer_write(inode, handle, 0, b"acknowledged")
+            .expect("write accepted");
+        assert_eq!(written, 12);
+
+        // The dirty journal holds the acknowledged bytes — they survive FUSE
+        // process death before flush (clear_dirty_journal runs on flush Ok).
+        let journal = fs.dirty_journal_path(inode);
+        let bytes = std::fs::read(&journal).expect("dirty journal written on write");
+        assert_eq!(bytes, b"acknowledged");
+
+        // A second write at an offset journals the full overlayed buffer.
+        fs.buffer_write(inode, handle, 12, b"-more")
+            .expect("second write");
+        let bytes = std::fs::read(&journal).expect("journal updated");
+        assert_eq!(bytes, b"acknowledged-more");
+    }
+
+    // ----- FIX 4: stale-handle last-writer-wins via base_version_id -----
+
+    /// Opening an existing file pins its current version as the
+    /// optimistic-concurrency base; flush forwards base_version_id in the
+    /// file.write params so the daemon can reject a stale writer.
+    #[test]
+    fn workspace_commit_forwards_base_version_id() {
+        let (addr, backend, _handle) = start_test_daemon("ws_fix4a");
+        let cache = workspace_test_dir("fix4a-cache");
+        let mount = workspace_test_dir("fix4a-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix4a".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // First commit creates the file; the daemon assigns version V.
+        let (inode, handle_create) = seed_uncommitted_handle(
+            &fs,
+            "versioned.txt",
+            b"original".to_vec(),
+            /*base_version_id*/ None,
+        );
+        fs.commit_handle(inode, handle_create)
+            .expect("create commit");
+
+        let (node_id, base_version) = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            (
+                entry.node_id.clone().expect("node bound"),
+                entry
+                    .current_version_id
+                    .clone()
+                    .expect("version mirrored from file.write response"),
+            )
+        };
+
+        // Simulate a real open() of the existing file: capture base_version_id
+        // from the inode (as open() does), write, then flush.
+        let handle_edit = seed_handle_on(&fs, inode, Some(base_version.clone()));
+        fs.buffer_write(inode, handle_edit, 0, b"updated")
+            .expect("write");
+        fs.commit_handle(inode, handle_edit).expect("edit commit");
+
+        // The latest file.write op for this node must carry base_version_id.
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let last_write = inner
+            .operations
+            .iter()
+            .rev()
+            .find(|op| {
+                op.method == "file.write" && op.base_node_id.as_deref() == Some(node_id.as_str())
+            })
+            .expect("file.write operation recorded");
+        let params: Value =
+            serde_json::from_str(&last_write.params_json).expect("params_json parses");
+        assert_eq!(
+            params
+                .get("base_version_id")
+                .and_then(|value| value.as_str()),
+            Some(base_version.as_str()),
+            "file.write params must include the captured base_version_id"
+        );
+        assert_eq!(
+            params.get("node_id").and_then(|value| value.as_str()),
+            Some(node_id.as_str()),
+            "edit commit hit the node_id update path"
+        );
+        // The daemon redacts content_hex from the operation log (content never
+        // lands in the audit trail); base_version_id survives redaction.
+        assert!(
+            params.get("content_hex").is_none(),
+            "content_hex must not be persisted in the operation log"
+        );
+    }
+
+    /// A synthetic stale base (another writer flushed first and bumped the
+    /// version) must surface as version_conflict → EIO, and the daemon must
+    /// NOT advance the version.
+    #[test]
+    fn workspace_commit_stale_base_yields_conflict_eio() {
+        let (addr, backend, _handle) = start_test_daemon("ws_fix4b");
+        let cache = workspace_test_dir("fix4b-cache");
+        let mount = workspace_test_dir("fix4b-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_fix4b".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        // Create the file (version V).
+        let (inode, handle_create) =
+            seed_uncommitted_handle(&fs, "protected.txt", b"original".to_vec(), None);
+        fs.commit_handle(inode, handle_create)
+            .expect("create commit");
+        let (node_id, real_version) = {
+            let state = fs.lock_state();
+            let entry = state.inodes.get(&inode).expect("inode");
+            (
+                entry.node_id.clone().expect("node bound"),
+                entry.current_version_id.clone().expect("version set"),
+            )
+        };
+
+        // Flush with a stale base. The daemon returns version_conflict; FUSE
+        // surfaces it as EIO.
+        let handle_stale = {
+            let mut state = fs.lock_state();
+            let handle_id = state.next_handle;
+            state.next_handle += 1;
+            state.handles.insert(
+                handle_id,
+                OpenHandle {
+                    inode,
+                    writable: true,
+                    write_buffer: Some(b"stale write".to_vec()),
+                    base_version_id: Some("ver_stale".to_string()),
+                },
+            );
+            handle_id
+        };
+        let errno = fs
+            .commit_handle(inode, handle_stale)
+            .expect_err("stale base must conflict");
+        assert_eq!(i32::from(errno), libc::EIO);
+
+        // The daemon did NOT advance the version or store the stale bytes.
+        let inner = backend
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let current = inner
+            .nodes
+            .get(&node_id)
+            .and_then(|node| node.current_version_id.clone());
+        assert_eq!(
+            current,
+            Some(real_version),
+            "version unchanged after stale-base conflict"
+        );
+        assert_ne!(
+            inner
+                .file_contents
+                .get(&node_id)
+                .map(|bytes| bytes.as_slice()),
+            Some(&b"stale write"[..]),
+            "stale bytes not committed"
+        );
+    }
+
+    /// Seed a writable handle bound to an existing inode with the given
+    /// optimistic-concurrency base (simulates open() of an existing file for
+    /// the FIX 4 edit leg). Returns the handle id.
+    fn seed_handle_on(fs: &WorkspaceFs, inode: u64, base_version_id: Option<String>) -> u64 {
+        let mut state = fs.lock_state();
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        state.handles.insert(
+            handle,
+            OpenHandle {
+                inode,
+                writable: true,
+                write_buffer: None,
+                base_version_id,
+            },
+        );
+        handle
+    }
+
+    /// Seed an uncommitted inode + handle holding `bytes` (simulates create()
+    /// for FIX 2 / the create leg of FIX 4). Returns (inode, handle).
+    fn seed_uncommitted_handle(
+        fs: &WorkspaceFs,
+        name: &str,
+        bytes: Vec<u8>,
+        base_version_id: Option<String>,
+    ) -> (u64, u64) {
+        let mut state = fs.lock_state();
+        let inode = state.next_inode;
+        state.next_inode += 1;
+        let now = SystemTime::now();
+        state.inodes.insert(
+            inode,
+            InodeState {
+                inode,
+                parent_inode: ROOT_INODE,
+                node_id: None,
+                name: OsString::from(name),
+                kind: FileType::RegularFile,
+                mode: DEFAULT_FILE_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Absent,
+                content_hash: None,
+                size_bytes: 0,
+                current_version_id: None,
+            },
+        );
+        state
+            .children
+            .entry(ROOT_INODE)
+            .or_default()
+            .by_name
+            .insert(OsString::from(name), inode);
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        state.handles.insert(
+            handle,
+            OpenHandle {
+                inode,
+                writable: true,
+                write_buffer: Some(bytes),
+                base_version_id,
+            },
+        );
+        (inode, handle)
+    }
+
+    /// Seed a writable open handle bound to a fresh inode (simulates open() of
+    /// an existing file for FIX 3 / FIX 4's edit leg). The handle starts with
+    /// no buffer (non-truncating open) and the given base_version_id. Returns
+    /// (inode, handle).
+    fn seed_writable_open(
+        fs: &WorkspaceFs,
+        name: &str,
+        base_version_id: Option<String>,
+    ) -> (u64, u64) {
+        let mut state = fs.lock_state();
+        let inode = state.next_inode;
+        state.next_inode += 1;
+        let now = SystemTime::now();
+        state.inodes.insert(
+            inode,
+            InodeState {
+                inode,
+                parent_inode: ROOT_INODE,
+                node_id: Some(format!("node_{name}")),
+                name: OsString::from(name),
+                kind: FileType::RegularFile,
+                mode: DEFAULT_FILE_MODE,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 0,
+                current_version_id: base_version_id.clone(),
+            },
+        );
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        state.handles.insert(
+            handle,
+            OpenHandle {
+                inode,
+                writable: true,
+                write_buffer: None,
+                base_version_id,
+            },
+        );
+        (inode, handle)
     }
 
     /// Live end-to-end test: mount the read-write filesystem against a running

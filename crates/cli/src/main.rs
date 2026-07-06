@@ -1160,7 +1160,7 @@ fn dry_run_envelope(
             "server_data_removed": matches!(classification, MutationClassification::Destructive),
             "note": "dry-run plan; backend impact computation lands with daemon/server wiring"
         },
-        "apply_hint": "re-run with --yes to apply (per-command --apply <token> lands with the daemon token backend)",
+        "apply_hint": "apply is not wired yet: daemon-issued operation tokens and --apply <token> are planned; --yes returns apply_not_wired under the current agent-safe profile",
     });
     CommandResponseEnvelope::ok(command, data, Source::Cli)
 }
@@ -4173,6 +4173,41 @@ mod tests {
         assert!(value["data"].get("plan_hash").is_some());
         assert!(value["data"].get("params_hash").is_some());
         assert!(value["data"].get("expires_at").is_some());
+    }
+
+    #[test]
+    fn dry_run_apply_hint_does_not_claim_yes_will_apply() {
+        // The dry-run envelope must not tell the user to "re-run with --yes to
+        // apply" — --yes intentionally returns apply_not_wired under the current
+        // agent-safe profile (daemon-issued operation tokens are not wired). The
+        // hint has to describe that gap honestly so artists/agents do not loop
+        // on --yes expecting the mutation to land.
+        let cli = parse(&["biohazardfs", "--dry-run", "cache", "evict"]);
+        let (output, code) = daemon_rpc_gated(
+            &cli,
+            "cache.evict",
+            "cache.evict",
+            serde_json::json!({ "older_than": "30d" }),
+        );
+        assert_eq!(code, EXIT_CONFIRMATION_REQUIRED);
+        let value: Value = serde_json::from_str(&output).expect("dry-run output is json");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["dry_run"], true);
+        let hint = value["data"]["apply_hint"]
+            .as_str()
+            .expect("apply_hint present");
+        assert!(
+            hint.contains("apply is not wired"),
+            "apply_hint should state apply is not wired; got: {hint}"
+        );
+        assert!(
+            hint.contains("apply_not_wired"),
+            "apply_hint should reference apply_not_wired; got: {hint}"
+        );
+        assert!(
+            !hint.contains("re-run with --yes to apply"),
+            "apply_hint must not claim --yes will apply; got: {hint}"
+        );
     }
 
     #[test]

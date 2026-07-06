@@ -1686,11 +1686,14 @@ fn operations_submit_payload(
         ensure_device_exists(&mut client, &subject.org_id, device_id)?;
     }
     // Idempotent replay: a resubmitted idempotency key must return the prior
-    // recorded operation rather than create a duplicate or silently fail.
+    // recorded operation rather than create a duplicate or silently fail. A
+    // replay that carries a DIFFERENT payload is rejected (409) so a reused
+    // key can never silently return the wrong operation to a caller.
     if let Some(key) = body.idempotency_key.as_deref()
         && let Some(existing) = lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?
     {
-        return Ok(existing);
+        verify_idempotency_payload_match(&existing, &body.params, key)?;
+        return Ok(existing.response);
     }
     let operation_id = generated_id("op");
     let req_id = request_id();
@@ -1748,6 +1751,9 @@ fn operations_submit_payload(
         // Race loser: a concurrent submission with the same idempotency key
         // won the unique index between our pre-read and this INSERT. Replay the
         // existing operation instead of returning operation_store_unavailable.
+        // The payload mismatch check applies here too: if the concurrent winner
+        // recorded different params under the same key, this submission must
+        // still be rejected rather than return the wrong operation.
         None => {
             let key = body.idempotency_key.as_deref().ok_or_else(|| {
                 (
@@ -1758,15 +1764,18 @@ fn operations_submit_payload(
                     ),
                 )
             })?;
-            lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?.ok_or_else(|| {
-                (
-                    503,
-                    ApiError::new(
-                        "operation_store_unavailable",
-                        "operation conflicted but the existing row could not be read",
-                    ),
-                )
-            })
+            let existing = lookup_operation_by_idempotency(&mut client, &subject.org_id, key)?
+                .ok_or_else(|| {
+                    (
+                        503,
+                        ApiError::new(
+                            "operation_store_unavailable",
+                            "operation conflicted but the existing row could not be read",
+                        ),
+                    )
+                })?;
+            verify_idempotency_payload_match(&existing, &body.params, key)?;
+            Ok(existing.response)
         }
     }
 }
@@ -1775,12 +1784,13 @@ fn lookup_operation_by_idempotency(
     client: &mut Client,
     org_id: &str,
     key: &str,
-) -> Result<Option<OperationSubmitResponse>, (u16, ApiError)> {
+) -> Result<Option<ExistingOperation>, (u16, ApiError)> {
     let created = ts_utc("created_at");
     let row = client
         .query_opt(
             &format!(
-                "SELECT operation_id, status, idempotency_key, {created}
+                "SELECT operation_id, status, idempotency_key,
+                        payload_json::text AS payload_json_text, {created}
                  FROM operations
                  WHERE org_id = $1 AND idempotency_key = $2
                  LIMIT 1"
@@ -1793,12 +1803,68 @@ fn lookup_operation_by_idempotency(
                 ApiError::new("operation_store_unavailable", "could not look up operation"),
             )
         })?;
-    Ok(row.map(|row| OperationSubmitResponse {
-        operation_id: row.get("operation_id"),
-        status: row.get("status"),
-        idempotency_key: row.get("idempotency_key"),
-        received_at: row.get("created_at"),
+    Ok(row.map(|row| {
+        // The synchronous postgres driver has no serde_json feature gate, so
+        // payload_json is read as text (jsonb canonical output) and parsed in
+        // Rust. Parsing failures fall back to Value::Null, which will not hash
+        // equal to any real submission, so a corrupt row fails closed as a
+        // payload mismatch rather than silently replaying.
+        let payload_text: String = row.get("payload_json_text");
+        let payload = serde_json::from_str(&payload_text).unwrap_or(serde_json::Value::Null);
+        ExistingOperation {
+            response: OperationSubmitResponse {
+                operation_id: row.get("operation_id"),
+                status: row.get("status"),
+                idempotency_key: row.get("idempotency_key"),
+                received_at: row.get("created_at"),
+            },
+            payload,
+        }
     }))
+}
+
+/// An existing operation located by idempotency key: the replayable response
+/// plus the stored payload needed to verify a replay carries the same params.
+#[derive(Debug, Clone)]
+struct ExistingOperation {
+    response: OperationSubmitResponse,
+    payload: serde_json::Value,
+}
+
+/// Stable SHA-256 digest of an operation's submitted params, used to reject
+/// idempotency replays that carry a different payload than the original
+/// submission. The canonical form is serde_json's default serialization, which
+/// sorts object keys (serde_json::Map is BTreeMap-backed unless the
+/// `preserve_order` feature is enabled, which this workspace does not), so the
+/// digest is independent of client-side key ordering and whitespace.
+fn payload_hash(params: &serde_json::Value) -> String {
+    let canonical = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+    hex_lower(&Sha256::digest(canonical.as_bytes()))
+}
+
+/// Reject an idempotency replay whose submitted params differ from the stored
+/// operation's payload. Returns Ok for a matching payload and a typed 409
+/// otherwise. Both sides are hashed through `payload_hash` so the comparison is
+/// invariant under key reordering; the stored side is the jsonb-canonical form
+/// read back from `payload_json`, which round-trips cleanly for the object- and
+/// string-heavy params used by file operations.
+fn verify_idempotency_payload_match(
+    existing: &ExistingOperation,
+    submitted_params: &serde_json::Value,
+    idempotency_key: &str,
+) -> Result<(), (u16, ApiError)> {
+    if payload_hash(&existing.payload) == payload_hash(submitted_params) {
+        Ok(())
+    } else {
+        Err((
+            409,
+            ApiError::with_details(
+                "operation_idempotency_payload_mismatch",
+                "an operation with this idempotency_key already exists with a different payload",
+                serde_json::json!({ "idempotency_key": idempotency_key }),
+            ),
+        ))
+    }
 }
 
 // ===== Trash =====
@@ -4448,9 +4514,21 @@ fn checksum_sql(sql: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    // Normalize CRLF -> LF before hashing so LF and CRLF checkouts of the
+    // bundled migrations produce identical checksums. Without this, a database
+    // migrated on one platform (e.g. Linux LF) would fail verify on another
+    // (e.g. Windows CRLF) because the raw SQL bytes differ. The runner applies
+    // and verifies against the same normalized bytes, so it stays internally
+    // consistent. This changes the recorded checksum of every bundled
+    // migration, so a dev database previously migrated with the raw-byte
+    // checksum needs a fresh `migrate`; smoke runs against ephemeral
+    // containers, so there is no production data to preserve.
     let mut hash = FNV_OFFSET;
-    for byte in sql.as_bytes() {
-        hash ^= u64::from(*byte);
+    for &byte in sql.as_bytes() {
+        if byte == b'\r' {
+            continue;
+        }
+        hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("fnv1a64:{hash:016x}")
@@ -5378,6 +5456,93 @@ mod tests {
     }
 
     #[test]
+    fn payload_hash_is_key_order_independent() {
+        // serde_json::Map is BTreeMap-backed in this workspace, so the canonical
+        // serialization sorts keys and the digest is stable under reordering.
+        let a = payload_hash(&serde_json::json!({"foo": "bar", "count": 3}));
+        let b = payload_hash(&serde_json::json!({"count": 3, "foo": "bar"}));
+        assert_eq!(a, b);
+        // SHA-256 hex digest is 64 lowercase characters.
+        assert_eq!(a.len(), 64);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn payload_hash_distinguishes_different_payloads() {
+        let a = payload_hash(&serde_json::json!({"foo": "bar"}));
+        let b = payload_hash(&serde_json::json!({"foo": "baz"}));
+        assert_ne!(a, b);
+        // SHA-256 hex digest is 64 chars; the empty-params digest is non-empty.
+        assert_eq!(payload_hash(&serde_json::json!({})).len(), 64);
+    }
+
+    fn existing_operation_fixture(payload: serde_json::Value) -> ExistingOperation {
+        ExistingOperation {
+            response: OperationSubmitResponse {
+                operation_id: "op_existing".to_string(),
+                status: "pending".to_string(),
+                idempotency_key: Some("key-existing".to_string()),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn idempotency_payload_match_allows_identical_payload() {
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        assert!(
+            verify_idempotency_payload_match(
+                &existing,
+                &serde_json::json!({"foo": "bar"}),
+                "key-existing"
+            )
+            .is_ok()
+        );
+        // Key reordering on the replay side is still a match.
+        assert!(
+            verify_idempotency_payload_match(
+                &existing,
+                &serde_json::json!({"foo": "bar"}),
+                "key-existing"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn idempotency_payload_match_rejects_mismatched_payload() {
+        let existing = existing_operation_fixture(serde_json::json!({"foo": "bar"}));
+        let (status, error) = verify_idempotency_payload_match(
+            &existing,
+            &serde_json::json!({"foo": "baz"}),
+            "key-existing",
+        )
+        .expect_err("mismatched payload must be rejected");
+        assert_eq!(status, 409);
+        assert_eq!(error.code, "operation_idempotency_payload_mismatch");
+        let details = error.details.expect("details carry the idempotency key");
+        assert_eq!(details["idempotency_key"], "key-existing");
+    }
+
+    #[test]
+    fn checksum_sql_is_line_ending_independent() {
+        // LF and CRLF variants of the same SQL must produce identical
+        // checksums so cross-platform checkouts verify against the same DB.
+        let lf = checksum_sql("CREATE TABLE foo (\n    id INTEGER\n);\n");
+        let crlf = checksum_sql("CREATE TABLE foo (\r\n    id INTEGER\r\n);\r\n");
+        assert_eq!(lf, crlf);
+        // A lone CR inside the content is also normalized away.
+        let with_cr = checksum_sql("SELECT 'a\rb'\n;");
+        let without_cr = checksum_sql("SELECT 'ab'\n;");
+        assert_eq!(with_cr, without_cr);
+        assert!(lf.starts_with("fnv1a64:"));
+    }
+
+    #[test]
     fn operation_kind_validator_rejects_garbage() {
         assert!(validate_operation_kind("file.write").is_ok());
         assert_eq!(
@@ -5761,6 +5926,25 @@ mod tests {
         assert_eq!(
             op_id1, op_id2,
             "idempotent replay must return the same operation id"
+        );
+
+        // SAFETY: replaying the same idempotency_key with DIFFERENT params must
+        // be rejected (409) rather than silently return the prior operation.
+        let mismatch_body = format!(
+            r#"{{"kind":"file.write","node_id":"{file_node}","idempotency_key":"idem-{suffix}","params":{{"foo":"qux"}}}}"#
+        );
+        let (status, body) = dispatch_http_request_with_config(
+            "POST",
+            "/api/v1/operations",
+            &admin_auth,
+            mismatch_body.as_bytes(),
+            &config,
+        );
+        assert_eq!(status, 409, "mismatched payload must be 409: {body}");
+        assert!(body.contains("operation_idempotency_payload_mismatch"));
+        assert!(
+            body.contains(&format!("idem-{suffix}")),
+            "details must echo the idempotency key without the bearer"
         );
 
         // Read endpoints return org-scoped 200 envelopes with the contract shape.

@@ -382,13 +382,20 @@ impl DaemonBackend {
         token
     }
 
-    /// Validate an operation token against the current params. Removes the
-    /// `operation_token` field before hashing so the token itself does not
-    /// perturb the params hash. Returns `operation_token_params_mismatch`
-    /// (per scope), `operation_token_invalid`, or `operation_token_expired`.
+    /// Validate an operation token against the attempted method/classification/
+    /// source and the current params. Removes the `operation_token` field before
+    /// hashing so the token itself does not perturb the params hash. Returns
+    /// `operation_token_invalid` (unknown id), `operation_token_mismatch`
+    /// (method/classification/source differ from the issued plan),
+    /// `operation_token_params_mismatch` (params drift), or
+    /// `operation_token_expired`. Identity bindings are checked before the
+    /// params hash so the field that diverged is reported cleanly.
     pub fn validate_operation_token(
         &self,
         token: &str,
+        method: &str,
+        classification: MutationClassification,
+        source: Source,
         params: &Value,
     ) -> Result<OperationToken, ApiError> {
         let inner = self.lock();
@@ -398,6 +405,8 @@ impl DaemonBackend {
                 "operation token was not issued by this daemon",
             )
         })?;
+
+        validate_token_binding(&stored.token, method, classification, source)?;
 
         let mut params_without_token = params.clone();
         if let Some(map) = params_without_token.as_object_mut() {
@@ -585,7 +594,17 @@ pub fn mount_list_payload(backend: &DaemonBackend) -> Result<Value, ApiError> {
 
 pub fn file_stat_payload(backend: &DaemonBackend, params: &Value) -> Result<Value, ApiError> {
     let node = lookup_node(backend, params)?;
-    Ok(serde_json::to_value(&node).expect("node serializes"))
+    // Surface the authoritative file size so FUSE can advertise it at lookup
+    // without a separate `file.read`. Directories report 0.
+    let size_bytes = {
+        let inner = backend.lock();
+        node_size_bytes(&inner, &node)
+    };
+    let mut value = serde_json::to_value(&node).expect("node serializes");
+    if let Some(map) = value.as_object_mut() {
+        map.insert("size_bytes".to_string(), serde_json::json!(size_bytes));
+    }
+    Ok(value)
 }
 
 pub fn file_list_payload(backend: &DaemonBackend, params: &Value) -> Result<Value, ApiError> {
@@ -628,11 +647,15 @@ pub fn file_list_payload(backend: &DaemonBackend, params: &Value) -> Result<Valu
     let entries: Vec<Value> = children
         .into_iter()
         .map(|child| {
+            // Files advertise their committed byte length so FUSE can size
+            // them at lookup; directories report 0.
+            let size_bytes = node_size_bytes(&inner, child);
             serde_json::json!({
                 "node_id": child.node_id,
                 "name": child.name,
                 "kind": serde_json::to_value(child.kind).unwrap_or(Value::Null),
                 "current_version_id": child.current_version_id,
+                "size_bytes": size_bytes,
             })
         })
         .collect();
@@ -849,6 +872,20 @@ pub fn file_write_payload(
         audit_event_id: None,
         metadata_json: None,
     };
+    // Redacted params for provenance: strips `content_hex` (the raw file bytes)
+    // and the operation-token capability, keeps only safe metadata plus the
+    // authoritative computed values. Stored in both the Operation record and
+    // the AuditEvent payload (METADATA_SCHEMA.md: audit never carries secrets).
+    let redacted_params = redact_file_write_params(
+        params,
+        &node.node_id,
+        &version_id,
+        &content_hash,
+        version.size_bytes,
+    );
+    let redacted_params_json =
+        serde_json::to_string(&redacted_params).unwrap_or_else(|_| "{}".to_string());
+
     let operation = Operation {
         org_id: org_id.clone(),
         operation_id: operation_id.clone(),
@@ -858,7 +895,7 @@ pub fn file_write_payload(
         impersonated_user_id: None,
         source: source.clone(),
         method: "file.write".to_string(),
-        params_json: serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()),
+        params_json: redacted_params_json,
         base_node_id: Some(node.node_id.clone()),
         base_version_id: parent_version_id.clone(),
         base_snapshot_id: None,
@@ -931,14 +968,9 @@ pub fn file_write_payload(
         Some(version_id.clone()),
         None,
         AuditEventResult::Success,
-        Some(
-            serde_json::json!({
-                "size_bytes": version.size_bytes,
-                "content_hash": content_hash,
-                "created": created,
-            })
-            .to_string(),
-        ),
+        // Audit payload mirrors the redacted operation params plus the
+        // `created` flag; it must never carry `content_hex` or the token.
+        Some(build_file_write_audit_payload(&redacted_params, created)),
     );
 
     Ok(serde_json::json!({
@@ -1874,6 +1906,81 @@ fn content_hash_for(bytes: &[u8]) -> String {
     format!("sha256:scaffold:{:x}", fxhash(bytes))
 }
 
+/// Build a redacted copy of the `file.write` request params for persistence in
+/// the Operation log and AuditEvent payload. METADATA_SCHEMA.md forbids file
+/// contents in audit/provenance records: those records are exported and
+/// inspected, and `content_hex` IS the raw file bytes. This is an allowlist, not
+/// a denylist: only known-safe metadata is copied across, so any future
+/// content-bearing field added to the wire shape (a base64 blob, a streaming
+/// chunk array, etc.) is dropped by default rather than silently leaked. The
+/// authoritative computed values (`node_id`, `version_id`, `content_hash`,
+/// `size_bytes`) are inserted last so the record points at the version actually
+/// written regardless of how the caller shaped the request.
+fn redact_file_write_params(
+    params: &Value,
+    node_id: &str,
+    version_id: &str,
+    content_hash: &str,
+    size_bytes: u64,
+) -> Value {
+    let mut redacted = serde_json::Map::new();
+    if let Some(map) = params.as_object() {
+        for key in [
+            "node_id",
+            "parent_node_id",
+            "name",
+            "mode",
+            "base_version_id",
+        ] {
+            if let Some(value) = map.get(key) {
+                redacted.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    redacted.insert("node_id".to_string(), Value::String(node_id.to_string()));
+    redacted.insert(
+        "version_id".to_string(),
+        Value::String(version_id.to_string()),
+    );
+    redacted.insert(
+        "content_hash".to_string(),
+        Value::String(content_hash.to_string()),
+    );
+    redacted.insert("size_bytes".to_string(), serde_json::json!(size_bytes));
+    Value::Object(redacted)
+}
+
+/// Serialize the redacted `file.write` params plus the `created` flag for the
+/// AuditEvent payload. Falls back to a minimal object if serialization fails
+/// (AuditEvent is plain JSON-safe, so that path is an invariant guard only).
+fn build_file_write_audit_payload(redacted_params: &Value, created: bool) -> String {
+    let mut payload = redacted_params.clone();
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("created".to_string(), serde_json::json!(created));
+    }
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Authoritative byte size for a namespace node, for `file.stat` / `file.list`
+/// and FUSE size-advertise at lookup. The committed [`FileVersion`] is the
+/// source of truth; in-memory `file_contents` is the fallback when a version
+/// has not been recorded yet. Directories and unknown nodes report 0 so the
+/// size signal is never fabricated.
+fn node_size_bytes(inner: &InMemoryBackend, node: &Node) -> u64 {
+    if node.kind != NodeKind::File {
+        return 0;
+    }
+    if let Some(version_id) = node.current_version_id.as_deref()
+        && let Some(version) = inner.file_versions.get(version_id)
+    {
+        return version.size_bytes;
+    }
+    if let Some(bytes) = inner.file_contents.get(&node.node_id) {
+        return bytes.len() as u64;
+    }
+    0
+}
+
 /// Drive a cache entry to `Ready` through the legal forward transition path
 /// after a `file.write` commit. The transition guards (core::cache::transition)
 /// reject unsafe moves; we never paper over them. This is the safety valve for
@@ -1954,6 +2061,54 @@ fn params_hash(params: &Value) -> String {
 fn plan_hash(method: &str, params_hash: &str) -> String {
     let merged = format!("{method}|{params_hash}");
     format!("scaffold_plan:{:016x}", fxhash(merged.as_bytes()))
+}
+
+/// Compare the attempted method/classification/source against the values bound
+/// to the issued token. A token issued for one plan must not apply a different
+/// one even if its params hash happens to match. Returns
+/// `operation_token_mismatch` with the first diverging field (method,
+/// classification, or source) so callers can distinguish a cross-plan replay
+/// from a same-plan params drift.
+fn validate_token_binding(
+    token: &OperationToken,
+    method: &str,
+    classification: MutationClassification,
+    source: Source,
+) -> Result<(), ApiError> {
+    if token.method != method {
+        return Err(ApiError::with_details(
+            "operation_token_mismatch",
+            "operation token was issued for a different method",
+            serde_json::json!({
+                "field": "method",
+                "expected": token.method,
+                "actual": method,
+            }),
+        ));
+    }
+    if token.classification != classification {
+        return Err(ApiError::with_details(
+            "operation_token_mismatch",
+            "operation token was issued for a different classification",
+            serde_json::json!({
+                "field": "classification",
+                "expected": serde_json::to_value(token.classification).unwrap_or(Value::Null),
+                "actual": serde_json::to_value(classification).unwrap_or(Value::Null),
+            }),
+        ));
+    }
+    if token.source != source {
+        return Err(ApiError::with_details(
+            "operation_token_mismatch",
+            "operation token was issued for a different source",
+            serde_json::json!({
+                "field": "source",
+                "expected": serde_json::to_value(&token.source).unwrap_or(Value::Null),
+                "actual": serde_json::to_value(&source).unwrap_or(Value::Null),
+            }),
+        ));
+    }
+    Ok(())
 }
 
 /// FNV-1a 64-bit. Deterministic, dependency-free, sufficient for drift
@@ -2054,6 +2209,56 @@ mod tests {
         // Neither node_id nor path present keeps the missing_param contract.
         let err = file_stat_payload(&backend, &serde_json::json!({})).unwrap_err();
         assert_eq!(err.code, "missing_param");
+    }
+
+    #[test]
+    fn file_stat_and_list_report_size_bytes_for_files() {
+        // FUSE size-advertise: file.stat and file.list must surface the real
+        // byte length of a file so the kernel can advertise it at lookup,
+        // without a separate file.read. Directories report 0.
+        let backend = test_backend();
+        let written = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "sized.exr",
+                "content_hex": "deadbeefcafe", // 6 bytes
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let node_id = written["node_id"].as_str().unwrap().to_string();
+
+        // file.stat reports the committed byte length.
+        let stat =
+            file_stat_payload(&backend, &serde_json::json!({"node_id": node_id.clone()})).unwrap();
+        assert_eq!(stat["size_bytes"], 6);
+
+        // file.list entries include size_bytes for the file.
+        let list = file_list_payload(
+            &backend,
+            &serde_json::json!({"parent_node_id": "node_root"}),
+        )
+        .unwrap();
+        let entry = list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["node_id"].as_str() == Some(node_id.as_str()))
+            .expect("written file appears in listing");
+        assert_eq!(entry["size_bytes"], 6);
+
+        // Directories report size 0 in both surfaces.
+        let dir_stat =
+            file_stat_payload(&backend, &serde_json::json!({"node_id": "node_root"})).unwrap();
+        assert_eq!(dir_stat["size_bytes"], 0);
+        let dir_entry = list["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some("shots"))
+            .expect("shots directory appears in listing");
+        assert_eq!(dir_entry["size_bytes"], 0);
     }
 
     #[test]
@@ -2318,7 +2523,13 @@ mod tests {
         let mut with_token = params.clone();
         with_token["operation_token"] = serde_json::Value::String(token.operation_token.clone());
         let validated = backend
-            .validate_operation_token(&token.operation_token, &with_token)
+            .validate_operation_token(
+                &token.operation_token,
+                "file.delete",
+                MutationClassification::Destructive,
+                Source::Agent,
+                &with_token,
+            )
             .unwrap();
         assert_eq!(validated.operation_token, token.operation_token);
         assert_eq!(validated.method, "file.delete");
@@ -2339,7 +2550,13 @@ mod tests {
             "operation_token": token.operation_token,
         });
         let err = backend
-            .validate_operation_token(&token.operation_token, &drifted)
+            .validate_operation_token(
+                &token.operation_token,
+                "file.delete",
+                MutationClassification::Destructive,
+                Source::Agent,
+                &drifted,
+            )
             .unwrap_err();
         assert_eq!(err.code, "operation_token_params_mismatch");
         assert!(err.details.is_some());
@@ -2349,9 +2566,98 @@ mod tests {
     fn validate_operation_token_rejects_unknown_token() {
         let backend = test_backend();
         let err = backend
-            .validate_operation_token("optok_bogus", &serde_json::json!({}))
+            .validate_operation_token(
+                "optok_bogus",
+                "file.delete",
+                MutationClassification::Destructive,
+                Source::Agent,
+                &serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(err.code, "operation_token_invalid");
+    }
+
+    #[test]
+    fn validate_operation_token_rejects_method_mismatch() {
+        // A token issued for cache.evict+destructive must not apply to a
+        // different method even with identical params/classification/source.
+        let backend = test_backend();
+        let params = serde_json::json!({"node_id": "node_readme"});
+        let token = backend.issue_operation_token(
+            "cache.evict",
+            &params,
+            MutationClassification::Destructive,
+            Source::Agent,
+        );
+        let err = backend
+            .validate_operation_token(
+                &token.operation_token,
+                "file.write",
+                MutationClassification::Destructive,
+                Source::Agent,
+                &params,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "operation_token_mismatch");
+        let details = err.details.unwrap();
+        assert_eq!(details["field"], "method");
+        assert_eq!(details["expected"], "cache.evict");
+        assert_eq!(details["actual"], "file.write");
+    }
+
+    #[test]
+    fn validate_operation_token_rejects_classification_mismatch() {
+        // Same method/params/source, but a destructive token cannot be used to
+        // authorize a low_risk attempt (and vice versa).
+        let backend = test_backend();
+        let params = serde_json::json!({"node_id": "node_readme"});
+        let token = backend.issue_operation_token(
+            "cache.evict",
+            &params,
+            MutationClassification::Destructive,
+            Source::Agent,
+        );
+        let err = backend
+            .validate_operation_token(
+                &token.operation_token,
+                "cache.evict",
+                MutationClassification::LowRisk,
+                Source::Agent,
+                &params,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "operation_token_mismatch");
+        let details = err.details.unwrap();
+        assert_eq!(details["field"], "classification");
+        assert_eq!(details["expected"], "destructive");
+        assert_eq!(details["actual"], "low_risk");
+    }
+
+    #[test]
+    fn validate_operation_token_rejects_source_mismatch() {
+        // A token issued for an agent must not authorize a CLI attempt.
+        let backend = test_backend();
+        let params = serde_json::json!({"node_id": "node_readme"});
+        let token = backend.issue_operation_token(
+            "cache.evict",
+            &params,
+            MutationClassification::Destructive,
+            Source::Agent,
+        );
+        let err = backend
+            .validate_operation_token(
+                &token.operation_token,
+                "cache.evict",
+                MutationClassification::Destructive,
+                Source::Cli,
+                &params,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "operation_token_mismatch");
+        let details = err.details.unwrap();
+        assert_eq!(details["field"], "source");
+        assert_eq!(details["expected"], "agent");
+        assert_eq!(details["actual"], "cli");
     }
 
     #[test]
@@ -2682,6 +2988,94 @@ mod tests {
         let read_response = crate::dispatch_rpc(&backend, &read_request);
         assert!(read_response.ok);
         assert_eq!(read_response.data.unwrap()["content_hex"], "c0ffee");
+    }
+
+    #[test]
+    fn file_write_redacts_content_from_operation_and_audit() {
+        // BLOCKER: file bytes must never land in operation/provenance records
+        // (those are exported and inspected). The Operation params_json and the
+        // AuditEvent payload_json must carry safe metadata (content_hash,
+        // size_bytes, version_id) but NOT the content_hex bytes nor the
+        // operation_token capability. The caller-facing response is unchanged.
+        let backend = test_backend();
+        let content_hex = "deadbeef";
+        let payload = file_write_payload(
+            &backend,
+            &serde_json::json!({
+                "parent_node_id": "node_root",
+                "name": "secret.exr",
+                "content_hex": content_hex,
+                "operation_token": "optok_should_not_leak",
+            }),
+            Source::Cli,
+        )
+        .unwrap();
+        let node_id = payload["node_id"].as_str().unwrap().to_string();
+        let version_id = payload["version_id"].as_str().unwrap().to_string();
+        // Caller-facing response still carries size + hash.
+        assert_eq!(payload["size_bytes"], 4);
+        assert_eq!(
+            payload["content_hash"],
+            content_hash_for(&[0xde, 0xad, 0xbe, 0xef])
+        );
+
+        let inner = backend.lock();
+        let op = inner
+            .operations
+            .iter()
+            .find(|op| op.method == "file.write")
+            .expect("operation logged");
+        let op_params = op.params_json.as_str();
+
+        // The content bytes and the token capability are absent from the op log.
+        assert!(
+            !op_params.contains(content_hex),
+            "Operation.params_json must not carry content_hex: {op_params}"
+        );
+        assert!(
+            !op_params.contains("optok_should_not_leak"),
+            "Operation.params_json must not carry the operation token: {op_params}"
+        );
+        // Safe metadata is preserved.
+        assert!(
+            op_params.contains(version_id.as_str()),
+            "Operation.params_json should carry version_id: {op_params}"
+        );
+        assert!(
+            op_params.contains("\"size_bytes\":4"),
+            "Operation.params_json should carry size_bytes: {op_params}"
+        );
+        assert!(
+            op_params.contains("content_hash"),
+            "Operation.params_json should carry content_hash: {op_params}"
+        );
+
+        // Same invariant for the audit trail.
+        let audit = inner
+            .audit
+            .iter()
+            .find(|event| {
+                event.event_type == "file.write"
+                    && event.node_id.as_deref() == Some(node_id.as_str())
+            })
+            .expect("file.write audit event recorded");
+        let audit_payload = audit.payload_json.as_deref().unwrap_or("");
+        assert!(
+            !audit_payload.contains(content_hex),
+            "AuditEvent.payload_json must not carry content_hex: {audit_payload}"
+        );
+        assert!(
+            !audit_payload.contains("optok_should_not_leak"),
+            "AuditEvent.payload_json must not carry the operation token: {audit_payload}"
+        );
+        assert!(
+            audit_payload.contains("\"size_bytes\":4"),
+            "AuditEvent.payload_json should carry size_bytes: {audit_payload}"
+        );
+        assert!(
+            audit_payload.contains("content_hash"),
+            "AuditEvent.payload_json should carry content_hash: {audit_payload}"
+        );
     }
 
     #[test]
