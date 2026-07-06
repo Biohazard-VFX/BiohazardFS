@@ -26,7 +26,8 @@ Not implemented yet:
 - daemon restart orchestration during update
 - platform service/autostart installation
 - uninstall/purge UI
-- published release workflow, draft release automation, and checksums
+- production-signed public release workflow
+- release attestations/SBOMs beyond SHA-256 checksums
 
 ## Packaging commands
 
@@ -161,6 +162,55 @@ Do not enable automatic download/apply until all are true:
 4. CLI/daemon/server compatibility is checked for the update target.
 5. Rollback or recovery guidance exists for failed install/update.
 6. Code signing/notarization requirements are met for the target channel.
+
+## GitHub release workflow
+
+Use `.github/workflows/desktop-release.yml` to create downloadable GitHub Release assets.
+
+The workflow is manual (`workflow_dispatch`) and requires:
+
+- `tag`: release tag to create or update, for example `desktop-v0.1.0-dev.1`
+- `channel`: `dev`, `nightly`, `alpha`, `beta`, or `stable`
+- `draft`: whether to keep the GitHub Release as a draft
+- `prerelease`: whether to mark the GitHub Release as a prerelease
+
+Safety gates:
+
+- `channel=stable` cannot be combined with `prerelease=true`.
+- `channel=stable` cannot be published publicly (`draft=false`) until signing/notarization is configured.
+- existing tags must point at the workflow dispatch commit, preventing mismatched source/release assets.
+
+The workflow builds on native runners:
+
+- Ubuntu: AppImage, deb, and Linux updater metadata
+- macOS: DMG, ZIP, and macOS updater metadata
+- Windows: NSIS `.exe` and Windows updater metadata
+
+It also uploads `SHA256SUMS.txt`.
+
+Normal packaging still defaults to `BIOHAZARDFS_ELECTRON_PUBLISH=never`; the release workflow uploads assets through `gh release upload` after all platform builds pass. This prevents ordinary `dist*` runs from accidentally publishing unsigned scaffold artifacts.
+
+Example authenticated download after a release exists:
+
+```bash
+gh release download desktop-v0.1.0-dev.1 \
+  --repo Biohazard-VFX/BiohazardFS \
+  --pattern 'BiohazardFS-*.AppImage' \
+  --pattern SHA256SUMS.txt
+```
+
+Linux AppImage quick run:
+
+```bash
+chmod +x BiohazardFS-*.AppImage
+./BiohazardFS-*.AppImage
+```
+
+Linux deb install:
+
+```bash
+sudo apt install ./BiohazardFS-*.deb
+```
 
 ## Generated files
 

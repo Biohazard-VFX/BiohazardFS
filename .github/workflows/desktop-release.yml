@@ -1,0 +1,258 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, for example desktop-v0.1.0-dev.1"
+        required: true
+        type: string
+      channel:
+        description: "Desktop updater channel"
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - nightly
+          - alpha
+          - beta
+          - stable
+      draft:
+        description: "Create or keep the GitHub release as a draft"
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate channel, tag, and source commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" =~ [[:space:]] ]]; then
+            echo "release tag must not contain whitespace" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_CHANNEL" == "stable" && "$RELEASE_PRERELEASE" == "true" ]]; then
+            echo "stable releases must not be marked prerelease; stable clients do not allow prerelease updates" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_CHANNEL" == "stable" && "$RELEASE_DRAFT" == "false" ]]; then
+            echo "public stable desktop releases are blocked until signing/notarization is configured" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "existing tag $RELEASE_TAG points at $tag_sha, but workflow ref is $GITHUB_SHA" >&2
+              echo "rerun the workflow from the tag ref or choose a new tag" >&2
+              exit 1
+            fi
+          fi
+
+  build:
+    name: Build ${{ matrix.name }} installer artifacts
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            script: dist:linux
+          - name: macOS
+            os: macos-latest
+            script: dist:mac
+          - name: Windows
+            os: windows-latest
+            script: dist:win
+    env:
+      BIOHAZARDFS_RELEASE_CHANNEL: ${{ inputs.channel }}
+      BIOHAZARDFS_ELECTRON_PUBLISH: never
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+
+      - name: Install Electron dependencies
+        run: pnpm --dir apps/workspace-electron install --frozen-lockfile
+
+      - name: Run desktop static checks
+        run: pnpm --dir apps/workspace-electron run static
+
+      - name: Build desktop installer artifacts
+        run: pnpm --dir apps/workspace-electron run ${{ matrix.script }}
+
+      - name: List release artifacts
+        shell: bash
+        run: find apps/workspace-electron/release -maxdepth 1 -type f -print | sort
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: biohazardfs-desktop-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            apps/workspace-electron/release/*.AppImage
+            apps/workspace-electron/release/*.deb
+            apps/workspace-electron/release/*.dmg
+            apps/workspace-electron/release/*.zip
+            apps/workspace-electron/release/*.exe
+            apps/workspace-electron/release/*.blockmap
+            apps/workspace-electron/release/*.yml
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_CHANNEL: ${{ inputs.channel }}
+      RELEASE_DRAFT: ${{ inputs.draft }}
+      RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+    steps:
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find artifacts -type f -print | sort
+          (cd artifacts && find . -type f -print0 | sort -z | xargs -0 sha256sum) | sed 's#  ./#  #' > SHA256SUMS.txt
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<EOF
+          # BiohazardFS Desktop ${RELEASE_TAG}
+
+          Channel: ${RELEASE_CHANNEL}
+          Commit: ${GITHUB_SHA}
+
+          This release contains unsigned Biohazard Workspace installer artifacts generated by the desktop release workflow.
+
+          ## Safety notes
+
+          - Installers are unsigned until code signing/notarization is configured.
+          - Auto-download and install-on-quit remain disabled in the app.
+          - The updater channel is embedded from release metadata.
+          - SHA-256 checksums are attached as \`SHA256SUMS.txt\`.
+          EOF
+
+      - name: Create or update draft GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            edit_args=("$RELEASE_TAG" --title "BiohazardFS Desktop ${RELEASE_TAG}" --notes-file release-notes.md --draft=true)
+            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+              edit_args+=(--prerelease=true)
+            else
+              edit_args+=(--prerelease=false)
+            fi
+            gh release edit "${edit_args[@]}"
+          else
+            args=("$RELEASE_TAG" --target "$GITHUB_SHA" --title "BiohazardFS Desktop ${RELEASE_TAG}" --notes-file release-notes.md --draft)
+            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "${args[@]}"
+          fi
+
+      - name: Remove stale workflow-managed assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.assets[] | select(.name == "SHA256SUMS.txt" or (.name | test("^BiohazardFS-")) or (.name | test("^(latest|dev|nightly|alpha|beta)(-linux|-mac)?\\.yml$"))) | .id')"
+          if [[ -n "$asset_ids" ]]; then
+            while IFS= read -r asset_id; do
+              [[ -z "$asset_id" ]] && continue
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done <<< "$asset_ids"
+          fi
+
+      - name: Upload assets to draft GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find artifacts -type f -print0 | sort -z)
+          gh release upload "$RELEASE_TAG" "${files[@]}" SHA256SUMS.txt --clobber
+
+      - name: Verify uploaded asset count
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_count="$(( $(find artifacts -type f | wc -l) + 1 ))"
+          actual_count="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')"
+          if [[ "$actual_count" -ne "$expected_count" ]]; then
+            echo "expected $expected_count release assets, found $actual_count" >&2
+            exit 1
+          fi
+
+      - name: Publish release when requested
+        if: ${{ inputs.draft == false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          edit_args=("$RELEASE_TAG" --draft=false)
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            edit_args+=(--prerelease=true)
+          else
+            edit_args+=(--prerelease=false)
+          fi
+          gh release edit "${edit_args[@]}"
