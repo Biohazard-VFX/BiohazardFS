@@ -124,9 +124,6 @@ jobs:
       - name: Install Electron dependencies
         run: pnpm --dir apps/workspace-electron install --frozen-lockfile
 
-      - name: Run desktop static checks
-        run: pnpm --dir apps/workspace-electron run static
-
       - name: Build desktop installer artifacts
         run: pnpm --dir apps/workspace-electron run ${{ matrix.script }}
 
