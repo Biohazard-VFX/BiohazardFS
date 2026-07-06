@@ -1,6 +1,11 @@
 /target/
 node_modules/
 dist/
+apps/workspace-electron/release/
+apps/workspace-electron/release-metadata.json
+apps/workspace-electron/resources/bin/*
+!apps/workspace-electron/resources/bin/.gitkeep
 .env
 *.log
+.fuse_hidden*
 .DS_Store

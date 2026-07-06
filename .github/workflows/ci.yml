@@ -60,6 +60,12 @@ jobs:
       - name: Electron build
         run: pnpm --dir apps/workspace-electron run build
 
+      - name: Electron package directory smoke
+        run: |
+          pnpm --dir apps/workspace-electron run build:rust:release
+          pnpm --dir apps/workspace-electron run prepare:desktop-resources
+          bash scripts/release/electron-builder.sh --dir
+
       - name: Install Linux static/smoke dependencies
         run: sudo apt-get update && sudo apt-get install -y shellcheck xvfb
 

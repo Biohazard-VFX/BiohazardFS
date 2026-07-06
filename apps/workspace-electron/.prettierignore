@@ -1,4 +1,7 @@
 dist
 node_modules
 pnpm-lock.yaml
+release
+release-metadata.json
+resources/bin/**
 src/renderer/assets/fonts/**

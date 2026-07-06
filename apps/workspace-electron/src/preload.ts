@@ -112,11 +112,23 @@ async function openPath(target: string): Promise<{ ok: boolean; error: string | 
 // not the daemon. prefs.set persists to userData/prefs.json in the main process.
 type WindowChrome = 'auto' | 'native' | 'frameless';
 type Theme = 'light' | 'dark' | 'system';
+type ReleaseChannel = 'dev' | 'nightly' | 'alpha' | 'beta' | 'stable';
 type Prefs = {
   windowChrome: WindowChrome;
   zoomFactor: number;
   theme: Theme;
   cacheLimitGB: number | null;
+  releaseChannel: ReleaseChannel;
+  autoUpdateChecks: boolean;
+};
+type UpdateStatus = {
+  state: 'idle' | 'checking' | 'available' | 'not_available' | 'unavailable' | 'error';
+  channel: ReleaseChannel;
+  currentVersion: string;
+  packaged: boolean;
+  updateVersion?: string;
+  message?: string;
+  checkedAt?: string;
 };
 type AppInfo = {
   platform: string;
@@ -134,6 +146,14 @@ async function prefsSet(patch: Partial<Prefs>): Promise<Prefs> {
 
 async function appInfo(): Promise<AppInfo> {
   return (await ipcRenderer.invoke('app:info')) as AppInfo;
+}
+
+async function updateStatus(): Promise<UpdateStatus> {
+  return (await ipcRenderer.invoke('updates:status')) as UpdateStatus;
+}
+
+async function updateCheck(): Promise<UpdateStatus> {
+  return (await ipcRenderer.invoke('updates:check')) as UpdateStatus;
 }
 
 // Subscribe to prefs changes pushed from main (so the Settings UI stays in sync
@@ -183,6 +203,8 @@ contextBridge.exposeInMainWorld('biohazardfs', {
   prefsGet,
   prefsSet,
   appInfo,
+  updateStatus,
+  updateCheck,
   minimizeWindow,
   toggleMaximize,
   closeWindow,

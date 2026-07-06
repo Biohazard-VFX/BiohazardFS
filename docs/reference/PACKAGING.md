@@ -298,7 +298,16 @@ Unsigned artifacts must never pretend to be production-stable.
 
 ## Auto-update
 
-Auto-update is desirable but not required for earliest MVP.
+Installation/update implementation details live in `docs/reference/INSTALLATION_AND_UPDATES.md`.
+
+Auto-update is desirable but must stay conservative until daemon restart and dirty-upload safety exist.
+
+Current scaffold:
+
+- Electron Builder packaging config exists.
+- Release channel is visible/configurable in Settings.
+- Packaged-only manual update checks use `electron-updater`.
+- Auto-download and install-on-quit are disabled.
 
 Future auto-update rules:
 
@@ -348,7 +357,7 @@ Optional purge/remove-data mode may remove preserved data, but it must be explic
 
 ## First implementation target
 
-The first packaging implementation should prove the one-installer path on at least one platform:
+The first scaffold now exists, but it is not yet a production installer. The next packaging implementation should prove the one-installer path on at least one platform:
 
 1. Build desktop shell artifact.
 2. Bundle CLI and daemon binaries.

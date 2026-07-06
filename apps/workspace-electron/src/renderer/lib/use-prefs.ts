@@ -7,6 +7,8 @@ import { useEffect, useState } from 'react';
 export type Prefs = Awaited<ReturnType<typeof window.biohazardfs.prefsGet>>;
 export type AppInfo = Awaited<ReturnType<typeof window.biohazardfs.appInfo>>;
 export type Theme = Prefs['theme'];
+export type ReleaseChannel = Prefs['releaseChannel'];
+export type UpdateStatus = Awaited<ReturnType<typeof window.biohazardfs.updateStatus>>;
 
 const THEME_STORAGE_KEY = 'biohazardfs.theme';
 
@@ -96,7 +98,57 @@ export function usePrefs() {
     setPrefs(await window.biohazardfs.prefsSet({ cacheLimitGB: gb }));
   }
 
-  return { prefs, setZoom, setWindowChrome, setTheme, setCacheLimit };
+  async function setReleaseChannel(releaseChannel: ReleaseChannel) {
+    setPrefs(await window.biohazardfs.prefsSet({ releaseChannel }));
+  }
+
+  async function setAutoUpdateChecks(autoUpdateChecks: boolean) {
+    setPrefs(await window.biohazardfs.prefsSet({ autoUpdateChecks }));
+  }
+
+  return {
+    prefs,
+    setZoom,
+    setWindowChrome,
+    setTheme,
+    setCacheLimit,
+    setReleaseChannel,
+    setAutoUpdateChecks,
+  };
+}
+
+export function useUpdateStatus() {
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.biohazardfs.updateStatus().then((s) => {
+      if (!cancelled) setStatus(s);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function checkNow() {
+    setChecking(true);
+    try {
+      const next = await window.biohazardfs.updateCheck();
+      setStatus(next);
+      return next;
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function refreshStatus() {
+    const next = await window.biohazardfs.updateStatus();
+    setStatus(next);
+    return next;
+  }
+
+  return { status, checking, checkNow, refreshStatus };
 }
 
 export function useAppInfo() {

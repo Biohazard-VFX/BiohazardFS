@@ -2,8 +2,9 @@ import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron'
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { loadPrefs, resolveFrameless, savePrefs } from './main.prefs';
+import { loadPrefs, resolveFrameless, savePrefs, type ReleaseChannel } from './main.prefs';
 import { buildAppMenu } from './main.menu';
+import { checkForUpdates, configureAutoUpdater, getUpdateStatus } from './main.updates';
 
 const DAEMON_ENDPOINT = process.env.BIOHAZARDFS_DAEMON_ENDPOINT ?? '127.0.0.1:47666';
 const LOCAL_TOKEN = process.env.BIOHAZARDFS_LOCAL_TOKEN ?? '';
@@ -346,6 +347,8 @@ ipcMain.handle(
       zoomFactor: number;
       theme: string;
       cacheLimitGB: number | null;
+      releaseChannel: string;
+      autoUpdateChecks: boolean;
     }>,
   ) => {
     // Only accept known shapes; unknown keys are ignored. zoomFactor + cache
@@ -355,6 +358,8 @@ ipcMain.handle(
       zoomFactor: number;
       theme: 'light' | 'dark' | 'system';
       cacheLimitGB: number | null;
+      releaseChannel: ReleaseChannel;
+      autoUpdateChecks: boolean;
     }> = {};
     if (
       patch.windowChrome === 'auto' ||
@@ -372,7 +377,22 @@ ipcMain.handle(
     if (patch.cacheLimitGB === null || typeof patch.cacheLimitGB === 'number') {
       safe.cacheLimitGB = patch.cacheLimitGB;
     }
+    if (
+      patch.releaseChannel === 'dev' ||
+      patch.releaseChannel === 'nightly' ||
+      patch.releaseChannel === 'alpha' ||
+      patch.releaseChannel === 'beta' ||
+      patch.releaseChannel === 'stable'
+    ) {
+      safe.releaseChannel = patch.releaseChannel;
+    }
+    if (typeof patch.autoUpdateChecks === 'boolean') {
+      safe.autoUpdateChecks = patch.autoUpdateChecks;
+    }
     const next = savePrefs(safe);
+    if (safe.releaseChannel !== undefined) {
+      configureAutoUpdater(next.releaseChannel);
+    }
     // Zoom applies live; window chrome needs a restart (frame is fixed at
     // creation), so only propagate zoom to live windows here.
     if (safe.zoomFactor !== undefined) {
@@ -384,6 +404,17 @@ ipcMain.handle(
     return next;
   },
 );
+
+ipcMain.handle('updates:status', () => {
+  const prefs = loadPrefs();
+  configureAutoUpdater(prefs.releaseChannel);
+  return getUpdateStatus(prefs.releaseChannel);
+});
+
+ipcMain.handle('updates:check', async () => {
+  const prefs = loadPrefs();
+  return checkForUpdates(prefs.releaseChannel);
+});
 
 function broadcastPrefs(prefs: { windowChrome: string; zoomFactor: number }) {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -426,7 +457,13 @@ void app
   .whenReady()
   .then(async () => {
     Menu.setApplicationMenu(buildAppMenu());
+    const prefs = loadPrefs();
+    configureAutoUpdater(prefs.releaseChannel);
     const window = await createWindow();
+
+    if (prefs.autoUpdateChecks && app.isPackaged) {
+      void checkForUpdates(prefs.releaseChannel);
+    }
 
     if (IS_SMOKE) {
       const status = await daemonStatus();
