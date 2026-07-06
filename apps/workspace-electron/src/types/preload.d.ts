@@ -14,11 +14,23 @@ export type VersionInfo = { app: string; electron: string; chrome: string; node:
 
 export type WindowChrome = 'auto' | 'native' | 'frameless';
 export type Theme = 'light' | 'dark' | 'system';
+export type ReleaseChannel = 'dev' | 'nightly' | 'alpha' | 'beta' | 'stable';
 export type Prefs = {
   windowChrome: WindowChrome;
   zoomFactor: number;
   theme: Theme;
   cacheLimitGB: number | null;
+  releaseChannel: ReleaseChannel;
+  autoUpdateChecks: boolean;
+};
+export type UpdateStatus = {
+  state: 'idle' | 'checking' | 'available' | 'not_available' | 'unavailable' | 'error';
+  channel: ReleaseChannel;
+  currentVersion: string;
+  packaged: boolean;
+  updateVersion?: string;
+  message?: string;
+  checkedAt?: string;
 };
 export type AppInfo = {
   platform: string;
@@ -51,6 +63,8 @@ declare global {
       prefsGet: () => Promise<Prefs>;
       prefsSet: (patch: Partial<Prefs>) => Promise<Prefs>;
       appInfo: () => Promise<AppInfo>;
+      updateStatus: () => Promise<UpdateStatus>;
+      updateCheck: () => Promise<UpdateStatus>;
       minimizeWindow: () => void;
       toggleMaximize: () => void;
       closeWindow: () => void;

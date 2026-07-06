@@ -9,6 +9,7 @@ import path from 'node:path';
 
 export type WindowChrome = 'auto' | 'native' | 'frameless';
 export type Theme = 'light' | 'dark' | 'system';
+export type ReleaseChannel = 'dev' | 'nightly' | 'alpha' | 'beta' | 'stable';
 
 export type Prefs = {
   windowChrome: WindowChrome;
@@ -17,13 +18,41 @@ export type Prefs = {
   // Local cache size preference in GB, or null for no limit. This is saved for
   // future daemon quota support; the desktop app does not enforce it yet.
   cacheLimitGB: number | null;
+  releaseChannel: ReleaseChannel;
+  autoUpdateChecks: boolean;
 };
+
+function isReleaseChannel(value: unknown): value is ReleaseChannel {
+  return (
+    value === 'dev' ||
+    value === 'nightly' ||
+    value === 'alpha' ||
+    value === 'beta' ||
+    value === 'stable'
+  );
+}
+
+function releaseChannelFromMetadata(): ReleaseChannel | null {
+  if (!app.isPackaged) return null;
+  try {
+    const metadataPath = path.join(process.resourcesPath, 'release-metadata.json');
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8')) as { channel?: unknown };
+    return isReleaseChannel(metadata.channel) ? metadata.channel : null;
+  } catch {
+    return null;
+  }
+}
+
+const DEFAULT_RELEASE_CHANNEL: ReleaseChannel =
+  releaseChannelFromMetadata() ?? (app.isPackaged ? 'stable' : 'dev');
 
 const DEFAULTS: Prefs = {
   windowChrome: 'auto',
   zoomFactor: 1,
   theme: 'dark',
   cacheLimitGB: null,
+  releaseChannel: DEFAULT_RELEASE_CHANNEL,
+  autoUpdateChecks: false,
 };
 
 export const ZOOM_MIN = 0.5;
@@ -58,6 +87,11 @@ export function loadPrefs(): Prefs {
           ? parsed.theme
           : DEFAULTS.theme,
       cacheLimitGB: clampCacheLimit(parsed.cacheLimitGB),
+      releaseChannel: clampReleaseChannel(parsed.releaseChannel),
+      autoUpdateChecks:
+        typeof parsed.autoUpdateChecks === 'boolean'
+          ? parsed.autoUpdateChecks
+          : DEFAULTS.autoUpdateChecks,
     };
   } catch {
     // Missing/unreadable prefs → fall back to defaults. Never throw on prefs;
@@ -77,6 +111,14 @@ export function savePrefs(patch: Partial<Prefs>): Prefs {
       patch.cacheLimitGB === undefined
         ? loadPrefs().cacheLimitGB
         : clampCacheLimit(patch.cacheLimitGB),
+    releaseChannel:
+      patch.releaseChannel === undefined
+        ? loadPrefs().releaseChannel
+        : clampReleaseChannel(patch.releaseChannel),
+    autoUpdateChecks:
+      patch.autoUpdateChecks === undefined
+        ? loadPrefs().autoUpdateChecks
+        : Boolean(patch.autoUpdateChecks),
   };
   cache = next;
   try {
@@ -99,6 +141,10 @@ export function clampCacheLimit(value: unknown): number | null {
   const n = typeof value === 'number' && Number.isFinite(value) ? value : NaN;
   if (Number.isNaN(n) || n <= 0) return DEFAULTS.cacheLimitGB;
   return Math.round(n);
+}
+
+export function clampReleaseChannel(value: unknown): ReleaseChannel {
+  return isReleaseChannel(value) ? value : DEFAULTS.releaseChannel;
 }
 
 // Resolve whether the window should be frameless for a given platform.

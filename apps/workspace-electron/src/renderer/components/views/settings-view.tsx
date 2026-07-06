@@ -5,7 +5,7 @@ import { useActions } from '@/app/root';
 import { type DaemonSnapshot } from '@/lib/use-daemon';
 import { isStubbed, METHOD_NOT_IMPLEMENTED } from '@/lib/daemon-capabilities';
 import { asString } from '@/lib/daemon';
-import { useAppInfo, usePrefs } from '@/lib/use-prefs';
+import { type ReleaseChannel, useAppInfo, usePrefs, useUpdateStatus } from '@/lib/use-prefs';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -123,6 +123,8 @@ export function SettingsView({ snapshot }: Props) {
             <Row label="Node" value={versions?.node ?? '—'} />
           </CardContent>
         </Card>
+
+        <UpdatesSection />
 
         <Separator />
 
@@ -271,6 +273,68 @@ function CacheLimitSection() {
             <span className="text-muted-foreground text-xs">Current: no limit</span>
           )}
         </form>
+      </CardContent>
+    </Card>
+  );
+}
+
+function UpdatesSection() {
+  const { prefs, setReleaseChannel, setAutoUpdateChecks } = usePrefs();
+  const { status, checking, checkNow, refreshStatus } = useUpdateStatus();
+  const channel = prefs?.releaseChannel ?? 'dev';
+  const autoChecks = prefs?.autoUpdateChecks ?? false;
+  const channels: ReleaseChannel[] = ['dev', 'nightly', 'alpha', 'beta', 'stable'];
+
+  async function changeChannel(next: ReleaseChannel) {
+    await setReleaseChannel(next);
+    await refreshStatus();
+  }
+
+  return (
+    <Card className="py-4">
+      <CardHeader className="pb-0">
+        <CardTitle className="text-sm">Updates</CardTitle>
+        <CardDescription>
+          Installer update checks are packaged-build only. Downloads remain manual until daemon
+          restart safety is implemented.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <div className="flex flex-wrap gap-1">
+          {channels.map((option) => (
+            <Button
+              key={option}
+              variant={channel === option ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => void changeChannel(option)}
+            >
+              {option}
+            </Button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant={autoChecks ? 'default' : 'outline'}
+            onClick={() => void setAutoUpdateChecks(!autoChecks)}
+          >
+            {autoChecks ? 'Auto-check enabled' : 'Auto-check disabled'}
+          </Button>
+          <Button size="sm" variant="outline" disabled={checking} onClick={() => void checkNow()}>
+            <RotateCcw className={cn('size-3.5', checking && 'animate-spin')} />
+            {checking ? 'Checking…' : 'Check now'}
+          </Button>
+        </div>
+        <div className="bg-muted/40 rounded-md border px-3 py-2 font-mono text-xs">
+          <Row label="Channel" value={status?.channel ?? channel} />
+          <Row label="State" value={status?.state ?? 'idle'} />
+          <Row label="Packaged" value={status?.packaged ? 'yes' : 'no'} />
+          {status?.updateVersion ? <Row label="Update" value={status.updateVersion} /> : null}
+          {status?.checkedAt ? <Row label="Checked" value={status.checkedAt} /> : null}
+        </div>
+        {status?.message ? (
+          <Feedback ok={status.state !== 'error'}>{status.message}</Feedback>
+        ) : null}
       </CardContent>
     </Card>
   );
