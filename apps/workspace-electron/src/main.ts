@@ -1,4 +1,6 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -7,9 +9,11 @@ import { buildAppMenu } from './main.menu';
 import { checkForUpdates, configureAutoUpdater, getUpdateStatus } from './main.updates';
 
 const DAEMON_ENDPOINT = process.env.BIOHAZARDFS_DAEMON_ENDPOINT ?? '127.0.0.1:47666';
-const LOCAL_TOKEN = process.env.BIOHAZARDFS_LOCAL_TOKEN ?? '';
+let localToken = process.env.BIOHAZARDFS_LOCAL_TOKEN ?? '';
+let managedDaemon: ChildProcess | null = null;
 const IS_SMOKE = process.env.BIOHAZARDFS_DESKTOP_SMOKE === '1';
 const IS_DEV = process.env.NODE_ENV === 'development';
+const DISABLE_DAEMON_AUTOSTART = process.env.BIOHAZARDFS_DISABLE_DAEMON_AUTOSTART === '1';
 
 const GENERIC_RENDERER_RPC_ALLOWLIST = new Set([
   'auth.status',
@@ -54,6 +58,102 @@ function isAllowedLoopbackEndpoint(endpoint: string): boolean {
   }
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function packagedBinDir(): string {
+  const platform =
+    process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux';
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  return `${platform}-${arch}`;
+}
+
+async function daemonBinaryPath(): Promise<string | null> {
+  const binaryName = process.platform === 'win32' ? 'biohazardfsd.exe' : 'biohazardfsd';
+  const override = process.env.BIOHAZARDFS_DAEMON_BIN;
+  const candidates = [
+    override,
+    app.isPackaged
+      ? path.join(process.resourcesPath, 'bin', packagedBinDir(), binaryName)
+      : undefined,
+    path.resolve(__dirname, '../../../../target/debug', binaryName),
+    path.resolve(__dirname, '../../../../target/release', binaryName),
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function ensureLocalToken(): Promise<string> {
+  if (localToken) return localToken;
+
+  const tokenPath = path.join(app.getPath('userData'), 'daemon-token');
+  try {
+    const existing = (await fs.readFile(tokenPath, 'utf8')).trim();
+    if (existing) {
+      localToken = existing;
+      return localToken;
+    }
+  } catch {
+    // Missing token file is expected on first launch.
+  }
+
+  localToken = `bfsd_${randomBytes(32).toString('base64url')}`;
+  await fs.mkdir(path.dirname(tokenPath), { recursive: true });
+  await fs.writeFile(tokenPath, `${localToken}\n`, { mode: 0o600 });
+  await fs.chmod(tokenPath, 0o600).catch(() => undefined);
+  return localToken;
+}
+
+async function waitForDaemonReady(timeoutMs = 2500): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const status = await daemonStatus();
+    if (status.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+}
+
+async function ensureManagedDaemon(): Promise<void> {
+  if (IS_SMOKE || DISABLE_DAEMON_AUTOSTART || managedDaemon) return;
+  if (!isAllowedLoopbackEndpoint(DAEMON_ENDPOINT)) return;
+
+  await ensureLocalToken();
+  const current = await daemonStatus();
+  if (current.ok) return;
+
+  const binary = await daemonBinaryPath();
+  if (!binary) return;
+
+  const child = spawn(binary, ['--dev-loopback-http', '--addr', DAEMON_ENDPOINT], {
+    env: {
+      ...process.env,
+      BIOHAZARDFS_LOCAL_TOKEN: localToken,
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  });
+  managedDaemon = child;
+
+  child.stderr.on('data', (chunk: Buffer) => {
+    const message = chunk.toString('utf8').trim();
+    if (message) console.warn(`[biohazardfsd] ${message}`);
+  });
+  child.on('exit', () => {
+    if (managedDaemon === child) managedDaemon = null;
+  });
+
+  await waitForDaemonReady();
+}
+
 async function daemonRpc(method: string, params: Record<string, unknown> = {}) {
   const endpoint = DAEMON_ENDPOINT;
   if (!isAllowedLoopbackEndpoint(endpoint)) {
@@ -63,8 +163,8 @@ async function daemonRpc(method: string, params: Record<string, unknown> = {}) {
       error: 'daemon endpoint must be an explicit loopback host and port',
     };
   }
-  if (!LOCAL_TOKEN) {
-    return { ok: false, endpoint, error: 'missing BIOHAZARDFS_LOCAL_TOKEN' };
+  if (!localToken) {
+    return { ok: false, endpoint, error: 'local daemon token is not initialized' };
   }
 
   try {
@@ -72,7 +172,7 @@ async function daemonRpc(method: string, params: Record<string, unknown> = {}) {
       method: 'POST',
       headers: {
         Accept: 'application/json',
-        Authorization: `Bearer ${LOCAL_TOKEN}`,
+        Authorization: `Bearer ${localToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -459,6 +559,7 @@ void app
     Menu.setApplicationMenu(buildAppMenu());
     const prefs = loadPrefs();
     configureAutoUpdater(prefs.releaseChannel);
+    await ensureManagedDaemon();
     const window = await createWindow();
 
     if (prefs.autoUpdateChecks && app.isPackaged) {
@@ -495,6 +596,12 @@ void app
     console.error(error);
     app.exit(1);
   });
+
+app.on('before-quit', () => {
+  if (managedDaemon && !managedDaemon.killed) {
+    managedDaemon.kill();
+  }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
