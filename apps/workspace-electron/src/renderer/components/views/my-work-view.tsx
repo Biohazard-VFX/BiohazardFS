@@ -12,7 +12,16 @@ import {
 
 import { type DaemonSnapshot } from '@/lib/use-daemon';
 import { useDaemonFetch } from '@/lib/use-fetch';
-import { type Entry, asNumber, asString, entryList, extractData } from '@/lib/daemon';
+import {
+  type Entry,
+  asNumber,
+  asString,
+  dirtyEntryCount,
+  entryList,
+  extractData,
+  mountAttached,
+  mountPathFromList,
+} from '@/lib/daemon';
 import { formatBytes } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -29,9 +38,10 @@ type Props = {
   snapshot: DaemonSnapshot;
   loaded: boolean;
   onOpenDrive: () => void;
+  refreshNonce: number;
 };
 
-export function MyWorkView({ snapshot, loaded, onOpenDrive }: Props) {
+export function MyWorkView({ snapshot, loaded, onOpenDrive, refreshNonce }: Props) {
   const cacheStatus = extractData(snapshot.cacheStatus);
   const transferData = extractData(snapshot.transferList);
   const conflictData = extractData(snapshot.conflictList);
@@ -40,9 +50,8 @@ export function MyWorkView({ snapshot, loaded, onOpenDrive }: Props) {
 
   const reachable = snapshot.daemon?.body !== undefined;
   const workspaceReady = workspaceData?.state === 'ready';
-  const workspaceRoot = asString(workspaceData?.root);
 
-  const dirtyCount = asNumber(cacheStatus?.dirty_count) ?? 0;
+  const dirtyCount = dirtyEntryCount(cacheStatus) ?? 0;
   const dirtyBytes = asNumber(cacheStatus?.dirty_bytes);
   const usedBytes = asNumber(cacheStatus?.used_bytes ?? cacheStatus?.bytes_used);
   const pinnedBytes = asNumber(cacheStatus?.pinned_bytes);
@@ -57,14 +66,17 @@ export function MyWorkView({ snapshot, loaded, onOpenDrive }: Props) {
   ).length;
   const failedTransfers = transfers.filter((t) => isFailed(t)).length;
 
-  const worksets = useDaemonFetch('workset.list', {}, 0);
-  const mount = useDaemonFetch('mount.status', {}, 0);
+  const worksets = useDaemonFetch('workset.list', {}, refreshNonce);
+  const mountStatusData = extractData(snapshot.mountStatus);
+  const mountListData = extractData(snapshot.mountList);
   const worksetEntries = entryList(worksets.data, ['entries', 'worksets', 'items']);
-  const mountPath = asString((mount.data as { path?: string; mount?: string } | null)?.path);
+  const mounted = mountAttached(mountStatusData);
+  const mountPath = mountPathFromList(mountListData);
 
   if (!loaded) return <ViewLoading rows={6} />;
 
-  const safeToEdit = reachable && workspaceReady && dirtyCount === 0 && failedTransfers === 0;
+  const safeToEdit =
+    reachable && workspaceReady && mounted && dirtyCount === 0 && failedTransfers === 0;
   const safeToQuit = dirtyCount === 0 && activeUploads === 0;
   const hasAttention = !reachable || dirtyCount > 0 || conflictCount > 0 || failedTransfers > 0;
 
@@ -74,9 +86,9 @@ export function MyWorkView({ snapshot, loaded, onOpenDrive }: Props) {
         {/* Readiness banner */}
         <ReadinessBanner
           reachable={reachable}
-          mounted={workspaceReady}
+          mounted={mounted}
           safeToEdit={safeToEdit}
-          mountPath={mountPath || workspaceRoot}
+          mountPath={mountPath}
           onOpenDrive={onOpenDrive}
         />
 
@@ -233,7 +245,7 @@ function ReadinessBanner({
   const detail = !reachable
     ? 'Daemon unreachable. Showing last known state.'
     : !mounted
-      ? 'Workspace not configured.'
+      ? 'No mounted drive is attached.'
       : safeToEdit
         ? 'Mounted and online. Safe to edit.'
         : 'Some work has not synced yet. Safe to read; hold off on destructive edits.';

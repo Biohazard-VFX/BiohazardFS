@@ -219,8 +219,8 @@ function AppearanceSection() {
 // Window chrome + zoom. These are Electron-owned presentation prefs (not daemon
 // config): persisted to userData/prefs.json. Zoom applies live; changing the
 // chrome requires a restart because the OS frame is fixed at window creation.
-// Cache size cap. Lives in Electron prefs (config.set is stubbed, so it can't
-// go through daemon config). null = no limit.
+// Cache size preference. Lives in Electron prefs until daemon quota support can
+// enforce it. null = no local preference.
 function CacheLimitSection() {
   const { prefs, setCacheLimit } = usePrefs();
   const limit = prefs?.cacheLimitGB ?? null;
@@ -237,10 +237,10 @@ function CacheLimitSection() {
   return (
     <Card className="py-4">
       <CardHeader className="pb-0">
-        <CardTitle className="text-sm">Cache limit</CardTitle>
+        <CardTitle className="text-sm">Cache size preference</CardTitle>
         <CardDescription>
-          Soft cap on local cache size in GB. Leave blank for no limit. Enforced client-side for
-          now.
+          Preferred local cache size in GB. Saved locally for future daemon quota support; not
+          enforced yet.
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-2">

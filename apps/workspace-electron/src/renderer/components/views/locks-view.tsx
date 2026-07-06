@@ -27,14 +27,17 @@ export function LocksView({ refreshNonce }: Props) {
   const result = useDaemonFetch('lock.list', {}, refreshNonce + actionNonce);
   const locks = entryList(result.data, ['entries', 'locks', 'items']);
 
-  async function act(method: 'lock.release' | 'lock.extend', path: string) {
+  async function act(method: 'lock.release' | 'lock.extend', lockId: string, label: string) {
     if (isStubbed(method)) {
       setFeedback({ ok: false, text: `Requires daemon support (${method} not built).` });
       return;
     }
     setFeedback(null);
-    setBusy(path);
-    const res = await window.biohazardfs.rpc(method, { path });
+    setBusy(lockId);
+    const res =
+      method === 'lock.release'
+        ? await window.biohazardfs.lockRelease({ lock_id: lockId })
+        : await window.biohazardfs.lockExtend({ lock_id: lockId, extend_seconds: 3600 });
     setBusy(null);
     const err = extractError(res);
     if (err?.code === METHOD_NOT_IMPLEMENTED) {
@@ -44,7 +47,7 @@ export function LocksView({ refreshNonce }: Props) {
     } else {
       setFeedback({
         ok: true,
-        text: `${method === 'lock.release' ? 'Released' : 'Extended'} ${path}.`,
+        text: `${method === 'lock.release' ? 'Released' : 'Extended'} ${label}.`,
       });
       setActionNonce((n) => n + 1);
     }
@@ -76,11 +79,11 @@ export function LocksView({ refreshNonce }: Props) {
           <ul className="divide-border divide-y">
             {locks.map((lock, index) => (
               <LockRow
-                key={`${String(index)}:${asString(lock.path)}`}
+                key={`${String(index)}:${asString(lock.lock_id)}`}
                 lock={lock}
                 busy={busy}
-                onAct={(method, path) => {
-                  void act(method, path);
+                onAct={(method, lockId, label) => {
+                  void act(method, lockId, label);
                 }}
                 breakAvailable={breakAvailable}
               />
@@ -100,10 +103,11 @@ function LockRow({
 }: {
   lock: Entry;
   busy: string | null;
-  onAct: (method: 'lock.release' | 'lock.extend', path: string) => void;
+  onAct: (method: 'lock.release' | 'lock.extend', lockId: string, label: string) => void;
   breakAvailable: boolean;
 }) {
-  const path = asString(lock.path, 'unknown path');
+  const lockId = asString(lock.lock_id);
+  const path = asString(lock.path_snapshot ?? lock.path, 'unknown path');
   const owner = asString(lock.owner);
   const expires = formatRelativeTime(lock.expires ?? lock.expires_at);
   // Default to locked when state unknown — never falsely advertise "safe to edit."
@@ -123,9 +127,9 @@ function LockRow({
       <Button
         variant="ghost"
         size="sm"
-        disabled={busy === path}
+        disabled={!lockId || busy === lockId}
         onClick={() => {
-          onAct('lock.extend', path);
+          onAct('lock.extend', lockId, path);
         }}
       >
         Extend
@@ -133,9 +137,9 @@ function LockRow({
       <Button
         variant="ghost"
         size="sm"
-        disabled={busy === path}
+        disabled={!lockId || busy === lockId}
         onClick={() => {
-          onAct('lock.release', path);
+          onAct('lock.release', lockId, path);
         }}
       >
         Release

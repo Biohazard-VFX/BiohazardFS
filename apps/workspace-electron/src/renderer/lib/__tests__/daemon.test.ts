@@ -4,13 +4,17 @@ import {
   DIRTY_STATES,
   asNumber,
   asString,
+  cacheEntryTarget,
   computeProgress,
+  dirtyEntryCount,
   entryList,
   extractData,
   extractError,
   isDirtyEntry,
   isPinnedEntry,
   keepLastGood,
+  mountAttached,
+  mountPathFromList,
   stateLabel,
 } from '../daemon';
 import { formatBytes } from '../format';
@@ -38,6 +42,36 @@ describe('isDirtyEntry', () => {
   it('treats empty/missing state as not dirty', () => {
     expect(isDirtyEntry({ state: '' })).toBe(false);
     expect(isDirtyEntry({ state: undefined })).toBe(false);
+  });
+});
+
+describe('dirtyEntryCount', () => {
+  it('prefers the daemon dirty_entries field and supports legacy dirty_count', () => {
+    expect(dirtyEntryCount({ dirty_entries: 3, dirty_count: 1 })).toBe(3);
+    expect(dirtyEntryCount({ dirty_count: 2 })).toBe(2);
+    expect(dirtyEntryCount({})).toBeNull();
+  });
+});
+
+describe('cacheEntryTarget', () => {
+  it('uses path when present, otherwise falls back to node_id', () => {
+    expect(cacheEntryTarget({ path: 'shots/a.exr', node_id: 'node_a' })).toEqual({
+      path: 'shots/a.exr',
+    });
+    expect(cacheEntryTarget({ node_id: 'node_a' })).toEqual({ node_id: 'node_a' });
+    expect(cacheEntryTarget({})).toBeNull();
+  });
+});
+
+describe('mount helpers', () => {
+  it('reads attached and mount_path from daemon mount payloads', () => {
+    expect(mountAttached({ attached: true })).toBe(true);
+    expect(mountAttached({ attached: false })).toBe(false);
+    expect(mountAttached({ mounted: true })).toBe(true);
+    expect(mountAttached({ mounted: false })).toBe(false);
+    expect(mountPathFromList({ mounts: [{ mount_path: '/mnt/biohazard', attached: true }] })).toBe(
+      '/mnt/biohazard',
+    );
   });
 });
 

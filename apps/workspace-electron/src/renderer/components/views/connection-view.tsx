@@ -4,7 +4,7 @@ import { ExternalLink, RefreshCw } from 'lucide-react';
 import { type DaemonSnapshot } from '@/lib/use-daemon';
 import { useDaemonFetch } from '@/lib/use-fetch';
 import { isStubbed } from '@/lib/daemon-capabilities';
-import { asString, extractData } from '@/lib/daemon';
+import { extractData, mountAttached, mountPathFromList } from '@/lib/daemon';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -20,20 +20,17 @@ type Props = {
 export function ConnectionView({ snapshot, refreshNonce }: Props) {
   const whoami = useDaemonFetch('auth.whoami', {}, refreshNonce);
   const authStatus = useDaemonFetch('auth.status', {}, refreshNonce);
-  const mountStatus = useDaemonFetch('mount.status', {}, refreshNonce);
-  const mountList = useDaemonFetch('mount.list', {}, refreshNonce);
-
-  const workspaceData = extractData(snapshot.workspace);
-  const workspaceRoot = asString(workspaceData?.root);
   const endpoint = snapshot.daemon?.endpoint ?? '127.0.0.1:47666';
+  const mountStatusData = extractData(snapshot.mountStatus);
+  const mountListData = extractData(snapshot.mountList);
 
   const [openFeedback, setOpenFeedback] = useState<string | null>(null);
 
   const user = field(whoami.data, ['user', 'display_name', 'name', 'email']);
   const deviceId = field(authStatus.data, ['device_id', 'device']);
   const authState = field(authStatus.data, ['state', 'status']);
-  const mountPath = field(mountStatus.data, ['path', 'mount', 'mount_point']) || workspaceRoot;
-  const mounted = asString(mountStatus.data?.mounted) !== 'false';
+  const mountPath = mountPathFromList(mountListData);
+  const mounted = mountAttached(mountStatusData);
 
   const mountOpsAvailable = !isStubbed('mount.attach');
 
@@ -77,14 +74,17 @@ export function ConnectionView({ snapshot, refreshNonce }: Props) {
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
             <div className="flex flex-col gap-1.5 font-mono text-xs">
-              <Row label="Path" value={mountPath || (mountStatus.loading ? '…' : 'not mounted')} />
+              <Row
+                label="Path"
+                value={mountPath || (snapshot.mountStatus === null ? '…' : 'not mounted')}
+              />
               <Row label="State" value={mounted ? 'mounted' : 'unmounted'} />
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
                 variant="outline"
-                disabled={!mountPath}
+                disabled={!mounted || !mountPath}
                 onClick={() => void openInFileManager()}
               >
                 <ExternalLink className="size-3.5" />
@@ -114,14 +114,14 @@ export function ConnectionView({ snapshot, refreshNonce }: Props) {
           </CardContent>
         </Card>
 
-        {mountList.data ? (
+        {mountListData ? (
           <Card className="py-4">
             <CardHeader className="pb-0">
               <CardTitle className="text-sm">Mounts</CardTitle>
             </CardHeader>
             <CardContent>
               <pre className="text-muted-foreground max-h-60 overflow-auto rounded-md bg-muted/40 p-3 text-[0.7rem]">
-                {JSON.stringify(mountList.data, null, 2)}
+                {JSON.stringify(mountListData, null, 2)}
               </pre>
             </CardContent>
           </Card>

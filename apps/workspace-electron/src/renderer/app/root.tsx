@@ -18,7 +18,7 @@ import { SnapshotsView } from '@/components/views/snapshots-view';
 import { AccessView } from '@/components/views/access-view';
 import { PlaceholderView } from '@/components/views/placeholder-view';
 import { SettingsView } from '@/components/views/settings-view';
-import { type DaemonStatusResult, extractData } from '@/lib/daemon';
+import { type CacheTargetParams, type DaemonStatusResult, extractData } from '@/lib/daemon';
 import { daemonReachable, deriveCounts } from '@/lib/derive';
 import { useDaemonState } from '@/lib/use-daemon';
 import { useAppInfo, useTheme } from '@/lib/use-prefs';
@@ -32,8 +32,8 @@ import { useAppInfo, useTheme } from '@/lib/use-prefs';
 // refresh during a transient dropout never blanks the panels.
 
 export type Actions = {
-  pinEntry: (path: string) => Promise<DaemonStatusResult>;
-  dehydrateEntry: (path: string) => Promise<DaemonStatusResult>;
+  pinEntry: (target: string | CacheTargetParams) => Promise<DaemonStatusResult>;
+  dehydrateEntry: (target: string | CacheTargetParams) => Promise<DaemonStatusResult>;
   pauseTransfers: () => Promise<DaemonStatusResult>;
   resumeTransfers: () => Promise<DaemonStatusResult>;
   preserveAllConflicts: () => Promise<DaemonStatusResult>;
@@ -86,13 +86,13 @@ export function Root() {
 
   const actions = useMemo<Actions>(
     () => ({
-      async pinEntry(path: string) {
-        const result = await window.biohazardfs.cachePin({ path });
+      async pinEntry(target: string | CacheTargetParams) {
+        const result = await window.biohazardfs.cachePin(normalizeCacheTarget(target));
         await refresh();
         return result;
       },
-      async dehydrateEntry(path: string) {
-        const result = await window.biohazardfs.cacheDehydrate({ path });
+      async dehydrateEntry(target: string | CacheTargetParams) {
+        const result = await window.biohazardfs.cacheDehydrate(normalizeCacheTarget(target));
         await refresh();
         return result;
       },
@@ -196,6 +196,7 @@ export function Root() {
                 onOpenDrive={() => {
                   setView('drive');
                 }}
+                refreshNonce={refreshNonce}
               />
             ) : view === 'connection' ? (
               <ConnectionView snapshot={snapshot} refreshNonce={refreshNonce} />
@@ -241,6 +242,10 @@ export function Root() {
       </div>
     </ActionContext.Provider>
   );
+}
+
+function normalizeCacheTarget(target: string | CacheTargetParams): CacheTargetParams {
+  return typeof target === 'string' ? { path: target } : target;
 }
 
 function OfflineBanner() {

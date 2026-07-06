@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { type DaemonStatusResult, type VersionInfo, keepLastGood } from './daemon';
+import { type DaemonStatusResult, type VersionInfo, dirtyEntryCount, keepLastGood } from './daemon';
 
 // Aggregated daemon state for the whole shell. This is the original renderer's
 // fetchAll/applyResults pattern, lifted verbatim in behavior, plus:
@@ -24,6 +24,8 @@ export type DaemonSnapshot = {
   transferList: DaemonStatusResult | null;
   conflictList: DaemonStatusResult | null;
   lockList: DaemonStatusResult | null;
+  mountStatus: DaemonStatusResult | null;
+  mountList: DaemonStatusResult | null;
   versions: VersionInfo | null;
 };
 
@@ -37,6 +39,8 @@ async function fetchSnapshot(): Promise<DaemonSnapshot> {
     transferList,
     conflictList,
     lockList,
+    mountStatus,
+    mountList,
     versions,
   ] = await Promise.all([
     window.biohazardfs.daemonStatus(),
@@ -47,6 +51,8 @@ async function fetchSnapshot(): Promise<DaemonSnapshot> {
     window.biohazardfs.transferList(),
     window.biohazardfs.conflictList(),
     window.biohazardfs.lockList(),
+    window.biohazardfs.rpc('mount.status'),
+    window.biohazardfs.rpc('mount.list'),
     window.biohazardfs.versions(),
   ]);
   return {
@@ -58,6 +64,8 @@ async function fetchSnapshot(): Promise<DaemonSnapshot> {
     transferList,
     conflictList,
     lockList,
+    mountStatus,
+    mountList,
     versions,
   };
 }
@@ -72,6 +80,8 @@ function mergeSnapshot(prev: DaemonSnapshot, next: DaemonSnapshot): DaemonSnapsh
     transferList: keepLastGood(prev.transferList, next.transferList),
     conflictList: keepLastGood(prev.conflictList, next.conflictList),
     lockList: keepLastGood(prev.lockList, next.lockList),
+    mountStatus: keepLastGood(prev.mountStatus, next.mountStatus),
+    mountList: keepLastGood(prev.mountList, next.mountList),
     versions: next.versions ?? prev.versions,
   };
 }
@@ -85,6 +95,8 @@ const EMPTY: DaemonSnapshot = {
   transferList: null,
   conflictList: null,
   lockList: null,
+  mountStatus: null,
+  mountList: null,
   versions: null,
 };
 
@@ -164,8 +176,8 @@ function activeInterval(snap: DaemonSnapshot): number {
     transfers?.data?.items?.length ??
     0;
   const cacheStatus = snap.cacheStatus?.body as
-    { data?: { dirty_count?: number; dirty_bytes?: number } } | undefined;
-  const dirtyCount = cacheStatus?.data?.dirty_count ?? 0;
+    { data?: { dirty_count?: number; dirty_entries?: number; dirty_bytes?: number } } | undefined;
+  const dirtyCount = dirtyEntryCount(cacheStatus?.data ?? null) ?? 0;
   const dirtyBytes = cacheStatus?.data?.dirty_bytes ?? 0;
 
   if (transferCount > 0 || dirtyCount > 0 || dirtyBytes > 0) {

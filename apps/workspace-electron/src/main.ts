@@ -1,4 +1,5 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { loadPrefs, resolveFrameless, savePrefs } from './main.prefs';
@@ -8,6 +9,21 @@ const DAEMON_ENDPOINT = process.env.BIOHAZARDFS_DAEMON_ENDPOINT ?? '127.0.0.1:47
 const LOCAL_TOKEN = process.env.BIOHAZARDFS_LOCAL_TOKEN ?? '';
 const IS_SMOKE = process.env.BIOHAZARDFS_DESKTOP_SMOKE === '1';
 const IS_DEV = process.env.NODE_ENV === 'development';
+
+const GENERIC_RENDERER_RPC_ALLOWLIST = new Set([
+  'auth.status',
+  'auth.whoami',
+  'mount.status',
+  'mount.list',
+  'workset.list',
+  'lock.list',
+  'cache.verify',
+  'audit.events',
+  'snapshot.list',
+  'grant.list',
+  'share.list',
+  'invite.list',
+]);
 
 function isAllowedLoopbackEndpoint(endpoint: string): boolean {
   if (
@@ -102,11 +118,17 @@ async function cacheList() {
   return daemonRpc('cache.list');
 }
 
-async function cachePin(params: { path: string }) {
+type CacheTargetParams = { path?: string; node_id?: string };
+
+type LockIdParams = { lock_id: string };
+
+type LockExtendParams = { lock_id: string; extend_seconds: number };
+
+async function cachePin(params: CacheTargetParams) {
   return daemonRpc('cache.pin', params);
 }
 
-async function cacheDehydrate(params: { path: string }) {
+async function cacheDehydrate(params: CacheTargetParams) {
   return daemonRpc('cache.dehydrate', params);
 }
 
@@ -134,6 +156,14 @@ async function lockList() {
   return daemonRpc('lock.list');
 }
 
+async function lockRelease(params: LockIdParams) {
+  return daemonRpc('lock.release', params);
+}
+
+async function lockExtend(params: LockExtendParams) {
+  return daemonRpc('lock.extend', params);
+}
+
 async function configSet(params: { key: string; value: string }) {
   return daemonRpc('config.set', params);
 }
@@ -144,6 +174,68 @@ function rendererEntry(): string {
     return devServerUrl;
   }
   return `file://${path.join(__dirname, '../renderer/index.html')}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function rpcPayloadMethod(payload: unknown): string | null {
+  if (!isRecord(payload)) return null;
+  return typeof payload.method === 'string' ? payload.method : null;
+}
+
+function rpcPayloadParams(payload: unknown): Record<string, unknown> {
+  if (!isRecord(payload)) return {};
+  return isRecord(payload.params) ? payload.params : {};
+}
+
+function responseData(
+  result: Awaited<ReturnType<typeof daemonRpc>>,
+): Record<string, unknown> | null {
+  const body = (result as { body?: unknown }).body;
+  if (!isRecord(body)) return null;
+  return isRecord(body.data) ? body.data : null;
+}
+
+async function realDirectoryPath(candidate: string): Promise<string | null> {
+  const real = await fs.realpath(candidate);
+  const stat = await fs.stat(real);
+  return stat.isDirectory() ? real : null;
+}
+
+function candidatePath(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+async function allowedOpenRoots(): Promise<string[]> {
+  const roots = new Set<string>();
+  const addRoot = async (candidate: unknown) => {
+    const raw = candidatePath(candidate);
+    if (!raw) return;
+    const real = await realDirectoryPath(raw).catch(() => null);
+    if (real) roots.add(real);
+  };
+
+  const workspace = responseData(await daemonRpc('workspace.status'));
+  await addRoot(workspace?.root);
+
+  const mountList = responseData(await daemonRpc('mount.list'));
+  const mounts = Array.isArray(mountList?.mounts) ? mountList.mounts : [];
+  for (const mount of mounts) {
+    if (!isRecord(mount) || mount.attached !== true) continue;
+    await addRoot(mount.mount_path ?? mount.path ?? mount.mount_point);
+  }
+
+  return [...roots];
+}
+
+function isWithin(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return (
+    relative === '' ||
+    (relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative))
+  );
 }
 
 async function createWindow(): Promise<BrowserWindow> {
@@ -183,8 +275,8 @@ ipcMain.handle('workspace:status', workspaceStatus);
 ipcMain.handle('workspace:list', (_event, pathName: string) => workspaceList(pathName));
 ipcMain.handle('cache:status', cacheStatus);
 ipcMain.handle('cache:list', cacheList);
-ipcMain.handle('cache:pin', (_event, params: { path: string }) => cachePin(params));
-ipcMain.handle('cache:dehydrate', (_event, params: { path: string }) => cacheDehydrate(params));
+ipcMain.handle('cache:pin', (_event, params: CacheTargetParams) => cachePin(params));
+ipcMain.handle('cache:dehydrate', (_event, params: CacheTargetParams) => cacheDehydrate(params));
 ipcMain.handle('transfer:list', transferList);
 ipcMain.handle('transfer:pause', (_event, params: { transfer_id?: string }) =>
   transferPause(params),
@@ -195,6 +287,8 @@ ipcMain.handle('transfer:resume', (_event, params: { transfer_id?: string }) =>
 ipcMain.handle('conflict:list', conflictList);
 ipcMain.handle('conflict:preserveAll', conflictPreserveAll);
 ipcMain.handle('lock:list', lockList);
+ipcMain.handle('lock:release', (_event, params: LockIdParams) => lockRelease(params));
+ipcMain.handle('lock:extend', (_event, params: LockExtendParams) => lockExtend(params));
 ipcMain.handle('config:set', (_event, params: { key: string; value: string }) => configSet(params));
 ipcMain.handle('app:versions', () => ({
   app: app.getVersion(),
@@ -205,23 +299,35 @@ ipcMain.handle('app:versions', () => ({
 
 // Generic read-only RPC passthrough for views that need methods outside the
 // always-polled global snapshot (workset.list, mount.status, audit.events,
-// snapshot.list, etc.). Same daemonRpc + loopback/token safety; the renderer
-// treats the envelope as untrusted draft data, same as everything else.
-ipcMain.handle(
-  'daemon:rpc',
-  (_event, payload: { method: string; params?: Record<string, unknown> }) =>
-    daemonRpc(payload.method, payload.params ?? {}),
-);
+// snapshot.list, etc.). The main process enforces an allowlist so a compromised
+// renderer cannot turn this helper into an arbitrary daemon-token proxy.
+ipcMain.handle('daemon:rpc', (_event, payload: unknown) => {
+  const method = rpcPayloadMethod(payload);
+  if (!method || !GENERIC_RENDERER_RPC_ALLOWLIST.has(method)) {
+    return {
+      ok: false,
+      endpoint: DAEMON_ENDPOINT,
+      error: 'daemon method is not allowed from renderer rpc',
+    };
+  }
+  return daemonRpc(method, rpcPayloadParams(payload));
+});
 
-// Open a folder in the OS file manager (Finder / Explorer / Files). Only ever
-// invoked with the workspace root from the Connection view. shell.openPath
-// returns '' on success or a localized error string.
+// Open a folder in the OS file manager (Finder / Explorer / Files). Main only
+// opens daemon-reported workspace/mount roots or their descendants, and only
+// when the resolved target is a directory.
 ipcMain.handle('shell:openPath', async (_event, target: unknown) => {
   if (typeof target !== 'string' || target.length === 0) {
     return { ok: false, error: 'invalid path' };
   }
   try {
-    const errorMessage = await shell.openPath(target);
+    const targetReal = await realDirectoryPath(target);
+    if (!targetReal) return { ok: false, error: 'path is not an existing directory' };
+    const roots = await allowedOpenRoots();
+    if (!roots.some((root) => isWithin(root, targetReal))) {
+      return { ok: false, error: 'path is outside the workspace or mount roots' };
+    }
+    const errorMessage = await shell.openPath(targetReal);
     return { ok: errorMessage === '', error: errorMessage || null };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

@@ -1,5 +1,13 @@
 import { type DaemonSnapshot } from './use-daemon';
-import { type Entry, asNumber, entryList, extractData, extractError, hasBody } from './daemon';
+import {
+  type Entry,
+  asNumber,
+  dirtyEntryCount,
+  entryList,
+  extractData,
+  extractError,
+  hasBody,
+} from './daemon';
 
 // Derived counts/status surfaced in the sidebar + sync pill. Reads are
 // defensive: the daemon's draft envelopes may omit any field, so every accessor
@@ -25,7 +33,7 @@ export function deriveCounts(snap: DaemonSnapshot): DaemonCounts {
 
   // Dirty total comes from cache.status if present, else counts dirty entries
   // in cache.list. Prefer the explicit daemon count to avoid undercounting.
-  const statusDirty = asNumber(cacheStatusData?.dirty_count);
+  const statusDirty = dirtyEntryCount(cacheStatusData);
   const listDirty = entryList(cacheListData, ['entries', 'items']).filter(
     (e) => e.dirty === true,
   ).length;

@@ -16,8 +16,10 @@ type VersionInfo = {
   node: string;
 };
 
-type CachePathParams = { path: string };
+type CacheTargetParams = { path?: string; node_id?: string };
 type TransferIdParams = { transfer_id?: string };
+type LockIdParams = { lock_id: string };
+type LockExtendParams = { lock_id: string; extend_seconds: number };
 type ConfigSetParams = { key: string; value: string };
 
 async function daemonStatus(): Promise<DaemonStatusResult> {
@@ -40,11 +42,11 @@ async function cacheList(): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('cache:list')) as DaemonStatusResult;
 }
 
-async function cachePin(params: CachePathParams): Promise<DaemonStatusResult> {
+async function cachePin(params: CacheTargetParams): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('cache:pin', params)) as DaemonStatusResult;
 }
 
-async function cacheDehydrate(params: CachePathParams): Promise<DaemonStatusResult> {
+async function cacheDehydrate(params: CacheTargetParams): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('cache:dehydrate', params)) as DaemonStatusResult;
 }
 
@@ -72,6 +74,14 @@ async function lockList(): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('lock:list')) as DaemonStatusResult;
 }
 
+async function lockRelease(params: LockIdParams): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('lock:release', params)) as DaemonStatusResult;
+}
+
+async function lockExtend(params: LockExtendParams): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('lock:extend', params)) as DaemonStatusResult;
+}
+
 async function configSet(params: ConfigSetParams): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('config:set', params)) as DaemonStatusResult;
 }
@@ -81,8 +91,8 @@ async function versions(): Promise<VersionInfo> {
 }
 
 // Generic read-only RPC for methods outside the always-polled global snapshot
-// (workset.list, mount.status, audit.events, …). Same envelope shape as the
-// dedicated helpers; the renderer parses it defensively.
+// (workset.list, mount.status, audit.events, …). The main process enforces an
+// allowlist; mutating actions use dedicated helpers above.
 async function rpc(
   method: string,
   params: Record<string, unknown> = {},
@@ -164,6 +174,8 @@ contextBridge.exposeInMainWorld('biohazardfs', {
   conflictList,
   conflictPreserveAll,
   lockList,
+  lockRelease,
+  lockExtend,
   configSet,
   versions,
   rpc,

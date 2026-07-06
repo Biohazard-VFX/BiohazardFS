@@ -8,6 +8,8 @@ import {
   type Entry,
   asNumber,
   asString,
+  cacheEntryTarget,
+  dirtyEntryCount,
   entryList,
   extractData,
   extractError,
@@ -49,7 +51,7 @@ export function CacheView({ snapshot, loaded }: Props) {
   const usedBytes = asNumber(status?.used_bytes ?? status?.bytes_used);
   const pinnedBytes = asNumber(status?.pinned_bytes);
   const dirtyBytes = asNumber(status?.dirty_bytes);
-  const dirtyCount = asNumber(status?.dirty_count);
+  const dirtyCount = dirtyEntryCount(status);
   const quotaBytes = asNumber(status?.quota_bytes ?? status?.total_bytes);
   const freeBytes = asNumber(
     status?.free_bytes ?? status?.disk_free_bytes ?? status?.available_bytes,
@@ -88,19 +90,39 @@ export function CacheView({ snapshot, loaded }: Props) {
     setFeedback(null);
     setClearing(true);
     let failures = 0;
+    let attempted = 0;
+    let skipped = 0;
     for (const entry of entries) {
-      const path = asString(entry.path);
-      if (!path || isDirtyEntry(entry)) continue;
-      const result = await dehydrateEntry(path);
+      if (isDirtyEntry(entry)) continue;
+      const target = cacheEntryTarget(entry);
+      if (!target) {
+        skipped += 1;
+        continue;
+      }
+      attempted += 1;
+      const result = await dehydrateEntry(target);
       if (extractError(result)) failures += 1;
     }
     setClearing(false);
+    if (attempted === 0 && entries.length > 0) {
+      setFeedback({
+        ok: false,
+        text:
+          skipped > 0
+            ? 'No cache entries had a path or node ID to clear.'
+            : 'No synced cache entries were eligible to clear.',
+      });
+      return;
+    }
     setFeedback(
       failures === 0
-        ? { ok: true, text: 'Local cache cleared.' }
+        ? {
+            ok: true,
+            text: `Local cache cleared (${String(attempted)} entr${attempted === 1 ? 'y' : 'ies'}).`,
+          }
         : {
             ok: false,
-            text: `${String(failures)} entr${failures === 1 ? 'y' : 'ies'} could not be cleared.`,
+            text: `${String(failures)} of ${String(attempted)} entr${attempted === 1 ? 'y' : 'ies'} could not be cleared.`,
           },
     );
   }
@@ -251,8 +273,7 @@ function groupByDirectory(entries: Entry[]): DirRow[] {
   const map = new Map<string, DirRow>();
   for (const entry of entries) {
     const rawPath = asString(entry.path);
-    if (!rawPath) continue;
-    const dir = parentDir(rawPath);
+    const dir = rawPath ? parentDir(rawPath) : 'Cache entries (node only)';
     const row = map.get(dir) ?? { dir, bytes: 0, dirty: 0 };
     const size = asNumber(entry.size_bytes);
     if (size !== null) row.bytes += size;

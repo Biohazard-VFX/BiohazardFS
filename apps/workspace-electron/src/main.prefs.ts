@@ -14,9 +14,8 @@ export type Prefs = {
   windowChrome: WindowChrome;
   zoomFactor: number;
   theme: Theme;
-  // Local cache size cap in GB, or null for no limit. Lives here (not daemon
-  // config) because config.set is stubbed and a cache cap is presentation/
-  // policy the desktop app enforces client-side for now.
+  // Local cache size preference in GB, or null for no limit. This is saved for
+  // future daemon quota support; the desktop app does not enforce it yet.
   cacheLimitGB: number | null;
 };
 

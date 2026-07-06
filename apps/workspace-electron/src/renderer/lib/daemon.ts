@@ -105,6 +105,41 @@ export function isPinnedEntry(entry: Entry): boolean {
   return state === 'pinned' || state === 'cached_pinned';
 }
 
+export function dirtyEntryCount(data: DataRecord | null): number | null {
+  return asNumber(data?.dirty_entries ?? data?.dirty_count);
+}
+
+export type CacheTargetParams = { path?: string; node_id?: string };
+
+export function cacheEntryTarget(entry: Entry): CacheTargetParams | null {
+  const path = asString(entry.path);
+  if (path) return { path };
+  const nodeId = asString(entry.node_id);
+  if (nodeId) return { node_id: nodeId };
+  return null;
+}
+
+export function cacheEntryLabel(entry: Entry): string {
+  return asString(entry.path) || asString(entry.node_id) || 'unknown cache entry';
+}
+
+export function mountAttached(data: DataRecord | null): boolean {
+  if (data?.attached === true) return true;
+  if (data?.attached === false) return false;
+  if (data?.mounted === true) return true;
+  if (data?.mounted === false) return false;
+  const legacyMounted = asString(data?.mounted);
+  return legacyMounted === 'true';
+}
+
+export function mountPathFromList(data: DataRecord | null): string {
+  const mounts = entryList(data, ['mounts']);
+  const attached = mounts.find((mount) => mount.attached === true);
+  const selected = attached ?? (mounts.length > 0 ? mounts[0] : null);
+  if (!selected) return '';
+  return asString(selected.mount_path ?? selected.path ?? selected.mount_point);
+}
+
 // When the daemon is unreachable, keep the last good card data visible so the
 // artist is not staring at empty panels during a transient dropout. A missing
 // `body` means transport-level failure; otherwise trust the new envelope, even
