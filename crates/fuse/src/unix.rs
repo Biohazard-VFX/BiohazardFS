@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use biohazardfs_api_types::{ApiError, DaemonRequest, Source};
 use biohazardfs_core::cache::{CacheState, transition as cache_transition};
@@ -567,14 +567,21 @@ fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Children of a directory indexed by name and by daemon `node_id`. `fetched`
-/// is set once a `file.list` has populated the cache so subsequent lookups skip
-/// the RPC.
+/// is set once a `file.list` has populated the cache; `fetched_at` lets the
+/// TTL gate re-fetch when the cache is stale so daemon-side mutations (sync
+/// pull/push, other clients) become visible in the mount without a remount.
 #[derive(Debug, Default, Clone)]
 struct ChildrenCache {
     by_name: BTreeMap<OsString, u64>,
     by_node: HashMap<String, u64>,
     fetched: bool,
+    fetched_at: Option<Instant>,
 }
+
+/// How long a directory's children cache is trusted before the next readdir
+/// re-fetches daemon truth. Short enough that sync results and collaborator
+/// changes appear quickly, long enough to avoid an RPC on every keystroke.
+const CHILDREN_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// One open file handle. `writable` is sticky for the handle's lifetime (set
 /// at create / open based on access mode); `write_buffer` is `Some` while
@@ -809,11 +816,12 @@ impl WorkspaceFs {
             if parent.kind != FileType::Directory {
                 return Err(RpcError::Protocol("inode is not a directory"));
             }
-            if state
-                .children
-                .get(&parent_inode)
-                .is_some_and(|cache| cache.fetched)
-            {
+            if state.children.get(&parent_inode).is_some_and(|cache| {
+                cache.fetched
+                    && cache
+                        .fetched_at
+                        .is_some_and(|t| t.elapsed() < CHILDREN_CACHE_TTL)
+            }) {
                 return Ok(());
             }
             parent
@@ -903,6 +911,7 @@ impl WorkspaceFs {
             refreshed.by_node.insert(node_id, inode);
         }
         refreshed.fetched = true;
+        refreshed.fetched_at = Some(Instant::now());
         state.next_inode = next_inode;
         state.children.insert(parent_inode, refreshed);
         Ok(())
@@ -3011,6 +3020,39 @@ mod tests {
             .collect();
         assert!(names.iter().any(|name| name == "shots"));
         assert!(names.iter().any(|name| name == "README.md"));
+    }
+
+    /// A fetched children cache is trusted for CHILDREN_CACHE_TTL, then becomes
+    /// stale so the next readdir re-fetches daemon truth (sync pull/push,
+    /// collaborator changes). Verify the cache records a `fetched_at` timestamp
+    /// and that it is honored while fresh.
+    #[test]
+    fn workspace_children_cache_records_fetched_at_and_is_fresh() {
+        let (addr, _backend, _handle) = start_test_daemon("ws_ttl");
+        let cache = workspace_test_dir("ttl-cache");
+        let mount = workspace_test_dir("ttl-mount");
+        let fs = WorkspaceFs::connect(&WorkspaceMountConfig {
+            daemon_endpoint: addr,
+            local_token: "ws_ttl".to_string(),
+            cache_dir: cache,
+            mountpoint: mount,
+            foreground: false,
+        })
+        .expect("connect");
+
+        fs.ensure_children_fetched(ROOT_INODE)
+            .expect("first fetch populates cache");
+        let fetched_at = {
+            let state = fs.lock_state();
+            let cache = state
+                .children
+                .get(&ROOT_INODE)
+                .expect("root children cache populated");
+            assert!(cache.fetched);
+            cache.fetched_at.expect("fetched_at timestamp recorded")
+        };
+        // While within the TTL window the cache is trusted (no re-fetch).
+        assert!(fetched_at.elapsed() < CHILDREN_CACHE_TTL);
     }
 
     /// Simulate `create()` + `flush()` end-to-end without a real FUSE mount:
