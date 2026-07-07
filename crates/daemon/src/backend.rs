@@ -21,9 +21,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use biohazardfs_api_types::{
     ApiError, EventEnvelope, MutationClassification, OperationToken, Source, timestamp,
@@ -131,6 +133,10 @@ pub struct InMemoryBackend {
     /// Offline/client operation log. `file.write` appends an Applied record so
     /// the audit/operation trail is real, not fabricated.
     pub operations: Vec<Operation>,
+    /// Last server version known to be cleanly reflected in a local node.
+    /// Used by the scaffold sync pull path to distinguish clean remote
+    /// advancement from unpushed local divergence.
+    pub server_versions: HashMap<String, String>,
 }
 
 /// Thread-safe wrapper over `InMemoryBackend`. Cloning shares the state.
@@ -154,6 +160,8 @@ struct PersistentBackendState {
     file_contents: HashMap<String, Vec<u8>>,
     file_versions: HashMap<String, FileVersion>,
     operations: Vec<Operation>,
+    #[serde(default)]
+    server_versions: HashMap<String, String>,
 }
 
 impl PersistentBackendState {
@@ -170,6 +178,7 @@ impl PersistentBackendState {
             file_contents: inner.file_contents.clone(),
             file_versions: inner.file_versions.clone(),
             operations: inner.operations.clone(),
+            server_versions: inner.server_versions.clone(),
         }
     }
 
@@ -190,6 +199,7 @@ impl PersistentBackendState {
         inner.file_contents = self.file_contents;
         inner.file_versions = self.file_versions;
         inner.operations = self.operations;
+        inner.server_versions = self.server_versions;
         Ok(())
     }
 }
@@ -384,6 +394,7 @@ impl DaemonBackend {
             file_contents: HashMap::new(),
             file_versions: HashMap::new(),
             operations: Vec::new(),
+            server_versions: HashMap::new(),
         };
 
         Self::from_inner(inner, None)
@@ -2181,6 +2192,658 @@ pub fn transfer_list_payload(backend: &DaemonBackend) -> Result<Value, ApiError>
         .map(|transfer| serde_json::to_value(transfer).expect("transfer serializes"))
         .collect();
     Ok(serde_json::json!({"transfers": transfers}))
+}
+
+pub fn sync_status_payload() -> Result<Value, ApiError> {
+    Ok(serde_json::json!({
+        "server_configured": server_config().is_ok(),
+        "server_url_env": "BIOHAZARDFS_SERVER_URL",
+        "server_token_env": "BIOHAZARDFS_SERVER_TOKEN",
+        "mode": "server_http_v1_scaffold",
+    }))
+}
+
+pub fn sync_push_payload(backend: &DaemonBackend) -> Result<Value, ApiError> {
+    let config = server_config()?;
+    let mut pushed_files = 0_u64;
+    let mut pushed_directories = 0_u64;
+    let mut skipped_files = 0_u64;
+    push_children_recursive(
+        backend,
+        &config,
+        "node_root",
+        None,
+        &mut pushed_directories,
+        &mut pushed_files,
+        &mut skipped_files,
+    )?;
+    Ok(serde_json::json!({
+        "direction": "push",
+        "directories": pushed_directories,
+        "files": pushed_files,
+        "skipped_files": skipped_files,
+    }))
+}
+
+pub fn sync_pull_payload(backend: &DaemonBackend) -> Result<Value, ApiError> {
+    let config = server_config()?;
+    let mut pulled_directories = 0_u64;
+    let mut pulled_files = 0_u64;
+    let mut skipped_conflicts = 0_u64;
+    pull_children_recursive(
+        backend,
+        &config,
+        None,
+        "node_root".to_string(),
+        &mut pulled_directories,
+        &mut pulled_files,
+        &mut skipped_conflicts,
+    )?;
+    Ok(serde_json::json!({
+        "direction": "pull",
+        "directories": pulled_directories,
+        "files": pulled_files,
+        "skipped_conflicts": skipped_conflicts,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct ServerSyncConfig {
+    host: String,
+    port: u16,
+    base_path: String,
+    token: String,
+}
+
+fn server_config() -> Result<ServerSyncConfig, ApiError> {
+    let base_url = std::env::var("BIOHAZARDFS_SERVER_URL").map_err(|_| {
+        ApiError::new(
+            "server_not_configured",
+            "set BIOHAZARDFS_SERVER_URL and BIOHAZARDFS_SERVER_TOKEN to enable server sync",
+        )
+    })?;
+    let token = std::env::var("BIOHAZARDFS_SERVER_TOKEN").map_err(|_| {
+        ApiError::new(
+            "server_not_configured",
+            "set BIOHAZARDFS_SERVER_TOKEN to enable server sync",
+        )
+    })?;
+    if token.trim().is_empty() {
+        return Err(ApiError::new(
+            "server_not_configured",
+            "BIOHAZARDFS_SERVER_TOKEN must not be empty",
+        ));
+    }
+    let without_scheme = base_url.trim().strip_prefix("http://").ok_or_else(|| {
+        ApiError::new(
+            "server_url_unsupported",
+            "server sync currently supports http:// URLs only",
+        )
+    })?;
+    let (authority, path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| ApiError::new("server_url_invalid", "server URL port is not valid"))?;
+            (host.to_string(), port)
+        }
+        None => (authority.to_string(), 80),
+    };
+    if host.is_empty() || host.contains('/') || host.contains('@') {
+        return Err(ApiError::new(
+            "server_url_invalid",
+            "server URL host is not valid",
+        ));
+    }
+    let plaintext_allowed = std::env::var("BIOHAZARDFS_ALLOW_PLAINTEXT_SERVER")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !plaintext_allowed && !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return Err(ApiError::new(
+            "server_url_insecure",
+            "http:// server sync is allowed only for loopback unless BIOHAZARDFS_ALLOW_PLAINTEXT_SERVER=1 is set",
+        ));
+    }
+    let base_path = if path.trim().is_empty() {
+        String::new()
+    } else {
+        format!("/{}", path.trim_matches('/'))
+    };
+    Ok(ServerSyncConfig {
+        host,
+        port,
+        base_path,
+        token,
+    })
+}
+
+fn server_request(
+    config: &ServerSyncConfig,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> Result<Value, ApiError> {
+    let path = format!("{}{}", config.base_path, path_and_query);
+    let address = (config.host.as_str(), config.port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            ApiError::new(
+                "server_url_invalid",
+                format!("could not resolve server host: {error}"),
+            )
+        })?
+        .next()
+        .ok_or_else(|| ApiError::new("server_url_invalid", "server host did not resolve"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).map_err(|error| {
+            ApiError::new(
+                "server_unreachable",
+                format!("could not connect to server: {error}"),
+            )
+        })?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        config.host,
+        config.token,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        ApiError::new(
+            "server_write_failed",
+            format!("could not write server request: {error}"),
+        )
+    })?;
+    stream.write_all(body).map_err(|error| {
+        ApiError::new(
+            "server_write_failed",
+            format!("could not write server request body: {error}"),
+        )
+    })?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|error| {
+        ApiError::new(
+            "server_read_failed",
+            format!("could not read server response: {error}"),
+        )
+    })?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or_else(|| {
+        ApiError::new(
+            "server_protocol_error",
+            "server response was not valid HTTP",
+        )
+    })?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    let envelope: Value = serde_json::from_str(body).map_err(|error| {
+        ApiError::new(
+            "server_protocol_error",
+            format!("server response was not JSON: {error}"),
+        )
+    })?;
+    if !(200..300).contains(&status) || envelope.get("ok") != Some(&Value::Bool(true)) {
+        let error = envelope.get("error").cloned().unwrap_or(Value::Null);
+        return Err(ApiError::with_details(
+            "server_request_failed",
+            format!("server returned HTTP {status}"),
+            error,
+        ));
+    }
+    envelope
+        .get("data")
+        .cloned()
+        .ok_or_else(|| ApiError::new("server_protocol_error", "server response omitted data"))
+}
+
+fn url_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn push_children_recursive(
+    backend: &DaemonBackend,
+    config: &ServerSyncConfig,
+    local_parent_id: &str,
+    remote_parent_id: Option<String>,
+    pushed_directories: &mut u64,
+    pushed_files: &mut u64,
+    skipped_files: &mut u64,
+) -> Result<(), ApiError> {
+    let children: Vec<Node> = {
+        let inner = backend.lock();
+        inner
+            .nodes
+            .values()
+            .filter(|node| {
+                node.is_live() && node.parent_node_id.as_deref() == Some(local_parent_id)
+            })
+            .cloned()
+            .collect()
+    };
+    for child in children {
+        match child.kind {
+            NodeKind::Directory => {
+                let data = server_request(
+                    config,
+                    "POST",
+                    "/api/v1/nodes/mkdir",
+                    serde_json::json!({"parent_node_id": remote_parent_id, "name": child.name})
+                        .to_string()
+                        .as_bytes(),
+                )?;
+                let remote_id = data
+                    .get("node_id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        ApiError::new("server_protocol_error", "mkdir response omitted node_id")
+                    })?
+                    .to_string();
+                *pushed_directories += 1;
+                push_children_recursive(
+                    backend,
+                    config,
+                    &child.node_id,
+                    Some(remote_id),
+                    pushed_directories,
+                    pushed_files,
+                    skipped_files,
+                )?;
+            }
+            NodeKind::File => {
+                let content = {
+                    let inner = backend.lock();
+                    inner.file_contents.get(&child.node_id).cloned()
+                };
+                let Some(content) = content else {
+                    *skipped_files += 1;
+                    continue;
+                };
+                let (current_version, synced_version) = {
+                    let inner = backend.lock();
+                    (
+                        inner
+                            .nodes
+                            .get(&child.node_id)
+                            .and_then(|node| node.current_version_id.clone()),
+                        inner.server_versions.get(&child.node_id).cloned(),
+                    )
+                };
+                if current_version.is_some() && current_version == synced_version {
+                    *skipped_files += 1;
+                    continue;
+                }
+                if synced_version.is_none()
+                    && remote_child_exists(config, remote_parent_id.as_deref(), &child.name)?
+                {
+                    *skipped_files += 1;
+                    continue;
+                }
+                let mut path = match &remote_parent_id {
+                    Some(parent) => format!(
+                        "/api/v1/files/content?parent_node_id={}&name={}&source=api",
+                        url_component(parent),
+                        url_component(&child.name)
+                    ),
+                    None => format!(
+                        "/api/v1/files/content?name={}&source=api",
+                        url_component(&child.name)
+                    ),
+                };
+                if let Some(base) = synced_version.as_deref() {
+                    path.push_str("&base_version_id=");
+                    path.push_str(&url_component(base));
+                }
+                let data = server_request(config, "PUT", &path, &content)?;
+                if let Some(version_id) = data.get("version_id").and_then(|value| value.as_str()) {
+                    let _guard = backend.persistence_guard();
+                    let mut inner = backend.lock();
+                    let rollback = inner.clone();
+                    if let Some(node) = inner.nodes.get_mut(&child.node_id) {
+                        node.current_version_id = Some(version_id.to_string());
+                    }
+                    inner
+                        .server_versions
+                        .insert(child.node_id.clone(), version_id.to_string());
+                    if let Some(entry) = inner.cache_entries.get_mut(&child.node_id) {
+                        entry.version_id = Some(version_id.to_string());
+                        entry.dirty = false;
+                        entry.state = CacheState::Ready;
+                    }
+                    drop(inner);
+                    backend.persist_or_restore(rollback)?;
+                }
+                *pushed_files += 1;
+            }
+            NodeKind::Symlink => *skipped_files += 1,
+        }
+    }
+    Ok(())
+}
+
+fn remote_child_exists(
+    config: &ServerSyncConfig,
+    remote_parent_id: Option<&str>,
+    name: &str,
+) -> Result<bool, ApiError> {
+    let path = match remote_parent_id {
+        Some(parent) => format!(
+            "/api/v1/namespace/children?parent_node_id={}&limit=500",
+            url_component(parent)
+        ),
+        None => "/api/v1/namespace/children?limit=500".to_string(),
+    };
+    let data = server_request(config, "GET", &path, &[])?;
+    let nodes = data
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            ApiError::new("server_protocol_error", "namespace response omitted nodes")
+        })?;
+    if nodes.len() >= 500 {
+        return Err(ApiError::new(
+            "sync_page_limit_exceeded",
+            "server sync refuses partial namespace results until pagination is implemented",
+        ));
+    }
+    let key = case_insensitive_sibling_key(name);
+    Ok(nodes.iter().any(|node| {
+        node.get("name")
+            .and_then(|value| value.as_str())
+            .is_some_and(|candidate| case_insensitive_sibling_key(candidate) == key)
+    }))
+}
+
+fn pull_children_recursive(
+    backend: &DaemonBackend,
+    config: &ServerSyncConfig,
+    remote_parent_id: Option<String>,
+    local_parent_id: String,
+    pulled_directories: &mut u64,
+    pulled_files: &mut u64,
+    skipped_conflicts: &mut u64,
+) -> Result<(), ApiError> {
+    let path = match &remote_parent_id {
+        Some(parent) => format!(
+            "/api/v1/namespace/children?parent_node_id={}&limit=500",
+            url_component(parent)
+        ),
+        None => "/api/v1/namespace/children?limit=500".to_string(),
+    };
+    let data = server_request(config, "GET", &path, &[])?;
+    let nodes = data
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ApiError::new("server_protocol_error", "namespace response omitted nodes"))?
+        .clone();
+    if nodes.len() >= 500 {
+        return Err(ApiError::new(
+            "sync_page_limit_exceeded",
+            "server sync refuses partial namespace results until pagination is implemented",
+        ));
+    }
+    for node in nodes {
+        let remote_id = node
+            .get("node_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                ApiError::new("server_protocol_error", "namespace node omitted node_id")
+            })?
+            .to_string();
+        let name = node
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ApiError::new("server_protocol_error", "namespace node omitted name"))?
+            .to_string();
+        let kind = node
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("file");
+        if kind == "directory" {
+            let local_id = ensure_local_directory(backend, &local_parent_id, &remote_id, &name)?;
+            *pulled_directories += 1;
+            pull_children_recursive(
+                backend,
+                config,
+                Some(remote_id),
+                local_id,
+                pulled_directories,
+                pulled_files,
+                skipped_conflicts,
+            )?;
+        } else if kind == "file" {
+            let content = server_request(
+                config,
+                "GET",
+                &format!(
+                    "/api/v1/files/content?node_id={}",
+                    url_component(&remote_id)
+                ),
+                &[],
+            )?;
+            if upsert_local_file_from_server(
+                backend,
+                &local_parent_id,
+                &remote_id,
+                &name,
+                &content,
+            )? {
+                *pulled_files += 1;
+            } else {
+                *skipped_conflicts += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_local_directory(
+    backend: &DaemonBackend,
+    local_parent_id: &str,
+    remote_id: &str,
+    name: &str,
+) -> Result<String, ApiError> {
+    let _guard = backend.persistence_guard();
+    let mut inner = backend.lock();
+    let rollback = inner.clone();
+    if let Some(existing) = inner.nodes.values().find(|node| {
+        node.is_live()
+            && node.parent_node_id.as_deref() == Some(local_parent_id)
+            && case_insensitive_sibling_key(&node.name) == case_insensitive_sibling_key(name)
+    }) {
+        if existing.kind != NodeKind::Directory {
+            return Err(ApiError::new(
+                "sync_kind_conflict",
+                "remote directory conflicts with local file",
+            ));
+        }
+        return Ok(existing.node_id.clone());
+    }
+    let now = timestamp();
+    let org_id = inner.org_id.clone();
+    inner.nodes.insert(
+        remote_id.to_string(),
+        Node {
+            org_id,
+            node_id: remote_id.to_string(),
+            project_id: None,
+            parent_node_id: Some(local_parent_id.to_string()),
+            name: name.to_string(),
+            kind: NodeKind::Directory,
+            current_version_id: None,
+            target: None,
+            mode: Some("0o755".to_string()),
+            owner_user_id: None,
+            created_at: now.clone(),
+            created_by: None,
+            updated_at: now,
+            updated_by: None,
+            deleted_at: None,
+            deleted_by: None,
+            trash_id: None,
+            path_cache: None,
+        },
+    );
+    drop(inner);
+    backend.persist_or_restore(rollback)?;
+    Ok(remote_id.to_string())
+}
+
+fn upsert_local_file_from_server(
+    backend: &DaemonBackend,
+    local_parent_id: &str,
+    remote_id: &str,
+    name: &str,
+    content: &Value,
+) -> Result<bool, ApiError> {
+    let content_hex = content
+        .get("content_hex")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            ApiError::new("server_protocol_error", "file response omitted content_hex")
+        })?;
+    let bytes = decode_hex(content_hex)
+        .map_err(|message| ApiError::new("server_protocol_error", message))?;
+    let version_id = content
+        .get("version_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("ver_server")
+        .to_string();
+    let content_hash = content
+        .get("content_hash")
+        .and_then(|value| value.as_str())
+        .unwrap_or("sha256:unknown")
+        .to_string();
+    let _guard = backend.persistence_guard();
+    let mut inner = backend.lock();
+    let rollback = inner.clone();
+    let existing_id = inner
+        .nodes
+        .values()
+        .find(|node| {
+            node.is_live()
+                && node.parent_node_id.as_deref() == Some(local_parent_id)
+                && case_insensitive_sibling_key(&node.name) == case_insensitive_sibling_key(name)
+        })
+        .map(|node| node.node_id.clone());
+    let node_id = if let Some(existing_id) = existing_id {
+        let existing = inner
+            .nodes
+            .get(&existing_id)
+            .expect("existing id came from map");
+        if existing.kind != NodeKind::File {
+            return Err(ApiError::new(
+                "sync_kind_conflict",
+                "remote file conflicts with local directory",
+            ));
+        }
+        if existing.current_version_id.as_deref() != Some(version_id.as_str())
+            && existing.current_version_id.is_some()
+            && match inner.server_versions.get(&existing_id) {
+                Some(synced) => existing.current_version_id.as_deref() != Some(synced.as_str()),
+                None => true,
+            }
+        {
+            return Ok(false);
+        }
+        existing_id
+    } else {
+        let now = timestamp();
+        let org_id = inner.org_id.clone();
+        inner.nodes.insert(
+            remote_id.to_string(),
+            Node {
+                org_id,
+                node_id: remote_id.to_string(),
+                project_id: None,
+                parent_node_id: Some(local_parent_id.to_string()),
+                name: name.to_string(),
+                kind: NodeKind::File,
+                current_version_id: None,
+                target: None,
+                mode: Some("0o644".to_string()),
+                owner_user_id: None,
+                created_at: now.clone(),
+                created_by: None,
+                updated_at: now,
+                updated_by: None,
+                deleted_at: None,
+                deleted_by: None,
+                trash_id: None,
+                path_cache: None,
+            },
+        );
+        remote_id.to_string()
+    };
+    if let Some(node) = inner.nodes.get_mut(&node_id) {
+        node.current_version_id = Some(version_id.clone());
+        node.updated_at = timestamp();
+    }
+    let version = FileVersion {
+        org_id: inner.org_id.clone(),
+        version_id: version_id.clone(),
+        node_id: node_id.clone(),
+        parent_version_id: None,
+        content_manifest_ref: ContentManifestRef {
+            object_id: content
+                .get("object_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("server-object")
+                .to_string(),
+            storage_key: content
+                .get("object_key")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            chunking: None,
+        },
+        content_hash: content_hash.clone(),
+        size_bytes: bytes.len() as u64,
+        logical_mtime: timestamp(),
+        created_at: timestamp(),
+        created_by: None,
+        created_device_id: None,
+        source: Source::Server,
+        operation_id: None,
+        audit_event_id: None,
+        metadata_json: None,
+    };
+    inner.file_versions.insert(version_id.clone(), version);
+    inner.file_contents.insert(node_id.clone(), bytes.clone());
+    inner
+        .server_versions
+        .insert(node_id.clone(), version_id.clone());
+    inner.cache_entries.insert(
+        node_id.clone(),
+        CacheEntry {
+            node_id,
+            version_id: Some(version_id),
+            state: CacheState::Ready,
+            content_hash: Some(content_hash),
+            size_bytes: bytes.len() as u64,
+            pinned: false,
+            dirty: false,
+            last_accessed_at: Some(timestamp()),
+        },
+    );
+    drop(inner);
+    backend.persist_or_restore(rollback)?;
+    Ok(true)
 }
 
 pub fn transfer_status_payload(backend: &DaemonBackend, params: &Value) -> Result<Value, ApiError> {

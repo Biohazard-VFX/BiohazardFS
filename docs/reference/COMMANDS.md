@@ -395,6 +395,7 @@ Rules:
 
 - The daemon reads `BIOHAZARDFS_WORKSPACE_ROOT` from its own environment; clients do not pass workspace roots through argv.
 - When `BIOHAZARDFS_STATE_PATH` is set, the dev-loopback daemon persists scaffold namespace/cache/content/audit state to that owner-only JSON file before acknowledging `file.write`, `file.mkdir`, or `file.rename`. The desktop app sets this path automatically under its per-user application data directory.
+- `sync.status`, `sync.push`, and `sync.pull` are daemon RPC methods for the first server sync scaffold. They read `BIOHAZARDFS_SERVER_URL` and `BIOHAZARDFS_SERVER_TOKEN` from the daemon environment. Non-loopback `http://` sync additionally requires `BIOHAZARDFS_ALLOW_PLAINTEXT_SERVER=1` until HTTPS support exists.
 - `workspace-list` accepts only relative paths that stay inside the configured workspace root.
 - These methods are local runtime inspection primitives for the daemon/Electron/CLI path, not server file APIs.
 

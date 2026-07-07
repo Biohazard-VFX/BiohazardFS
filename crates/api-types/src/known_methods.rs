@@ -203,6 +203,25 @@ pub const DAEMON_METHODS: &[MethodDescriptor] = &[
     MethodDescriptor::daemon("cache.move", "cache", M::DataMoving, "move cache location"),
     MethodDescriptor::daemon("cache.verify", "cache", M::Read, "verify cache integrity"),
     MethodDescriptor::daemon("cache.repair", "cache", M::DataMoving, "repair cache state"),
+    // sync
+    MethodDescriptor::daemon(
+        "sync.status",
+        "sync",
+        M::Read,
+        "server sync configuration status",
+    ),
+    MethodDescriptor::daemon(
+        "sync.push",
+        "sync",
+        M::DataMoving,
+        "push local namespace/content to server",
+    ),
+    MethodDescriptor::daemon(
+        "sync.pull",
+        "sync",
+        M::DataMoving,
+        "pull server namespace/content into local cache",
+    ),
     // transfer
     MethodDescriptor::daemon("transfer.list", "transfer", M::Read, "list transfers"),
     MethodDescriptor::daemon("transfer.status", "transfer", M::Read, "transfer status"),

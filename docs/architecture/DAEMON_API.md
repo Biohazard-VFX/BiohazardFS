@@ -282,6 +282,10 @@ Every other entry in the method-groups block above (`daemon.shutdown`, `daemon.r
 
 `workspace.status` reports whether `BIOHAZARDFS_WORKSPACE_ROOT` is configured, exists, and is writable; `workspace.list` lists up to 500 entries under a relative workspace path while rejecting absolute paths, parent traversal, and control characters. The workspace root is configured in the daemon process environment, not passed by clients through argv. These two remain the smokeable local runtime bridge for CLI/Electron visibility; they are not the final FUSE/placeholder sync engine, and the Electron scaffold still calls them through context-isolated preload IPC.
 
+### Server sync scaffold
+
+`sync.status`, `sync.push`, and `sync.pull` are the first daemon-to-server sync spine. They are configured with `BIOHAZARDFS_SERVER_URL` and `BIOHAZARDFS_SERVER_TOKEN`. The current client supports HTTP v1 endpoints only; plaintext non-loopback URLs require explicit `BIOHAZARDFS_ALLOW_PLAINTEXT_SERVER=1` until HTTPS support lands. `sync.push` walks the local daemon namespace, creates remote directories through `server.nodes.mkdir`, and uploads cached file contents through `server.files.content.put` with `base_version_id` when it has prior server ancestry. `sync.pull` walks remote namespace children, hydrates files through `server.files.content.get`, and refuses to overwrite locally divergent versions, reporting them as skipped conflicts. Pagination is not implemented yet; a full page is treated as an error rather than silently partial sync.
+
 ## Event stream
 
 The daemon exposes a one-way structured event stream first. Bidirectional streaming can be added later if needed.

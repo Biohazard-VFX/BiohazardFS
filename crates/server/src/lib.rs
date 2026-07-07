@@ -180,6 +180,7 @@ struct FileContentPutQuery {
     parent_node_id: Option<String>,
     name: String,
     source: String,
+    base_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,7 +555,7 @@ fn dispatch_http_request_with_config(
         }
         // Periphery: nodes.
         "/api/v1/nodes/stat" if method == "GET" => not_implemented_response("server.nodes.stat"),
-        "/api/v1/nodes/mkdir" if method == "POST" => not_implemented_response("server.nodes.mkdir"),
+        "/api/v1/nodes/mkdir" if method == "POST" => node_mkdir_response(headers, body, config),
         "/api/v1/nodes/symlink" if method == "POST" => {
             not_implemented_response("server.nodes.symlink")
         }
@@ -761,6 +762,27 @@ fn file_content_get_response(
             status_code,
             &ServerResponseEnvelope::<serde_json::Value>::error(
                 "server.files.content.get",
+                error,
+                Source::Server,
+            ),
+        ),
+    }
+}
+
+fn node_mkdir_response(
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> (u16, String) {
+    match node_mkdir_payload(headers, body, config) {
+        Ok(payload) => json_response(
+            200,
+            &ServerResponseEnvelope::ok("server.nodes.mkdir", payload, Source::Server),
+        ),
+        Err((status_code, error)) => json_response(
+            status_code,
+            &ServerResponseEnvelope::<serde_json::Value>::error(
+                "server.nodes.mkdir",
                 error,
                 Source::Server,
             ),
@@ -2551,6 +2573,171 @@ fn worksets_list_payload(
     })
 }
 
+fn node_mkdir_payload(
+    headers: &[(String, String)],
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> Result<serde_json::Value, (u16, ApiError)> {
+    #[derive(Deserialize)]
+    struct RequestBody {
+        parent_node_id: Option<String>,
+        name: String,
+    }
+
+    let request: RequestBody = serde_json::from_slice(body).map_err(|_| {
+        (
+            400,
+            ApiError::new("invalid_body", "node mkdir request body must be JSON"),
+        )
+    })?;
+    biohazardfs_core::path::validate_file_name(&request.name).map_err(|error| {
+        (
+            400,
+            ApiError::with_details(
+                "invalid_name",
+                error.to_string(),
+                serde_json::json!({"name": request.name}),
+            ),
+        )
+    })?;
+    let bearer = bearer_token(headers).ok_or_else(|| {
+        (
+            401,
+            ApiError::new("auth_required", "Authorization: Bearer token is required"),
+        )
+    })?;
+    let database_url = database_url_from_config(config).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is not configured for node requests"),
+        )
+    })?;
+    let mut client = connect_database(database_url).map_err(|error| {
+        (
+            503,
+            ApiError::new(error.code(), "database is unavailable for node requests"),
+        )
+    })?;
+    let subject = authenticate_subject(&mut client, bearer)?;
+    if !scopes_allow_node_write(&subject.scopes_json) {
+        return Err((
+            403,
+            ApiError::new("auth_scope_missing", "bearer token cannot mutate nodes"),
+        ));
+    }
+    let mut transaction = client.transaction().map_err(|_| {
+        (
+            503,
+            ApiError::new("node_store_unavailable", "could not start node mkdir"),
+        )
+    })?;
+    if let Some(parent_node_id) = request.parent_node_id.as_deref() {
+        let parent_rows = transaction
+            .query(
+                "SELECT kind FROM nodes WHERE org_id = $1 AND node_id = $2 AND deleted_at IS NULL",
+                &[&subject.org_id, &parent_node_id],
+            )
+            .map_err(|_| {
+                (
+                    503,
+                    ApiError::new("node_store_unavailable", "could not verify parent node"),
+                )
+            })?;
+        let Some(parent) = parent_rows.first() else {
+            return Err((
+                404,
+                ApiError::new("parent_not_found", "parent directory was not found"),
+            ));
+        };
+        let kind: String = parent.get("kind");
+        if kind != "directory" {
+            return Err((
+                409,
+                ApiError::new("parent_not_directory", "parent node is not a directory"),
+            ));
+        }
+    }
+    let existing_rows = transaction
+        .query(
+            "SELECT node_id, kind FROM nodes
+             WHERE org_id = $1
+               AND deleted_at IS NULL
+               AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
+               AND lower(name) = lower($3)
+             LIMIT 1",
+            &[
+                &subject.org_id,
+                &request.parent_node_id.as_deref(),
+                &request.name,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("node_store_unavailable", "could not inspect sibling nodes"),
+            )
+        })?;
+    if let Some(existing) = existing_rows.first() {
+        let kind: String = existing.get("kind");
+        if kind != "directory" {
+            return Err((
+                409,
+                ApiError::new("node_kind_conflict", "existing node is not a directory"),
+            ));
+        }
+        let node_id: String = existing.get("node_id");
+        transaction.commit().map_err(|_| {
+            (
+                503,
+                ApiError::new("node_store_unavailable", "could not commit mkdir replay"),
+            )
+        })?;
+        return Ok(serde_json::json!({
+            "created": false,
+            "node_id": node_id,
+            "parent_node_id": request.parent_node_id,
+            "name": request.name,
+            "kind": "directory",
+        }));
+    }
+    let node_id = stable_node_id(
+        &subject.org_id,
+        request.parent_node_id.as_deref(),
+        &request.name,
+    );
+    transaction
+        .execute(
+            "INSERT INTO nodes (org_id, node_id, parent_node_id, name, kind, owner_user_id, created_by, updated_by)
+             VALUES ($1, $2, $3, $4, 'directory', $5, $5, $5)",
+            &[
+                &subject.org_id,
+                &node_id,
+                &request.parent_node_id.as_deref(),
+                &request.name,
+                &subject.user_id,
+            ],
+        )
+        .map_err(|_| {
+            (
+                503,
+                ApiError::new("node_store_unavailable", "could not create directory node"),
+            )
+        })?;
+    transaction.commit().map_err(|_| {
+        (
+            503,
+            ApiError::new("node_store_unavailable", "could not commit node mkdir"),
+        )
+    })?;
+    Ok(serde_json::json!({
+        "created": true,
+        "node_id": node_id,
+        "parent_node_id": request.parent_node_id,
+        "name": request.name,
+        "kind": "directory",
+    }))
+}
+
 fn file_content_put_payload(
     query: &str,
     headers: &[(String, String)],
@@ -2715,7 +2902,7 @@ fn preflight_file_content_write(
 
     let existing_rows = client
         .query(
-            "SELECT kind FROM nodes
+            "SELECT kind, current_version_id FROM nodes
              WHERE org_id = $1
                AND deleted_at IS NULL
                AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
@@ -2741,6 +2928,27 @@ fn preflight_file_content_write(
                 ApiError::new("node_kind_conflict", "existing node is not a file"),
             ));
         }
+        if let Some(base_version_id) = query.base_version_id.as_deref() {
+            let current: Option<String> = existing.get("current_version_id");
+            if current.as_deref() != Some(base_version_id) {
+                return Err((
+                    409,
+                    ApiError::with_details(
+                        "version_conflict",
+                        "server file changed since the client's base version",
+                        serde_json::json!({"base_version_id": base_version_id, "current_version_id": current}),
+                    ),
+                ));
+            }
+        }
+    } else if query.base_version_id.is_some() {
+        return Err((
+            409,
+            ApiError::new(
+                "version_conflict",
+                "base_version_id was provided for a missing file",
+            ),
+        ));
     }
     Ok(())
 }
@@ -2790,12 +2998,13 @@ fn record_file_content(
 
     let existing_rows = transaction
         .query(
-            "SELECT node_id, kind FROM nodes
+            "SELECT node_id, kind, current_version_id FROM nodes
              WHERE org_id = $1
                AND deleted_at IS NULL
                AND (($2::text IS NULL AND parent_node_id IS NULL) OR parent_node_id = $2)
                AND lower(name) = lower($3)
-             LIMIT 1",
+             LIMIT 1
+             FOR UPDATE",
             &[
                 &subject.org_id,
                 &query.parent_node_id.as_deref(),
@@ -2816,8 +3025,30 @@ fn record_file_content(
                 ApiError::new("node_kind_conflict", "existing node is not a file"),
             ));
         }
+        if let Some(base_version_id) = query.base_version_id.as_deref() {
+            let current: Option<String> = existing.get("current_version_id");
+            if current.as_deref() != Some(base_version_id) {
+                return Err((
+                    409,
+                    ApiError::with_details(
+                        "version_conflict",
+                        "server file changed since the client's base version",
+                        serde_json::json!({"base_version_id": base_version_id, "current_version_id": current}),
+                    ),
+                ));
+            }
+        }
         existing.get("node_id")
     } else {
+        if query.base_version_id.is_some() {
+            return Err((
+                409,
+                ApiError::new(
+                    "version_conflict",
+                    "base_version_id was provided for a missing file",
+                ),
+            ));
+        }
         let node_id = stable_node_id(
             &subject.org_id,
             query.parent_node_id.as_deref(),
@@ -3268,6 +3499,7 @@ fn parse_file_content_put_query(query: &str) -> Result<FileContentPutQuery, (u16
     let mut parent_node_id = None;
     let mut name = None;
     let mut source = "cli".to_string();
+    let mut base_version_id = None;
 
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -3287,7 +3519,12 @@ fn parse_file_content_put_query(query: &str) -> Result<FileContentPutQuery, (u16
                 validate_file_source(&decoded)?;
                 source = decoded;
             }
-            "parent" | "parent_node_id" | "name" | "source" => {}
+            "base_version_id" if !value.trim().is_empty() => {
+                let decoded = percent_decode_query_value(value)?;
+                validate_opaque_id(&decoded, "invalid_version_id", "base_version_id")?;
+                base_version_id = Some(decoded);
+            }
+            "parent" | "parent_node_id" | "name" | "source" | "base_version_id" => {}
             _ => {}
         }
     }
@@ -3302,6 +3539,7 @@ fn parse_file_content_put_query(query: &str) -> Result<FileContentPutQuery, (u16
         parent_node_id,
         name,
         source,
+        base_version_id,
     })
 }
 
@@ -3571,6 +3809,19 @@ fn scopes_allow_file_read(scopes_json: &str) -> bool {
 
 fn scopes_allow_file_write(scopes_json: &str) -> bool {
     scopes_allow_any(scopes_json, &["file:write", "file:*", "server:write"])
+}
+
+fn scopes_allow_node_write(scopes_json: &str) -> bool {
+    scopes_allow_any(
+        scopes_json,
+        &[
+            "node:write",
+            "node:*",
+            "file:write",
+            "file:*",
+            "server:write",
+        ],
+    )
 }
 
 fn scopes_allow_lock_read(scopes_json: &str) -> bool {
@@ -4741,7 +4992,11 @@ fn handle_stream(mut stream: TcpStream, config: &RuntimeConfig) -> std::io::Resu
             route_path,
             "/api/v1/objects/content" | "/api/v1/files/content"
         ))
-        || (method == "POST" && matches!(route_path, "/api/v1/locks" | "/api/v1/operations"));
+        || (method == "POST"
+            && matches!(
+                route_path,
+                "/api/v1/locks" | "/api/v1/operations" | "/api/v1/nodes/mkdir"
+            ));
     let body_bytes = if should_read_body {
         reader
             .get_mut()
@@ -5457,7 +5712,6 @@ mod tests {
             ("POST", "/api/v1/invites", "server.invites.create"),
             ("DELETE", "/api/v1/invites", "server.invites.revoke"),
             ("GET", "/api/v1/nodes/stat", "server.nodes.stat"),
-            ("POST", "/api/v1/nodes/mkdir", "server.nodes.mkdir"),
             ("POST", "/api/v1/nodes/symlink", "server.nodes.symlink"),
             ("POST", "/api/v1/nodes/move", "server.nodes.move"),
             ("POST", "/api/v1/nodes/copy", "server.nodes.copy"),

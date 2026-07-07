@@ -313,6 +313,11 @@ fn dispatch_method(
         "cache.verify" => b::cache_verify_payload(backend),
         "cache.evict" | "cache.move" | "cache.repair" => Err(not_implemented(method)),
 
+        // ----- sync -----
+        "sync.status" => b::sync_status_payload(),
+        "sync.push" => b::sync_push_payload(backend),
+        "sync.pull" => b::sync_pull_payload(backend),
+
         // ----- transfer -----
         "transfer.list" => b::transfer_list_payload(backend),
         "transfer.status" => b::transfer_status_payload(backend, params),

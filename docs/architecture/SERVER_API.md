@@ -99,7 +99,8 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 | `GET /api/v1/namespace/children` | `server.namespace.children` | Authenticated live child-node listing for the caller's organization |
 | `PUT /api/v1/objects/content` | `server.objects.content.put` | Authenticated bounded content-object upload backed by RustFS |
 | `GET /api/v1/objects/content?sha256=<hash>` | `server.objects.content.get` | Authenticated content-object fetch by SHA-256 |
-| `PUT /api/v1/files/content?name=<name>[&parent_node_id=<id>]` | `server.files.content.put` | Authenticated current-version file upload: store content and record/update metadata |
+| `POST /api/v1/nodes/mkdir` | `server.nodes.mkdir` | Authenticated idempotent directory creation under the caller's organization |
+| `PUT /api/v1/files/content?name=<name>[&parent_node_id=<id>][&base_version_id=<id>]` | `server.files.content.put` | Authenticated current-version file upload: store content and record/update metadata |
 | `GET /api/v1/files/content?node_id=<id>` | `server.files.content.get` | Authenticated current-version file download by metadata node ID |
 
 `GET /api/v1/namespace/children` requires `Authorization: Bearer <token>`. The server stores and compares token hashes in the globally unique `tokens.secret_hash` column using the current `sha256:<hex>` MVP format. The token must be active, unexpired, unrevoked, attached to an active user and organization, and include one of `namespace:read`, `namespace:*`, `server:read`, or `*` in its JSON `scopes` array. The endpoint returns only live nodes in that authenticated org and accepts optional query params:
@@ -111,7 +112,9 @@ When running `biohazardfs-server serve`, the scaffold exposes:
 
 `GET /api/v1/objects/content?sha256=<hash>` requires one of `object:read`, `object:*`, `file:read`, `file:*`, `server:read`, or `*`. It fetches the deterministic object from RustFS, verifies the SHA-256 hash, and returns a JSON response with `content_hex`. This hex payload is intentionally inefficient but binary-safe for the first smokeable primitive; client/daemon file workflows should replace it with a streaming or presigned transfer contract later.
 
-`PUT /api/v1/files/content?name=<name>[&parent_node_id=<id>][&source=cli]` requires one of `file:write`, `file:*`, `server:write`, or `*`. The server stores the bounded content object in RustFS, then records a content manifest, creates or updates a live file node under the authenticated organization, creates a file version, and points the node at that current version. This first slice intentionally skips final operation/idempotency/conflict semantics.
+`POST /api/v1/nodes/mkdir` requires one of `node:write`, `node:*`, `file:write`, `file:*`, `server:write`, or `*`. The JSON body is `{ "parent_node_id": null | "node_...", "name": "folder" }`. The operation is idempotent for an existing directory with the same parent/name and rejects file/directory kind conflicts.
+
+`PUT /api/v1/files/content?name=<name>[&parent_node_id=<id>][&source=cli][&base_version_id=<id>]` requires one of `file:write`, `file:*`, `server:write`, or `*`. The server stores the bounded content object in RustFS, then records a content manifest, creates or updates a live file node under the authenticated organization, creates a file version, and points the node at that current version. When `base_version_id` is supplied for an existing file, the server rejects the write with `version_conflict` unless the current server version still matches that base. This first slice intentionally skips final operation/idempotency/conflict semantics.
 
 `GET /api/v1/files/content?node_id=<id>` requires one of `file:read`, `file:*`, `server:read`, or `*`. It resolves the node current version from Postgres, verifies that the stored object key matches the deterministic org-scoped content key, fetches the object from RustFS, verifies the hash, and returns metadata plus `content_hex`.
 
@@ -156,7 +159,7 @@ The following routes are typed, registered in `is_known_server_route`, and bound
 - `server.shares.list/create/revoke` — `GET`/`POST`/`DELETE /api/v1/shares`
 - `server.publishes.list/create/revoke` — `GET`/`POST`/`DELETE /api/v1/publishes`
 - `server.invites.list/create/revoke` — `GET`/`POST`/`DELETE /api/v1/invites`
-- `server.nodes.stat/mkdir/symlink/move/copy/delete` — `GET /api/v1/nodes/stat`, `POST /api/v1/nodes/{mkdir,symlink,move,copy}`, `DELETE /api/v1/nodes`
+- `server.nodes.stat/symlink/move/copy/delete` — `GET /api/v1/nodes/stat`, `POST /api/v1/nodes/{symlink,move,copy}`, `DELETE /api/v1/nodes` (`server.nodes.mkdir` is implemented as the first node mutation spine)
 - `server.auth.device.enroll`, `server.auth.login_token` — `POST /api/v1/auth/device/enroll`, `POST /api/v1/auth/login_token`
 - `server.operations.replay` — `POST /api/v1/operations/replay`
 - `server.trash.restore/purge` — `POST /api/v1/trash/restore`, `POST /api/v1/trash/purge`
