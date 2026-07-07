@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { type CSSProperties, useState } from 'react';
 import { CheckCircle2, Circle, LoaderCircle, TriangleAlert } from 'lucide-react';
 
 import { type DaemonSnapshot } from '@/lib/use-daemon';
@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { WindowControls } from '@/components/window-controls';
 
 // First-run onboarding (DASHBOARD_UX §3). A focused join flow:
 // Welcome → Workstation preflight → Mount → Load access → Success.
@@ -22,11 +23,13 @@ type Props = {
   snapshot: DaemonSnapshot;
   onClose: () => void;
   onOpenDrive: () => void;
+  frameless: boolean;
+  platform?: string;
 };
 
 const STEPS = ['Welcome', 'Workstation', 'Mount', 'Access', 'Ready'] as const;
 
-export function Onboarding({ snapshot, onClose, onOpenDrive }: Props) {
+export function Onboarding({ snapshot, onClose, onOpenDrive, frameless, platform }: Props) {
   const [step, setStep] = useState(0);
 
   const workspaceData = extractData(snapshot.workspace);
@@ -34,10 +37,23 @@ export function Onboarding({ snapshot, onClose, onOpenDrive }: Props) {
   const reachable = snapshot.daemon?.body !== undefined;
   const workspaceReady = workspaceData?.state === 'ready';
 
+  const dragStyle = frameless ? ({ WebkitAppRegion: 'drag' } as CSSProperties) : undefined;
+  const macFrameless = frameless && platform === 'darwin';
+
   return (
-    <div className="bg-background text-foreground flex h-screen w-screen">
+    <div className="bg-background text-foreground relative flex h-screen w-screen">
+      {macFrameless ? (
+        <div className="absolute top-3 left-3 z-50">
+          <WindowControls platform={platform} />
+        </div>
+      ) : null}
       {/* Stepper */}
-      <aside className="bg-sidebar text-sidebar-foreground hidden w-64 shrink-0 flex-col gap-1 border-r p-4 sm:flex">
+      <aside
+        className={cn(
+          'bg-sidebar text-sidebar-foreground hidden w-64 shrink-0 flex-col gap-1 border-r p-4 sm:flex',
+          macFrameless && 'pt-12',
+        )}
+      >
         <p className="text-muted-foreground mb-2 text-[0.62rem] font-semibold tracking-widest uppercase">
           Join a studio
         </p>
@@ -72,8 +88,18 @@ export function Onboarding({ snapshot, onClose, onOpenDrive }: Props) {
 
       {/* Content */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 shrink-0 items-center border-b px-4">
-          <span className="text-sm font-semibold tracking-tight">Biohazard Workspace</span>
+        <header
+          className={cn(
+            'flex h-12 shrink-0 items-center gap-3 border-b px-4',
+            macFrameless && 'pl-28',
+          )}
+          style={dragStyle}
+        >
+          <span className="text-sm font-semibold tracking-tight select-none">
+            Biohazard Workspace
+          </span>
+          <div className="flex-1" />
+          {frameless && !macFrameless ? <WindowControls platform={platform} /> : null}
         </header>
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto flex max-w-xl flex-col gap-4 p-6">

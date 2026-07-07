@@ -18,6 +18,7 @@ type Props = {
   studioLabel: string;
   workspaceReady: boolean;
   reachable: boolean;
+  macWindowControls?: boolean;
 };
 
 export function AppSidebar({
@@ -27,12 +28,15 @@ export function AppSidebar({
   studioLabel,
   workspaceReady,
   reachable,
+  macWindowControls = false,
 }: Props) {
   const [adminOpen, setAdminOpen] = useState(false);
   return (
     <aside className="bg-sidebar text-sidebar-foreground flex h-full w-60 shrink-0 flex-col border-r">
       {/* Selected-studio header. */}
-      <div className="flex h-14 items-center gap-2.5 px-4">
+      <div
+        className={cn('flex items-center gap-2.5 px-4', macWindowControls ? 'h-20 pt-6' : 'h-14')}
+      >
         <span className="flex min-w-0 flex-col leading-tight">
           <span className="truncate text-sm font-semibold tracking-tight">{studioLabel}</span>
           <span

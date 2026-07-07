@@ -148,8 +148,7 @@ export function clampReleaseChannel(value: unknown): ReleaseChannel {
 }
 
 // Resolve whether the window should be frameless for a given platform.
-// `auto` = frameless on Linux (Wayland/X clients that already provide their own
-// window management), native decorations on macOS/Windows.
+// `auto` = app-owned chrome on macOS/Linux, native decorations on Windows.
 export function resolveFrameless(prefs: Prefs, platform: NodeJS.Platform): boolean {
   switch (prefs.windowChrome) {
     case 'frameless':
@@ -158,6 +157,6 @@ export function resolveFrameless(prefs: Prefs, platform: NodeJS.Platform): boole
       return false;
     case 'auto':
     default:
-      return platform === 'linux';
+      return platform === 'darwin' || platform === 'linux';
   }
 }

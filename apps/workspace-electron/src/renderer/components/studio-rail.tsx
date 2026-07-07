@@ -23,13 +23,20 @@ import { cn } from '@/lib/utils';
 export function StudioRail({
   reachable,
   onShowOnboarding,
+  macWindowControls = false,
 }: {
   reachable: boolean;
   onShowOnboarding: () => void;
+  macWindowControls?: boolean;
 }) {
   const [addOpen, setAddOpen] = useState(false);
   return (
-    <aside className="bg-sidebar flex w-14 shrink-0 flex-col items-center gap-2 border-r py-3">
+    <aside
+      className={cn(
+        'bg-sidebar flex w-14 shrink-0 flex-col items-center gap-2 border-r pb-3',
+        macWindowControls ? 'pt-12' : 'pt-3',
+      )}
+    >
       {/* Active profile. Single profile = the local daemon studio. */}
       <Tooltip>
         <TooltipTrigger asChild>

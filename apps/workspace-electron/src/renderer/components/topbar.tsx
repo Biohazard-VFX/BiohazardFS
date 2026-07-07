@@ -2,6 +2,7 @@ import { RefreshCw, Search } from 'lucide-react';
 import type { CSSProperties } from 'react';
 
 import { VIEW_TITLES, type FilesViewMode, type ViewId } from '@/app/nav';
+import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { SyncStatus } from '@/components/sync-status';
@@ -18,6 +19,7 @@ type Props = {
   dirtyCount: number;
   reachable: boolean;
   frameless: boolean;
+  platform?: string;
   filesMode: FilesViewMode;
   onFilesModeChange: (mode: FilesViewMode) => void;
 };
@@ -35,14 +37,22 @@ export function Topbar({
   dirtyCount,
   reachable,
   frameless,
+  platform,
   filesMode,
   onFilesModeChange,
 }: Props) {
   const showSearch = view === 'drive' || view === 'cache' || view === 'conflicts';
   const dragStyle = frameless ? ({ WebkitAppRegion: 'drag' } as CSSProperties) : undefined;
   const noDragStyle = { WebkitAppRegion: 'no-drag' } as CSSProperties;
+  const macFrameless = frameless && platform === 'darwin';
   return (
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b pl-4 pr-2" style={dragStyle}>
+    <header
+      className={cn(
+        'flex h-14 shrink-0 items-center gap-3 border-b pl-4 pr-2',
+        macFrameless && 'pl-28',
+      )}
+      style={dragStyle}
+    >
       <h1 className="text-sm font-semibold tracking-tight select-none">{VIEW_TITLES[view]}</h1>
       <SyncStatus transferCount={transferCount} dirtyCount={dirtyCount} reachable={reachable} />
       <div className="flex-1" />
@@ -77,7 +87,7 @@ export function Topbar({
           <RefreshCw className={refreshing ? 'size-4 animate-spin' : 'size-4'} />
         </Button>
       </div>
-      {frameless ? <WindowControls /> : null}
+      {frameless && !macFrameless ? <WindowControls platform={platform} /> : null}
     </header>
   );
 }

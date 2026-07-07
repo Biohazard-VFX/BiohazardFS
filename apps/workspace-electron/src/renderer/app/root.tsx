@@ -5,6 +5,7 @@ import { AppSidebar } from '@/components/app-sidebar';
 import { StudioRail } from '@/components/studio-rail';
 import { Topbar } from '@/components/topbar';
 import { StatusBar } from '@/components/status-bar';
+import { WindowControls } from '@/components/window-controls';
 import { FilesView } from '@/components/views/files-view';
 import { ActivityView } from '@/components/views/activity-view';
 import { CacheView } from '@/components/views/cache-view';
@@ -22,6 +23,8 @@ import { type CacheTargetParams, type DaemonStatusResult, extractData } from '@/
 import { daemonReachable, deriveCounts } from '@/lib/derive';
 import { useDaemonState } from '@/lib/use-daemon';
 import { useAppInfo, useTheme } from '@/lib/use-prefs';
+
+const ONBOARDING_DISMISSED_STORAGE_KEY = 'biohazardfs.onboardingDismissed';
 
 // The shell. Holds view-state and the query string for the topbar filter, and
 // composes the sidebar, topbar, active view, and status bar. All daemon state
@@ -60,6 +63,25 @@ export function Root() {
   // opened manually from the studio rail for review (the seeded daemon always
   // has a workspace, so it won't auto-trigger in the preview).
   const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissedState] = useState(() => {
+    try {
+      return localStorage.getItem(ONBOARDING_DISMISSED_STORAGE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const setOnboardingDismissed = useCallback((dismissed: boolean) => {
+    setOnboardingDismissedState(dismissed);
+    try {
+      if (dismissed) {
+        localStorage.setItem(ONBOARDING_DISMISSED_STORAGE_KEY, 'true');
+      } else {
+        localStorage.removeItem(ONBOARDING_DISMISSED_STORAGE_KEY);
+      }
+    } catch {
+      // localStorage may be unavailable in constrained renderer contexts.
+    }
+  }, []);
   // Files layout preference (list vs tree). Persisted to localStorage so it
   // survives relaunches; it's a renderer-only view pref, not daemon state.
   const [filesMode, setFilesModeState] = useState<FilesViewMode>(() => {
@@ -138,26 +160,34 @@ export function Root() {
   }, [refresh]);
 
   const realFirstRun = loaded && daemonReachable(snapshot) && !workspaceReady;
-  if (realFirstRun || onboardingOpen) {
+  if ((realFirstRun && !onboardingDismissed) || onboardingOpen) {
     return (
       <Onboarding
         snapshot={snapshot}
         onClose={() => {
           setOnboardingOpen(false);
+          setOnboardingDismissed(true);
         }}
         onOpenDrive={() => {
           setOnboardingOpen(false);
+          setOnboardingDismissed(true);
           setView('drive');
         }}
+        frameless={appInfo?.frameless ?? false}
+        platform={appInfo?.platform}
       />
     );
   }
 
+  const macFrameless = (appInfo?.frameless ?? false) && appInfo?.platform === 'darwin';
+
   return (
     <ActionContext.Provider value={actions}>
-      <div className="text-foreground flex h-screen w-screen overflow-hidden bg-background">
+      <div className="text-foreground relative flex h-screen w-screen overflow-hidden bg-background">
+        {macFrameless ? <WindowChromeOverlay platform={appInfo?.platform} /> : null}
         <StudioRail
           reachable={daemonReachable(snapshot)}
+          macWindowControls={macFrameless}
           onShowOnboarding={() => {
             setOnboardingOpen(true);
           }}
@@ -169,6 +199,7 @@ export function Root() {
           studioLabel="Local workspace"
           workspaceReady={workspaceReady}
           reachable={daemonReachable(snapshot)}
+          macWindowControls={macFrameless}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -182,6 +213,7 @@ export function Root() {
             dirtyCount={counts.dirtyCount}
             reachable={reachable}
             frameless={appInfo?.frameless ?? false}
+            platform={appInfo?.platform}
             filesMode={filesMode}
             onFilesModeChange={setFilesMode}
           />
@@ -246,6 +278,14 @@ export function Root() {
 
 function normalizeCacheTarget(target: string | CacheTargetParams): CacheTargetParams {
   return typeof target === 'string' ? { path: target } : target;
+}
+
+function WindowChromeOverlay({ platform }: { platform?: string }) {
+  return (
+    <div className="absolute top-3 left-3 z-50">
+      <WindowControls platform={platform} />
+    </div>
+  );
 }
 
 function OfflineBanner() {

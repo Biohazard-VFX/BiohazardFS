@@ -69,6 +69,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Changed
 
+- Biohazard Workspace now uses app-owned frameless chrome by default on macOS, with traffic-light window controls drawn inside the UI.
 - CLI: the `object get` and `file get` local-file flag is renamed from `--output <path>` to `--out <path>`. `--output <json|ndjson|text>` is now the global output-format flag, matching `docs/reference/COMMANDS.md`.
 - Daemon `dispatch_rpc` is now stateful: `dispatch_rpc(backend: &DaemonBackend, request: &DaemonRequest)`. `DevLoopbackConfig` carries an `Arc<DaemonBackend>`; construct via `DevLoopbackConfig::new(addr, token)` or `DevLoopbackConfig::with_backend(addr, token, backend)`. `DaemonHttpClient` and `call::<T>` are unchanged.
 - `scripts/ci/server-db-smoke.sh` now asserts migration count 3 and validates all 23 metadata tables.
@@ -77,6 +78,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Fixed
 
+- Biohazard Workspace first-run onboarding can now be skipped or completed even while the local workspace is still unconfigured, and the Back button behavior is covered by a renderer test.
 - FUSE read-write partial-write corruption: non-truncating edits to existing files committed a sparse zero-padded buffer instead of overlaying the existing content (repro: `abcdef` + seek 3 + write `X` became `00 00 58`). The write buffer is now seeded from the hydrated cache file on first write, and flush/close are a no-op when no writes occurred.
 - FUSE dirty-data loss on release: after a failed daemon flush, `release` dropped the only in-memory copy of the dirty bytes. Unsynced bytes are now persisted to a durable on-disk dirty journal (`<cache_dir>/dirty/`) on flush failure and release, and cleared on successful commit.
 - Security: `biohazardfs-fuse mount-workspace --local-token` and `biohazardfs auth login --token` exposed secrets in argv (process listings / shell history). Both flags are removed; the local daemon token is read from `BIOHAZARDFS_LOCAL_TOKEN` and the login token from `BIOHAZARDFS_TOKEN` (env only).

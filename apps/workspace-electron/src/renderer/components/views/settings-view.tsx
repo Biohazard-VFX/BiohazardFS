@@ -366,9 +366,11 @@ function WindowSection() {
           <div className="flex gap-1">
             {(['auto', 'native', 'frameless'] as const).map((option) => {
               const active = (prefs?.windowChrome ?? 'auto') === option;
+              const autoMode =
+                platform === 'darwin' || platform === 'linux' ? 'app chrome' : 'native';
               const label =
                 option === 'auto'
-                  ? `Auto (${platform === 'linux' ? 'frameless' : 'native'})`
+                  ? `Auto (${autoMode})`
                   : option === 'native'
                     ? nativeLabel
                     : 'Frameless';
