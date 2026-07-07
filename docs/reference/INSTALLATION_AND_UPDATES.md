@@ -19,6 +19,7 @@ Implemented scaffold:
 
 Not implemented yet:
 
+- automatic macFUSE installation/approval orchestration for macOS workspace mounts
 - code signing
 - macOS notarization
 - Windows Authenticode signing
@@ -71,6 +72,8 @@ Required binaries:
 Optional when present:
 
 - `biohazardfs-fuse`
+
+macOS workspace mounts currently require macFUSE to be installed, approved in System Settings → Privacy & Security, and available to the kernel before `biohazardfs-fuse mount-workspace` can attach the Finder-visible mount.
 
 It also writes:
 

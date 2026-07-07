@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use biohazardfs_daemon::{DaemonClientError, DaemonHttpClient};
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use serde_json::Value;
 
@@ -389,12 +389,7 @@ pub fn mount_read_only_workspace(config: MountConfig) -> Result<()> {
     let index = WorkspaceIndex::build(&source)?;
     let filesystem = ReadOnlyWorkspaceFs::new(index);
     let mut options = Config::default();
-    options.mount_options = vec![
-        MountOption::RO,
-        MountOption::FSName("biohazardfs".to_string()),
-        MountOption::Subtype("biohazardfs".to_string()),
-        MountOption::DefaultPermissions,
-    ];
+    options.mount_options = biohazardfs_mount_options(true);
     if config.foreground {
         eprintln!(
             "biohazardfs-fuse mounting {} at {} (read-only)",
@@ -405,13 +400,42 @@ pub fn mount_read_only_workspace(config: MountConfig) -> Result<()> {
     fuser::mount2(filesystem, &mountpoint, &options).map_err(|error| {
         FuseError::io(
             FuseErrorKind::Io,
-            format!(
-                "could not mount BiohazardFS FUSE view at {}",
-                mountpoint.display()
-            ),
+            mount_error_message("could not mount BiohazardFS FUSE view", &mountpoint, &error),
             error,
         )
     })
+}
+
+fn biohazardfs_mount_options(read_only: bool) -> Vec<MountOption> {
+    let mut options = Vec::new();
+    if read_only {
+        options.push(MountOption::RO);
+    }
+    options.push(MountOption::FSName("Biohazard".to_string()));
+    options.push(MountOption::Subtype("biohazardfs".to_string()));
+    options.push(MountOption::DefaultPermissions);
+    #[cfg(target_os = "macos")]
+    {
+        // Make Finder present the mount like a normal local volume with the
+        // artist-facing studio name instead of the implementation binary name.
+        options.push(MountOption::CUSTOM("volname=Biohazard".to_string()));
+        options.push(MountOption::CUSTOM("local".to_string()));
+        options.push(MountOption::CUSTOM("noappledouble".to_string()));
+    }
+    options
+}
+
+fn mount_error_message(context: &str, mountpoint: &Path, error: &std::io::Error) -> String {
+    let base = format!("{context} at {}", mountpoint.display());
+    #[cfg(target_os = "macos")]
+    {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return format!(
+                "{base}; macFUSE is installed but not available to the kernel. Open System Settings → Privacy & Security, approve macFUSE by Benjamin Fleischer if prompted, then reboot if macOS asks."
+            );
+        }
+    }
+    base
 }
 
 fn attr_from_metadata(inode: u64, metadata: &fs::Metadata, kind: FileType, perm: u16) -> FileAttr {
@@ -510,6 +534,7 @@ struct InodeState {
     content_hash: Option<String>,
     size_bytes: u64,
     current_version_id: Option<String>,
+    flags: u32,
 }
 
 impl InodeState {
@@ -522,6 +547,23 @@ impl InodeState {
 /// write-buffer seed path and `InodeState::cache_path` cannot drift.
 fn inode_cache_path(cache_dir: &Path, inode: u64) -> PathBuf {
     cache_dir.join(format!("inode-{inode}"))
+}
+
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 /// Children of a directory indexed by name and by daemon `node_id`. `fetched`
@@ -569,6 +611,7 @@ struct FsState {
     inodes: HashMap<u64, InodeState>,
     children: HashMap<u64, ChildrenCache>,
     handles: HashMap<u64, OpenHandle>,
+    xattrs: HashMap<(u64, OsString), Vec<u8>>,
     next_inode: u64,
     next_handle: u64,
     /// Owner uid/gid stamped on every attr so the kernel enforces the artist's
@@ -650,6 +693,7 @@ impl WorkspaceFs {
             inodes: HashMap::new(),
             children: HashMap::new(),
             handles: HashMap::new(),
+            xattrs: HashMap::new(),
             next_inode: 2,
             next_handle: 1,
             uid,
@@ -671,6 +715,7 @@ impl WorkspaceFs {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: None,
+                flags: 0,
             },
         );
         state.children.insert(ROOT_INODE, ChildrenCache::default());
@@ -720,11 +765,11 @@ impl WorkspaceFs {
             eprintln!("biohazardfs-fuse: dirty journal path has no parent for inode {inode}");
             return;
         };
-        if fs::create_dir_all(parent).is_err() {
+        if create_owner_only_dir(parent).is_err() {
             eprintln!("biohazardfs-fuse: could not create dirty journal dir for inode {inode}");
             return;
         }
-        if fs::write(&path, bytes).is_err() {
+        if write_owner_only(&path, bytes).is_err() {
             eprintln!("biohazardfs-fuse: could not journal dirty bytes for inode {inode}");
         }
     }
@@ -849,6 +894,7 @@ impl WorkspaceFs {
                         content_hash: None,
                         size_bytes,
                         current_version_id,
+                        flags: 0,
                     },
                 );
                 allocated
@@ -953,8 +999,12 @@ impl WorkspaceFs {
             let dirty_generation = handle.dirty_generation;
             let entry = state.inodes.get(&ino).ok_or(Errno::EIO)?.clone();
             let was_unbound = entry.node_id.is_none();
+            let mount_local =
+                entry.parent_inode == ROOT_INODE && entry.name == OsStr::new(".VolumeIcon.icns");
             let content_hex = encode_hex(&bytes);
-            let params = if let Some(node_id) = &entry.node_id {
+            let params = if mount_local {
+                serde_json::json!({})
+            } else if let Some(node_id) = &entry.node_id {
                 let mut params = serde_json::json!({
                     "node_id": node_id,
                     "content_hex": content_hex,
@@ -983,8 +1033,28 @@ impl WorkspaceFs {
                 cache_path: entry.cache_path(&self.cache_dir),
                 was_unbound,
                 dirty_generation,
+                mount_local,
             }
         };
+
+        if prepared.mount_local {
+            if write_owner_only(&prepared.cache_path, &prepared.bytes).is_err() {
+                return Err(Errno::EIO);
+            }
+            let mut state = self.lock_state();
+            if let Some(entry) = state.inodes.get_mut(&ino) {
+                entry.size_bytes = prepared.bytes.len() as u64;
+                entry.cache_state = CacheState::Ready;
+            }
+            if let Some(handle) = state.handles.get_mut(&fh) {
+                handle.in_flight = false;
+                handle.ever_dirty = false;
+                handle.write_buffer = None;
+            }
+            drop(state);
+            self.clear_dirty_journal(ino, fh);
+            return Ok(());
+        }
 
         // Hard safety boundary: success only after file.write acknowledges the
         // version. The RPC runs with no state lock held.
@@ -1013,7 +1083,7 @@ impl WorkspaceFs {
 
                 // Persist the committed bytes to the local cache so a subsequent
                 // open/read sees them without a round-trip.
-                if fs::write(&prepared.cache_path, &prepared.bytes).is_err() {
+                if write_owner_only(&prepared.cache_path, &prepared.bytes).is_err() {
                     // The daemon accepted the version but the local cache write
                     // failed. Do NOT restore the buffer as if it were
                     // uncommitted: that would make retry create a duplicate or
@@ -1299,6 +1369,7 @@ struct PreparedCommit {
     cache_path: PathBuf,
     was_unbound: bool,
     dirty_generation: u64,
+    mount_local: bool,
 }
 
 impl Filesystem for WorkspaceFs {
@@ -1349,7 +1420,7 @@ impl Filesystem for WorkspaceFs {
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
+        flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         // size: truncate/extend the cache file and stage the surviving bytes in
@@ -1380,8 +1451,88 @@ impl Filesystem for WorkspaceFs {
                 fuser::TimeOrNow::Now => SystemTime::now(),
             };
         }
+        if let Some(new_flags) = flags {
+            entry.flags = new_flags.bits();
+        }
         let attr = build_attr(entry, uid, gid);
         reply.attr(&TTL, &attr);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if name != OsStr::new("com.apple.FinderInfo") {
+            reply.error(Errno::ENOTSUP);
+            return;
+        }
+        let mut state = self.lock_state();
+        if !state.inodes.contains_key(&ino.0) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        state
+            .xattrs
+            .insert((ino.0, name.to_os_string()), value.to_vec());
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let state = self.lock_state();
+        if !state.inodes.contains_key(&ino.0) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let Some(value) = state.xattrs.get(&(ino.0, name.to_os_string())) else {
+            reply.error(Errno::NO_XATTR);
+            return;
+        };
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if value.len() > size as usize {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(value);
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let state = self.lock_state();
+        if !state.inodes.contains_key(&ino.0) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let mut names = Vec::new();
+        for (xattr_inode, name) in state.xattrs.keys() {
+            if *xattr_inode != ino.0 {
+                continue;
+            }
+            names.extend_from_slice(name.to_string_lossy().as_bytes());
+            names.push(0);
+        }
+        if size == 0 {
+            reply.size(names.len() as u32);
+        } else if names.len() > size as usize {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&names);
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let mut state = self.lock_state();
+        if !state.inodes.contains_key(&ino.0) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        state.xattrs.remove(&(ino.0, name.to_os_string()));
+        reply.ok();
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
@@ -1439,7 +1590,7 @@ impl Filesystem for WorkspaceFs {
                         .and_then(|value| value.as_str())
                         .unwrap_or("");
                     let content = decode_hex(content_hex).unwrap_or_default();
-                    if fs::write(&cache_path, &content).is_err() {
+                    if write_owner_only(&cache_path, &content).is_err() {
                         reply.error(Errno::EIO);
                         return;
                     }
@@ -1479,7 +1630,7 @@ impl Filesystem for WorkspaceFs {
         }
 
         if truncating {
-            let _ = fs::write(&cache_path, []);
+            let _ = write_owner_only(&cache_path, &[]);
             let mut state = self.lock_state();
             if let Some(entry) = state.inodes.get_mut(&ino.0) {
                 entry.cache_state = CacheState::Ready;
@@ -1726,6 +1877,7 @@ impl Filesystem for WorkspaceFs {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: None,
+                flags: 0,
             };
             let attr = build_attr(&entry, uid, gid);
             state.inodes.insert(inode, entry);
@@ -1826,16 +1978,102 @@ impl Filesystem for WorkspaceFs {
     fn mkdir(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _mode: u32,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        // No daemon method yet for creating directories. Return EROFS so the
-        // artist sees "not supported" rather than a silent no-op. Promotion
-        // needs a daemon mkdir spine + FUSE-side operation-token minting.
-        reply.error(Errno::EROFS);
+        {
+            let state = self.lock_state();
+            let Some(entry) = state.inodes.get(&parent.0) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            if entry.kind != FileType::Directory {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+        }
+        if self.ensure_children_fetched(parent.0).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let dir_mode = parse_mode_from_u32(mode, DEFAULT_DIR_MODE);
+        let parent_node_id = {
+            let state = self.lock_state();
+            state
+                .inodes
+                .get(&parent.0)
+                .and_then(|entry| entry.node_id.clone())
+        };
+        let Some(parent_node_id) = parent_node_id else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let created = match self.rpc(
+            "file.mkdir",
+            serde_json::json!({
+                "parent_node_id": parent_node_id,
+                "name": name.to_string_lossy(),
+                "mode": format!("0o{dir_mode:o}"),
+            }),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("biohazardfs-fuse: mkdir failed: {}", error.message());
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let Some(node_id) = created
+            .get("node_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+        else {
+            reply.error(Errno::EIO);
+            return;
+        };
+
+        let attr = {
+            let mut state = self.lock_state();
+            let uid = state.uid;
+            let gid = state.gid;
+            let inode = state.next_inode;
+            state.next_inode += 1;
+            let now = SystemTime::now();
+            let entry = InodeState {
+                inode,
+                parent_inode: parent.0,
+                node_id: Some(node_id.clone()),
+                name: name.to_os_string(),
+                kind: FileType::Directory,
+                mode: dir_mode,
+                target: None,
+                mtime: now,
+                crtime: now,
+                cache_state: CacheState::Ready,
+                content_hash: None,
+                size_bytes: 0,
+                current_version_id: None,
+                flags: 0,
+            };
+            let attr = build_attr(&entry, uid, gid);
+            state.inodes.insert(inode, entry);
+            state.children.insert(
+                inode,
+                ChildrenCache {
+                    fetched: true,
+                    ..Default::default()
+                },
+            );
+            let children = state.children.entry(parent.0).or_default();
+            children.by_name.insert(name.to_os_string(), inode);
+            children.by_node.insert(node_id, inode);
+            attr
+        };
+        reply.entry(&TTL, &attr, Generation(0));
     }
 
     fn symlink(
@@ -1866,17 +2104,125 @@ impl Filesystem for WorkspaceFs {
     fn rename(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
-        _newparent: INodeNo,
-        _newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // Routes to daemon file.move once promoted AND the FUSE layer can mint
-        // the required operation token (file.move is DataMoving under
-        // AgentSafe). Until then, EIO so the artist sees a real failure.
-        reply.error(Errno::EIO);
+        if !flags.is_empty() {
+            reply.error(Errno::ENOTSUP);
+            return;
+        }
+        if self.ensure_children_fetched(parent.0).is_err()
+            || self.ensure_children_fetched(newparent.0).is_err()
+        {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let state = self.lock_state();
+        let Some(parent_entry) = state.inodes.get(&parent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if parent_entry.kind != FileType::Directory {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+        let Some(newparent_entry) = state.inodes.get(&newparent.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if newparent_entry.kind != FileType::Directory {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+
+        let Some(source_inode) = state
+            .children
+            .get(&parent.0)
+            .and_then(|children| children.by_name.get(name).copied())
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let new_key = case_insensitive_sibling_key(&newname.to_string_lossy());
+        let conflicting_inode = state
+            .children
+            .get(&newparent.0)
+            .and_then(|target_children| {
+                target_children
+                    .by_name
+                    .iter()
+                    .find_map(|(existing, inode)| {
+                        (case_insensitive_sibling_key(&existing.to_string_lossy()) == new_key)
+                            .then_some(*inode)
+                    })
+            });
+        if conflicting_inode.is_some_and(|inode| inode != source_inode) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        let source_node_id = state
+            .inodes
+            .get(&source_inode)
+            .and_then(|entry| entry.node_id.clone());
+        let new_parent_node_id = state
+            .inodes
+            .get(&newparent.0)
+            .and_then(|entry| entry.node_id.clone());
+        drop(state);
+
+        if let (Some(source_node_id), Some(new_parent_node_id)) =
+            (source_node_id.as_ref(), new_parent_node_id.as_ref())
+            && let Err(error) = self.rpc(
+                "file.rename",
+                serde_json::json!({
+                    "node_id": source_node_id,
+                    "new_parent_node_id": new_parent_node_id,
+                    "new_name": newname.to_string_lossy(),
+                }),
+            )
+        {
+            eprintln!("biohazardfs-fuse: rename failed: {}", error.message());
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let mut state = self.lock_state();
+        if let Some(source_children) = state.children.get_mut(&parent.0) {
+            source_children.by_name.remove(name);
+            source_children
+                .by_node
+                .retain(|_, inode| *inode != source_inode);
+        }
+        state
+            .children
+            .entry(newparent.0)
+            .or_default()
+            .by_name
+            .insert(newname.to_os_string(), source_inode);
+        let node_id = state
+            .inodes
+            .get(&source_inode)
+            .and_then(|entry| entry.node_id.clone());
+        if let Some(node_id) = node_id {
+            state
+                .children
+                .entry(newparent.0)
+                .or_default()
+                .by_node
+                .insert(node_id, source_inode);
+        }
+        if let Some(entry) = state.inodes.get_mut(&source_inode) {
+            entry.parent_inode = newparent.0;
+            entry.name = newname.to_os_string();
+            entry.mtime = SystemTime::now();
+        }
+        reply.ok();
     }
 }
 
@@ -1886,11 +2232,7 @@ pub fn mount_workspace(config: WorkspaceMountConfig) -> Result<()> {
     let filesystem = WorkspaceFs::connect(&config)?;
 
     let mut options = Config::default();
-    options.mount_options = vec![
-        MountOption::FSName("biohazardfs".to_string()),
-        MountOption::Subtype("biohazardfs".to_string()),
-        MountOption::DefaultPermissions,
-    ];
+    options.mount_options = biohazardfs_mount_options(false);
     if config.foreground {
         eprintln!(
             "biohazardfs-fuse mounting workspace at {} (daemon {}, cache {})",
@@ -1902,10 +2244,7 @@ pub fn mount_workspace(config: WorkspaceMountConfig) -> Result<()> {
     fuser::mount2(filesystem, &mountpoint, &options).map_err(|error| {
         FuseError::io(
             FuseErrorKind::Io,
-            format!(
-                "could not mount BiohazardFS workspace at {}",
-                mountpoint.display()
-            ),
+            mount_error_message("could not mount BiohazardFS workspace", &mountpoint, &error),
             error,
         )
     })
@@ -1961,7 +2300,7 @@ fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
             )
         })?
     } else {
-        fs::create_dir_all(cache_dir).map_err(|error| {
+        create_owner_only_dir(cache_dir).map_err(|error| {
             FuseError::io(
                 FuseErrorKind::InvalidMountpoint,
                 format!("could not create cache_dir {}", cache_dir.display()),
@@ -1989,6 +2328,13 @@ fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
             "cache_dir must be a directory",
         ));
     }
+    fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        FuseError::io(
+            FuseErrorKind::InvalidMountpoint,
+            "cache_dir permissions could not be tightened to owner-only",
+            error,
+        )
+    })?;
     Ok(canonical)
 }
 
@@ -2015,9 +2361,10 @@ fn validate_workspace_mountpoint(mountpoint: &Path, cache_dir: &Path) -> Result<
     }
     // The cache_dir holds the live hydrate content; mounting over it (or vice
     // versa) would make cache I/O alias FUSE traffic and confuse the kernel.
-    if canonical_mountpoint == cache_dir
-        || canonical_mountpoint.starts_with(cache_dir)
-        || cache_dir.starts_with(&canonical_mountpoint)
+    let canonical_cache = fs::canonicalize(cache_dir).unwrap_or_else(|_| cache_dir.to_path_buf());
+    if canonical_mountpoint == canonical_cache
+        || canonical_mountpoint.starts_with(&canonical_cache)
+        || canonical_cache.starts_with(&canonical_mountpoint)
     {
         return Err(FuseError::new(
             FuseErrorKind::InvalidMountpoint,
@@ -2061,7 +2408,7 @@ fn build_attr(entry: &InodeState, uid: u32, gid: u32) -> FileAttr {
         gid,
         rdev: 0,
         blksize: 4096,
-        flags: 0,
+        flags: entry.flags,
     }
 }
 
@@ -2210,7 +2557,7 @@ fn truncate_cache_file(cache_path: &Path, new_len: usize) -> std::result::Result
     }
     let mut truncated = existing;
     truncated.truncate(new_len);
-    if let Err(error) = fs::write(cache_path, &truncated) {
+    if let Err(error) = write_owner_only(cache_path, &truncated) {
         eprintln!(
             "biohazardfs-fuse: setattr cache rewrite failed for {}: {error}",
             cache_path.display()
@@ -2498,6 +2845,7 @@ mod tests {
                 inodes: HashMap::new(),
                 children: HashMap::new(),
                 handles: HashMap::new(),
+                xattrs: HashMap::new(),
                 next_inode: 2,
                 next_handle: 1,
                 uid: 0,
@@ -2705,6 +3053,7 @@ mod tests {
                     content_hash: None,
                     size_bytes: 0,
                     current_version_id: None,
+                    flags: 0,
                 },
             );
             state
@@ -2780,6 +3129,7 @@ mod tests {
             inodes: HashMap::new(),
             children: HashMap::new(),
             handles: HashMap::new(),
+            xattrs: HashMap::new(),
             next_inode: 2,
             next_handle: 1,
             uid,
@@ -2803,6 +3153,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: None,
+                flags: 0,
             },
         );
         let parent_node = "node_root".to_string();
@@ -2822,6 +3173,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: None,
+                flags: 0,
             }
         });
         let payload = b"do not lose me".to_vec();
@@ -3389,6 +3741,7 @@ mod tests {
             inodes: HashMap::new(),
             children: HashMap::new(),
             handles: HashMap::new(),
+            xattrs: HashMap::new(),
             next_inode: 2,
             next_handle: 1,
             uid,
@@ -3410,6 +3763,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 6,
                 current_version_id: Some("ver_open".to_string()),
+                flags: 0,
             },
         );
         let handle = 1u64;
@@ -3473,6 +3827,7 @@ mod tests {
             inodes: HashMap::new(),
             children: HashMap::new(),
             handles: HashMap::new(),
+            xattrs: HashMap::new(),
             next_inode: 2,
             next_handle: 1,
             uid,
@@ -3494,6 +3849,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 3,
                 current_version_id: Some("ver_open".to_string()),
+                flags: 0,
             },
         );
         let fs = WorkspaceFs {
@@ -3841,6 +4197,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: None,
+                flags: 0,
             },
         );
         state
@@ -3895,6 +4252,7 @@ mod tests {
                 content_hash: None,
                 size_bytes: 0,
                 current_version_id: base_version_id.clone(),
+                flags: 0,
             },
         );
         let handle = state.next_handle;

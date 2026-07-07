@@ -29,7 +29,7 @@ if [[ "$CHANNEL" == "stable" ]]; then
   BUILDER_CHANNEL="latest"
 fi
 
-TMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/biohazardfs-electron-builder.XXXXXX.json")"
+TMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/biohazardfs-electron-builder.XXXXXX").json"
 trap 'rm -f "$TMP_CONFIG"' EXIT
 
 python3 - <<'PY' "$APP_DIR/package.json" "$TMP_CONFIG" "$BUILDER_CHANNEL"

@@ -70,6 +70,8 @@ cargo check --workspace --all-features
 cargo test --workspace --all-features
 ```
 
+macOS runners that build the FUSE crate must install `pkgconf` and macFUSE headers/libraries first. Live macOS mount smoke additionally requires macFUSE approval in System Settings → Privacy & Security; when the kernel extension is not approved, `scripts/ci/fuse-smoke.sh` skips with an explicit diagnostic rather than failing unrelated checks.
+
 This catches cross-platform compile and test failures early without making every static/documentation gate run three times.
 
 ## Dependency, license, and security policy

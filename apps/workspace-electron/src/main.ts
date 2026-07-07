@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -11,9 +12,17 @@ import { checkForUpdates, configureAutoUpdater, getUpdateStatus } from './main.u
 const DAEMON_ENDPOINT = process.env.BIOHAZARDFS_DAEMON_ENDPOINT ?? '127.0.0.1:47666';
 let localToken = process.env.BIOHAZARDFS_LOCAL_TOKEN ?? '';
 let managedDaemon: ChildProcess | null = null;
+let managedWorkspaceMount: { child: ChildProcess; mountpoint: string; cacheDir: string } | null =
+  null;
+let mountWorkspaceInFlight: Promise<{
+  ok: boolean;
+  mountpoint: string | null;
+  error: string | null;
+}> | null = null;
 const IS_SMOKE = process.env.BIOHAZARDFS_DESKTOP_SMOKE === '1';
 const IS_DEV = process.env.NODE_ENV === 'development';
 const DISABLE_DAEMON_AUTOSTART = process.env.BIOHAZARDFS_DISABLE_DAEMON_AUTOSTART === '1';
+const DEFAULT_MAC_VOLUME_MOUNTPOINT = '/Volumes/Biohazard';
 
 const GENERIC_RENDERER_RPC_ALLOWLIST = new Set([
   'auth.status',
@@ -74,9 +83,12 @@ function packagedBinDir(): string {
   return `${platform}-${arch}`;
 }
 
-async function daemonBinaryPath(): Promise<string | null> {
-  const binaryName = process.platform === 'win32' ? 'biohazardfsd.exe' : 'biohazardfsd';
-  const override = process.env.BIOHAZARDFS_DAEMON_BIN;
+async function bundledBinaryPath(
+  binaryBaseName: string,
+  overrideEnv: string,
+): Promise<string | null> {
+  const binaryName = process.platform === 'win32' ? `${binaryBaseName}.exe` : binaryBaseName;
+  const override = process.env[overrideEnv];
   const candidates = [
     override,
     app.isPackaged
@@ -90,6 +102,14 @@ async function daemonBinaryPath(): Promise<string | null> {
     if (await fileExists(candidate)) return candidate;
   }
   return null;
+}
+
+async function daemonBinaryPath(): Promise<string | null> {
+  return bundledBinaryPath('biohazardfsd', 'BIOHAZARDFS_DAEMON_BIN');
+}
+
+async function fuseBinaryPath(): Promise<string | null> {
+  return bundledBinaryPath('biohazardfs-fuse', 'BIOHAZARDFS_FUSE_BIN');
 }
 
 async function ensureLocalToken(): Promise<string> {
@@ -122,6 +142,12 @@ async function waitForDaemonReady(timeoutMs = 2500): Promise<void> {
   }
 }
 
+function defaultWorkspaceRoot(): string {
+  if (process.env.BIOHAZARDFS_WORKSPACE_ROOT) return process.env.BIOHAZARDFS_WORKSPACE_ROOT;
+  if (process.platform === 'darwin') return DEFAULT_MAC_VOLUME_MOUNTPOINT;
+  return path.join(app.getPath('home'), 'Biohazard');
+}
+
 async function ensureManagedDaemon(): Promise<void> {
   if (IS_SMOKE || DISABLE_DAEMON_AUTOSTART || managedDaemon) return;
   if (!isAllowedLoopbackEndpoint(DAEMON_ENDPOINT)) return;
@@ -137,6 +163,7 @@ async function ensureManagedDaemon(): Promise<void> {
     env: {
       ...process.env,
       BIOHAZARDFS_LOCAL_TOKEN: localToken,
+      BIOHAZARDFS_WORKSPACE_ROOT: defaultWorkspaceRoot(),
     },
     stdio: ['ignore', 'ignore', 'pipe'],
     windowsHide: true,
@@ -152,6 +179,212 @@ async function ensureManagedDaemon(): Promise<void> {
   });
 
   await waitForDaemonReady();
+}
+
+async function ensureDirectory(dir: string, mode = 0o755): Promise<void> {
+  await fs.mkdir(dir, { recursive: true, mode });
+  await fs.chmod(dir, mode).catch(() => undefined);
+}
+
+async function mountLineForPath(mountpoint: string): Promise<string | null> {
+  if (process.platform === 'win32') return null;
+  const { execFile } = await import('node:child_process');
+  try {
+    return await new Promise<string | null>((resolve) => {
+      execFile('/sbin/mount', [], (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        resolve(stdout.split('\n').find((line) => line.includes(` on ${mountpoint} `)) ?? null);
+      });
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function isMountedPath(mountpoint: string): Promise<boolean> {
+  if (process.platform === 'linux') {
+    const { execFile } = await import('node:child_process');
+    return await new Promise<boolean>((resolve) => {
+      execFile('mountpoint', ['-q', mountpoint], (error) => {
+        resolve(!error);
+      });
+    });
+  }
+  return (await mountLineForPath(mountpoint)) !== null;
+}
+
+async function isBiohazardMount(mountpoint: string): Promise<boolean> {
+  const line = await mountLineForPath(mountpoint);
+  if (!line) return false;
+  if (process.platform === 'darwin') {
+    return line.startsWith('Biohazard on ') && line.includes('macfuse');
+  }
+  return line.includes('fuse.biohazardfs') || line.includes('biohazardfs-fuse');
+}
+
+async function directoryIsEmpty(dir: string): Promise<boolean> {
+  const entries = await fs.readdir(dir);
+  return entries.length === 0;
+}
+
+async function ensureMacVolumeMountpoint(): Promise<string | null> {
+  if (process.platform !== 'darwin') return null;
+  if (await fileExists(DEFAULT_MAC_VOLUME_MOUNTPOINT)) return DEFAULT_MAC_VOLUME_MOUNTPOINT;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
+  const script = `do shell script "mkdir -p ${DEFAULT_MAC_VOLUME_MOUNTPOINT}; chown ${uid}:${gid} ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true; chmod 755 ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true" with administrator privileges`;
+  spawnSync('/usr/bin/osascript', ['-e', script], { stdio: 'ignore' });
+  return (await fileExists(DEFAULT_MAC_VOLUME_MOUNTPOINT)) ? DEFAULT_MAC_VOLUME_MOUNTPOINT : null;
+}
+
+function applyMacVolumeIcon(mountpoint: string): void {
+  if (process.platform !== 'darwin') return;
+  const iconPath = path.join(process.resourcesPath, 'icon.icns');
+  try {
+    // Do not use cp/fcopyfile here: macFUSE does not implement the fcopyfile
+    // fast path, which can leave a zero-filled partial .VolumeIcon.icns while
+    // still setting Finder's custom-icon bit.
+    const icon = fsSync.readFileSync(iconPath);
+    fsSync.writeFileSync(path.join(mountpoint, '.VolumeIcon.icns'), icon, { mode: 0o644 });
+    spawnSync('/usr/bin/SetFile', ['-a', 'C', mountpoint], { stdio: 'ignore', timeout: 10000 });
+  } catch (error) {
+    console.warn(
+      `[biohazardfs-fuse] could not apply Finder volume icon: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+async function waitForMountReady(mountpoint: string, timeoutMs = 4000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await isMountedPath(mountpoint)) return true;
+    if (managedWorkspaceMount && managedWorkspaceMount.mountpoint === mountpoint) {
+      if (managedWorkspaceMount.child.exitCode !== null) return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return false;
+}
+
+async function mountWorkspace(): Promise<{
+  ok: boolean;
+  mountpoint: string | null;
+  error: string | null;
+}> {
+  if (mountWorkspaceInFlight) return mountWorkspaceInFlight;
+  mountWorkspaceInFlight = mountWorkspaceInner()
+    .catch((error: unknown) => ({
+      ok: false,
+      mountpoint: null,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    .finally(() => {
+      mountWorkspaceInFlight = null;
+    });
+  return mountWorkspaceInFlight;
+}
+
+async function mountWorkspaceInner(): Promise<{
+  ok: boolean;
+  mountpoint: string | null;
+  error: string | null;
+}> {
+  if (managedWorkspaceMount && (await isMountedPath(managedWorkspaceMount.mountpoint))) {
+    return { ok: true, mountpoint: managedWorkspaceMount.mountpoint, error: null };
+  }
+  if (process.platform === 'win32') {
+    return {
+      ok: false,
+      mountpoint: null,
+      error: 'workspace FUSE mount is not available on Windows yet',
+    };
+  }
+
+  await ensureManagedDaemon();
+  const token = await ensureLocalToken();
+  const fuse = await fuseBinaryPath();
+  if (!fuse) {
+    return { ok: false, mountpoint: null, error: 'biohazardfs-fuse binary was not found' };
+  }
+
+  const volumeMountpoint = await ensureMacVolumeMountpoint();
+  if (process.platform === 'darwin' && !volumeMountpoint) {
+    return {
+      ok: false,
+      mountpoint: null,
+      error:
+        'Could not create /Volumes/Biohazard. macOS administrator approval is required for the default Finder-visible mount.',
+    };
+  }
+  const mountpoint = volumeMountpoint ?? path.join(app.getPath('home'), 'Biohazard');
+  const cacheDir = path.join(app.getPath('userData'), 'cache', 'workspace');
+  await ensureDirectory(mountpoint, 0o755);
+  await ensureDirectory(cacheDir, 0o700);
+  if (await isMountedPath(mountpoint)) {
+    if (await isBiohazardMount(mountpoint)) {
+      return { ok: true, mountpoint, error: null };
+    }
+    return {
+      ok: false,
+      mountpoint: null,
+      error: `${mountpoint} is already occupied by another mounted volume`,
+    };
+  }
+  if (!(await directoryIsEmpty(mountpoint))) {
+    return {
+      ok: false,
+      mountpoint: null,
+      error: `${mountpoint} already exists and is not empty; move its contents or choose another mount path before mounting`,
+    };
+  }
+
+  const child = spawn(
+    fuse,
+    [
+      'mount-workspace',
+      '--daemon-endpoint',
+      DAEMON_ENDPOINT,
+      '--cache-dir',
+      cacheDir,
+      '--mountpoint',
+      mountpoint,
+    ],
+    {
+      env: { ...process.env, BIOHAZARDFS_LOCAL_TOKEN: token },
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+    },
+  );
+  managedWorkspaceMount = { child, mountpoint, cacheDir };
+  let stderr = '';
+  child.stderr.on('data', (chunk: Buffer) => {
+    const message = chunk.toString('utf8');
+    stderr += message;
+    if (message.trim()) console.warn(`[biohazardfs-fuse] ${message.trim()}`);
+  });
+  child.on('error', (error) => {
+    stderr += error instanceof Error ? error.message : String(error);
+    if (managedWorkspaceMount?.child === child) managedWorkspaceMount = null;
+  });
+  child.on('exit', () => {
+    if (managedWorkspaceMount?.child === child) managedWorkspaceMount = null;
+  });
+
+  if (await waitForMountReady(mountpoint)) {
+    applyMacVolumeIcon(mountpoint);
+    return { ok: true, mountpoint, error: null };
+  }
+  child.kill();
+  return {
+    ok: false,
+    mountpoint: null,
+    error: stderr.trim() || 'workspace mount did not become ready',
+  };
 }
 
 async function daemonRpc(method: string, params: Record<string, unknown> = {}) {
@@ -320,6 +553,7 @@ async function allowedOpenRoots(): Promise<string[]> {
 
   const workspace = responseData(await daemonRpc('workspace.status'));
   await addRoot(workspace?.root);
+  await addRoot(managedWorkspaceMount?.mountpoint);
 
   const mountList = responseData(await daemonRpc('mount.list'));
   const mounts = Array.isArray(mountList?.mounts) ? mountList.mounts : [];
@@ -374,6 +608,7 @@ async function createWindow(): Promise<BrowserWindow> {
 ipcMain.handle('daemon:status', daemonStatus);
 ipcMain.handle('workspace:status', workspaceStatus);
 ipcMain.handle('workspace:list', (_event, pathName: string) => workspaceList(pathName));
+ipcMain.handle('workspace:mount', mountWorkspace);
 ipcMain.handle('cache:status', cacheStatus);
 ipcMain.handle('cache:list', cacheList);
 ipcMain.handle('cache:pin', (_event, params: CacheTargetParams) => cachePin(params));
@@ -561,6 +796,9 @@ void app
     configureAutoUpdater(prefs.releaseChannel);
     await ensureManagedDaemon();
     const window = await createWindow();
+    if (!IS_SMOKE) {
+      void mountWorkspace();
+    }
 
     if (prefs.autoUpdateChecks && app.isPackaged) {
       void checkForUpdates(prefs.releaseChannel);
@@ -597,7 +835,24 @@ void app
     app.exit(1);
   });
 
+function unmountManagedWorkspaceSync(): void {
+  const mount = managedWorkspaceMount;
+  if (!mount) return;
+  if (process.platform === 'darwin') {
+    spawnSync('/sbin/umount', [mount.mountpoint], { stdio: 'ignore' });
+  } else if (process.platform === 'linux') {
+    const unmount = spawnSync('fusermount3', ['-u', mount.mountpoint], { stdio: 'ignore' });
+    if (unmount.status !== 0) {
+      spawnSync('fusermount', ['-u', mount.mountpoint], { stdio: 'ignore' });
+    }
+  }
+}
+
 app.on('before-quit', () => {
+  unmountManagedWorkspaceSync();
+  if (managedWorkspaceMount && !managedWorkspaceMount.child.killed) {
+    managedWorkspaceMount.child.kill();
+  }
   if (managedDaemon && !managedDaemon.killed) {
     managedDaemon.kill();
   }

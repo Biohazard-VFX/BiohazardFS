@@ -176,6 +176,13 @@ pub const DAEMON_METHODS: &[MethodDescriptor] = &[
     ),
     MethodDescriptor::daemon("file.delete", "file", M::Destructive, "delete to trash"),
     MethodDescriptor::daemon("file.move", "file", M::DataMoving, "rename or move a file"),
+    MethodDescriptor::daemon("file.rename", "file", M::LowRisk, "rename a mounted node"),
+    MethodDescriptor::daemon(
+        "file.mkdir",
+        "file",
+        M::LowRisk,
+        "create a mounted directory",
+    ),
     MethodDescriptor::daemon("file.copy", "file", M::DataMoving, "copy a file"),
     MethodDescriptor::daemon("file.checksum", "file", M::Read, "compute file checksum"),
     MethodDescriptor::daemon("file.write", "file", M::LowRisk, "commit a file write"),

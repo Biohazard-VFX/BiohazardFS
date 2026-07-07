@@ -116,7 +116,7 @@ has_errors
 
 ## Hydration behavior
 
-MVP hydrates full files before allowing normal open/edit workflows.
+MVP hydrates full files before allowing normal open/edit workflows. The current FUSE adapter implements this on Linux and on macOS when macFUSE is installed and approved; production-native placeholder integrations remain planned.
 
 Rules:
 

@@ -44,6 +44,11 @@ declare global {
       daemonStatus: () => Promise<DaemonStatusResult>;
       workspaceStatus: () => Promise<DaemonStatusResult>;
       workspaceList: (path?: string) => Promise<DaemonStatusResult>;
+      workspaceMount: () => Promise<{
+        ok: boolean;
+        mountpoint: string | null;
+        error: string | null;
+      }>;
       cacheStatus: () => Promise<DaemonStatusResult>;
       cacheList: () => Promise<DaemonStatusResult>;
       cachePin: (params: CacheTargetParams) => Promise<DaemonStatusResult>;

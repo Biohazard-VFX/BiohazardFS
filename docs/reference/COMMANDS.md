@@ -408,7 +408,7 @@ Read-only source-backed mount (Linux; the live mount foundation):
 biohazardfs-fuse mount --source /path/to/workspace --mountpoint /path/to/mountpoint
 ```
 
-Read-write daemon-backed workspace mount (Linux; the FUSE write path):
+Read-write daemon-backed workspace mount (Linux/macOS with FUSE runtime; the FUSE write path):
 
 ```bash
 BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs-fuse mount-workspace \
@@ -424,8 +424,8 @@ Rules:
 - For `mount`: the mounted view is read-only; write, unlink, and rmdir requests are denied with a read-only filesystem error. Directory entries are indexed from regular files and directories under the source root; symlinks and special files are skipped in the MVP to preserve path containment.
 - For `mount-workspace`: files hydrate from the daemon via `file.read` on open, writes buffer per file handle, and one complete blob is pushed per flush/fsync via `file.write`. Dirty data is never lost: a write that has not flushed is not acked to the daemon, and dehydrate/evict refuse dirty or pinned cache entries.
 - For `mount-workspace`: cache state drives through the legal forward transition path (Absent/Failed → Populating → Ready, Ready → Dirty → Ready on overwrite); illegal transitions are rejected, never papered over.
-- Both modes are Linux-only. Other platforms return an explicit `unsupported_platform` error.
-- Reproducible smoke proof lives in `scripts/ci/fuse-smoke.sh`; it exercises both `mount` and `mount-workspace` and skips safely when `/dev/fuse` or `fusermount` is unavailable.
+- Both modes run on Linux and macOS when a FUSE runtime is installed. Linux requires `/dev/fuse` plus `fusermount3`/`fusermount`; macOS requires macFUSE to be installed and approved in System Settings → Privacy & Security. The desktop app uses `/Volumes/Biohazard` by default on macOS so Finder shows the workspace as a normal `Biohazard` location. Other platforms return an explicit `unsupported_platform` error.
+- Reproducible smoke proof lives in `scripts/ci/fuse-smoke.sh`; it exercises both `mount` and `mount-workspace` and skips safely when the platform FUSE runtime or unmount tool is unavailable.
 
 ## File workflow commands
 
@@ -570,7 +570,7 @@ biohazardfs versions <path>        # file versions
 biohazardfs restore ...            # file restore
 ```
 
-Status: the daemon spine for `file.stat`, `file.list`, `file.history`, `file.versions`, `file.checksum`, `file.read`, and `file.write` is IMPLEMENTED against the in-memory namespace (resolves by `node_id` / `parent_node_id`). `file write` and `file read` round-trip real content via `content_hex`. `file restore`, `file delete`, `file move`, and `file copy` are SCAFFOLD (periphery → `method_not_implemented`). The short aliases above are PLANNED. Note: the thin `file stat/list/history/versions/checksum` subcommands currently forward a `path` argument while the daemon resolves by `node_id`; the path→node resolution seam is still being wired, so callers that hit the daemon through `--json '{"node_id":"..."}'` get real data while the positional `<path>` forms will round out in a follow-up.
+Status: the daemon spine for `file.stat`, `file.list`, `file.history`, `file.versions`, `file.checksum`, `file.read`, `file.write`, `file.mkdir`, and `file.rename` is IMPLEMENTED against the in-memory namespace (resolves by `node_id` / `parent_node_id`). `file write` and `file read` round-trip real content via `content_hex`; `file mkdir` and `file rename` back Finder/FUSE directory creation and rename before acknowledging the kernel. `file restore`, `file delete`, `file move`, and `file copy` are SCAFFOLD (periphery → `method_not_implemented`). The short aliases above are PLANNED. Note: the thin `file stat/list/history/versions/checksum` subcommands currently forward a `path` argument while the daemon resolves by `node_id`; the path→node resolution seam is still being wired, so callers that hit the daemon through `--json '{"node_id":"..."}'` get real data while the positional `<path>` forms will round out in a follow-up.
 
 ### Cache namespace
 
@@ -802,7 +802,7 @@ The CLI command tree in `crates/cli/src/main.rs` wires the full canonical namesp
 - Daemon workspace runtime: `workspace.status`, `workspace.list`, `daemon.status`, `daemon.health`, `daemon.version`, `daemon.methods`, `daemon.events.subscribe`.
 - Daemon file/cache/lock/conflict/transfer/snapshot/workset/collaboration/audit **read spines** plus low-risk mutations (`file.write`, `file.read`, `cache.pin`, `cache.unpin`, `cache.hydrate`, `cache.dehydrate`, `cache.verify`, `lock.acquire`, `lock.release`, `lock.extend`).
 - `mcp serve` stdio seam: `initialize`, `ping`, `tools/list` (generated from `known_methods`).
-- FUSE: `biohazardfs-fuse mount` (read-only source-backed) and `biohazardfs-fuse mount-workspace` (read-write daemon-backed, hydrate-on-open, write/flush/fsync through `file.write`, dirty-data-never-lost). Linux only; smoke in `scripts/ci/fuse-smoke.sh`.
+- FUSE: `biohazardfs-fuse mount` (read-only source-backed) and `biohazardfs-fuse mount-workspace` (read-write daemon-backed, hydrate-on-open, mkdir/rename through daemon namespace methods, write/flush/fsync through `file.write`, dirty-data-never-lost). Linux/macOS with a FUSE runtime; smoke in `scripts/ci/fuse-smoke.sh`.
 
 ### Scaffold (typed + wired + tested seam, returns `method_not_implemented` or a typed stub)
 

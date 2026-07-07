@@ -38,10 +38,17 @@ type Props = {
   snapshot: DaemonSnapshot;
   loaded: boolean;
   onOpenDrive: () => void;
+  desktopMountPath: string | null;
   refreshNonce: number;
 };
 
-export function MyWorkView({ snapshot, loaded, onOpenDrive, refreshNonce }: Props) {
+export function MyWorkView({
+  snapshot,
+  loaded,
+  onOpenDrive,
+  desktopMountPath,
+  refreshNonce,
+}: Props) {
   const cacheStatus = extractData(snapshot.cacheStatus);
   const transferData = extractData(snapshot.transferList);
   const conflictData = extractData(snapshot.conflictList);
@@ -70,8 +77,9 @@ export function MyWorkView({ snapshot, loaded, onOpenDrive, refreshNonce }: Prop
   const mountStatusData = extractData(snapshot.mountStatus);
   const mountListData = extractData(snapshot.mountList);
   const worksetEntries = entryList(worksets.data, ['entries', 'worksets', 'items']);
-  const mounted = mountAttached(mountStatusData);
-  const mountPath = mountPathFromList(mountListData);
+  const daemonMounted = mountAttached(mountStatusData);
+  const mounted = daemonMounted || desktopMountPath !== null;
+  const mountPath = mountPathFromList(mountListData) || desktopMountPath || '';
 
   if (!loaded) return <ViewLoading rows={6} />;
 

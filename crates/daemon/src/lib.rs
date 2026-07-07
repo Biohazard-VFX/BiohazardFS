@@ -289,6 +289,8 @@ fn dispatch_method(
         "file.versions" => b::file_versions_payload(backend, params),
         "file.write" => b::file_write_payload(backend, params, source),
         "file.read" => b::file_read_payload(backend, params),
+        "file.mkdir" => b::file_mkdir_payload(backend, params, source),
+        "file.rename" => b::file_rename_payload(backend, params, source),
         "file.restore" | "file.delete" | "file.move" | "file.copy" => Err(not_implemented(method)),
 
         // ----- cache -----
@@ -493,18 +495,23 @@ fn workspace_list_payload(params: &Value) -> Result<Value, ApiError> {
         if entries.len() >= 500 {
             break;
         }
-        let entry = entry.map_err(|_| {
-            ApiError::new(
-                "workspace_unavailable",
-                "could not read workspace directory entry",
-            )
-        })?;
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| {
-            ApiError::new("workspace_unavailable", "could not inspect workspace entry")
-        })?;
-        let file_type = entry.file_type().map_err(|_| {
-            ApiError::new("workspace_unavailable", "could not inspect workspace entry")
-        })?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if name_text == ".VolumeIcon.icns"
+            || name_text == ".DS_Store"
+            || name_text.starts_with("._")
+        {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let kind = if file_type.is_symlink() {
             "symlink"
         } else if file_type.is_dir() {
@@ -515,7 +522,7 @@ fn workspace_list_payload(params: &Value) -> Result<Value, ApiError> {
             "other"
         };
         entries.push(serde_json::json!({
-            "name": entry.file_name().to_string_lossy(),
+            "name": name.to_string_lossy(),
             "kind": kind,
             "size_bytes": if file_type.is_file() { Some(metadata.len()) } else { None },
         }));

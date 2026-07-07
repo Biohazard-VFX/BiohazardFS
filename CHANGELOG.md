@@ -18,6 +18,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Added
 
+- macOS FUSE support for the `biohazardfs-fuse` adapter when macFUSE is installed and approved, including desktop IPC to launch a daemon-backed `/Volumes/Biohazard` Finder-visible workspace mount with an owner-only local token, per-user cache directory, BiohazardFS volume icon metadata, and daemon-backed directory create/rename support for Finder.
 - Biohazard Workspace desktop UI rebuilt as a LucidLink-style client: sidebar navigation (Files, Activity, Cache, Conflicts, Settings) with live status badges and a cache-usage footer, topbar with sync-status pill and filter, status bar, and five views with loading/empty/error states. Real shadcn/ui (Radix) primitives replace the hand-rolled scaffold CSS. The raw daemon-diagnostics dump moved into Settings → Diagnostics, out of the default artist flow. All daemon IPC, loopback/token safety, and the renderer's defensive parsing + sync guards (dirty-file dehydration guard, clear-all-local-cache refuse-while-dirty, keep-last-good on dropout, lock default-to-locked) are preserved and now unit-tested. Dark theme by default; accent `#dd4132`.
 - Vitest added for the Electron renderer with unit coverage of the safety-critical pure helpers (`isDirtyEntry`, `keepLastGood`, `computeProgress`, `formatBytes`, `extractData`/`extractError`, `entryList`, `stateLabel`).
 - Archiv Grotesk wired as the primary UI typeface for the dev/preview build.
@@ -69,6 +70,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) st
 
 ### Changed
 
+- `scripts/ci/fuse-smoke.sh` now runs on Linux and macOS, skipping safely when the platform FUSE runtime is unavailable or macFUSE still needs Privacy & Security approval.
 - Biohazard Workspace now uses app-owned frameless chrome by default on macOS, with traffic-light window controls drawn inside the UI.
 - CLI: the `object get` and `file get` local-file flag is renamed from `--output <path>` to `--out <path>`. `--output <json|ndjson|text>` is now the global output-format flag, matching `docs/reference/COMMANDS.md`.
 - Daemon `dispatch_rpc` is now stateful: `dispatch_rpc(backend: &DaemonBackend, request: &DaemonRequest)`. `DevLoopbackConfig` carries an `Arc<DaemonBackend>`; construct via `DevLoopbackConfig::new(addr, token)` or `DevLoopbackConfig::with_backend(addr, token, backend)`. `DaemonHttpClient` and `call::<T>` are unchanged.

@@ -571,23 +571,74 @@ pub fn config_get_payload(params: &Value) -> Result<Value, ApiError> {
 // ---- mount ----
 
 pub fn mount_status_payload(backend: &DaemonBackend) -> Result<Value, ApiError> {
-    let inner = backend.lock();
-    let attached = inner.mounts.iter().any(|mount| mount.attached);
+    let mounts = effective_mounts(backend);
+    let attached = mounts.iter().any(|mount| mount.attached);
     Ok(serde_json::json!({
         "attached": attached,
-        "mounts": inner.mounts.len(),
+        "mounts": mounts.len(),
+        "mount_path": mounts.iter().find(|mount| mount.attached).map(|mount| mount.mount_path.clone()),
         "transport": "dev_loopback_http_json_rpc",
     }))
 }
 
 pub fn mount_list_payload(backend: &DaemonBackend) -> Result<Value, ApiError> {
-    let inner = backend.lock();
-    let mounts: Vec<Value> = inner
-        .mounts
+    let mounts: Vec<Value> = effective_mounts(backend)
         .iter()
         .map(|mount| serde_json::to_value(mount).unwrap_or(Value::Null))
         .collect();
     Ok(serde_json::json!({"mounts": mounts}))
+}
+
+fn effective_mounts(backend: &DaemonBackend) -> Vec<MountRecord> {
+    let inner = backend.lock();
+    let mut mounts = inner.mounts.clone();
+    drop(inner);
+
+    if mounts.iter().any(|mount| mount.attached) {
+        return mounts;
+    }
+    let Some(root) = std::env::var_os("BIOHAZARDFS_WORKSPACE_ROOT") else {
+        return mounts;
+    };
+    let root = std::path::PathBuf::from(root);
+    if root.is_dir() && path_is_biohazard_mount(&root) {
+        mounts.push(MountRecord {
+            mount_id: "mount_local_workspace".to_string(),
+            root_node_id: "node_root".to_string(),
+            mount_path: root.to_string_lossy().to_string(),
+            attached: true,
+            read_only: false,
+            transport: "fuse".to_string(),
+        });
+    }
+    mounts
+}
+
+fn path_is_biohazard_mount(path: &std::path::Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Ok(output) = std::process::Command::new("/sbin/mount").output() else {
+            return false;
+        };
+        let mount_path = path.to_string_lossy();
+        String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            if !line.contains(&format!(" on {mount_path} ")) {
+                return false;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                line.starts_with("Biohazard on ") && line.contains("macfuse")
+            }
+            #[cfg(target_os = "linux")]
+            {
+                line.contains("fuse.biohazardfs") || line.contains("biohazardfs-fuse")
+            }
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 // ---- file ----
@@ -980,6 +1031,236 @@ pub fn file_write_payload(
         "size_bytes": version.size_bytes,
         "operation_id": operation_id,
         "created": created,
+    }))
+}
+
+/// `file.mkdir`: create a directory under a live directory parent. This is a
+/// low-risk mounted-filesystem operation: it is durable in the daemon namespace
+/// scaffold and enforces the same case-insensitive sibling uniqueness as file
+/// creation.
+pub fn file_mkdir_payload(
+    backend: &DaemonBackend,
+    params: &Value,
+    source: Source,
+) -> Result<Value, ApiError> {
+    let parent_id = require_str_param(params, "parent_node_id")?;
+    validate_node_id(parent_id).map_err(core_error_to_api)?;
+    let name = require_str_param(params, "name")?;
+    biohazardfs_core::path::validate_file_name(name).map_err(core_error_to_api)?;
+    let mode = params
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0o755")
+        .to_string();
+    let now = timestamp();
+
+    let mut inner = backend.lock();
+    let parent = inner
+        .nodes
+        .get(parent_id)
+        .cloned()
+        .filter(Node::is_live)
+        .ok_or_else(|| {
+            ApiError::new(
+                "node_not_found",
+                format!("parent node {parent_id} was not found"),
+            )
+        })?;
+    if parent.kind != NodeKind::Directory {
+        return Err(ApiError::with_details(
+            "parent_not_directory",
+            "parent node must be a directory to create a directory",
+            serde_json::json!({"parent_node_id": parent_id}),
+        ));
+    }
+    let sibling_key = case_insensitive_sibling_key(name);
+    let conflict = inner.nodes.values().any(|candidate| {
+        candidate.is_live()
+            && candidate.parent_node_id.as_deref() == Some(parent_id)
+            && case_insensitive_sibling_key(&candidate.name) == sibling_key
+    });
+    if conflict {
+        return Err(ApiError::with_details(
+            "sibling_name_conflict",
+            "a sibling with the same case-insensitive name already exists",
+            serde_json::json!({"parent_node_id": parent_id, "name": name}),
+        ));
+    }
+
+    let node = Node {
+        org_id: inner.org_id.clone(),
+        node_id: generate_id(NODE_ID_PREFIX),
+        project_id: parent.project_id.clone(),
+        parent_node_id: Some(parent_id.to_string()),
+        name: name.to_string(),
+        kind: NodeKind::Directory,
+        current_version_id: None,
+        target: None,
+        mode: Some(mode),
+        owner_user_id: None,
+        created_at: now.clone(),
+        created_by: None,
+        updated_at: now,
+        updated_by: None,
+        deleted_at: None,
+        deleted_by: None,
+        trash_id: None,
+        path_cache: None,
+    };
+    let node_id = node.node_id.clone();
+    inner.nodes.insert(node_id.clone(), node.clone());
+    drop(inner);
+    backend.record_event(
+        biohazardfs_api_types::event_types::FILE_CHANGED,
+        serde_json::json!({"node_id": node_id, "kind": "directory", "operation": "mkdir"}),
+    );
+    backend.record_audit(
+        "file.mkdir",
+        source,
+        None,
+        Some(node_id.clone()),
+        None,
+        None,
+        AuditEventResult::Success,
+        Some(serde_json::json!({"parent_node_id": parent_id, "name": name}).to_string()),
+    );
+    Ok(serde_json::json!({
+        "created": true,
+        "node_id": node_id,
+        "parent_node_id": parent_id,
+        "name": name,
+        "kind": "directory",
+        "mode": node.mode,
+    }))
+}
+
+/// `file.rename`: rename or move a live node within the mounted workspace
+/// namespace. Unlike the guarded `file.move` product operation, this low-risk
+/// spine exists for the local FUSE adapter so Finder rename can update daemon
+/// truth before the kernel is acknowledged.
+pub fn file_rename_payload(
+    backend: &DaemonBackend,
+    params: &Value,
+    source: Source,
+) -> Result<Value, ApiError> {
+    let node_id = require_str_param(params, "node_id")?;
+    validate_node_id(node_id).map_err(core_error_to_api)?;
+    let new_parent_id = require_str_param(params, "new_parent_node_id")?;
+    validate_node_id(new_parent_id).map_err(core_error_to_api)?;
+    let new_name = require_str_param(params, "new_name")?;
+    biohazardfs_core::path::validate_file_name(new_name).map_err(core_error_to_api)?;
+    let replace_existing = params
+        .get("replace_existing")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if replace_existing {
+        return Err(ApiError::new(
+            "replace_not_supported",
+            "rename replacement is disabled until delete/trash preservation is implemented",
+        ));
+    }
+    let now = timestamp();
+
+    let mut inner = backend.lock();
+    let node = inner
+        .nodes
+        .get(node_id)
+        .cloned()
+        .filter(Node::is_live)
+        .ok_or_else(|| ApiError::new("node_not_found", format!("node {node_id} was not found")))?;
+    if node.parent_node_id.is_none() {
+        return Err(ApiError::new(
+            "cannot_rename_root",
+            "the workspace root cannot be renamed",
+        ));
+    }
+    if new_parent_id == node_id {
+        return Err(ApiError::new(
+            "namespace_cycle",
+            "a node cannot be moved under itself",
+        ));
+    }
+    let mut ancestor = Some(new_parent_id.to_string());
+    while let Some(ancestor_id) = ancestor {
+        if ancestor_id == node_id {
+            return Err(ApiError::new(
+                "namespace_cycle",
+                "a directory cannot be moved under one of its descendants",
+            ));
+        }
+        ancestor = inner
+            .nodes
+            .get(&ancestor_id)
+            .and_then(|candidate| candidate.parent_node_id.clone());
+    }
+
+    let parent = inner
+        .nodes
+        .get(new_parent_id)
+        .cloned()
+        .filter(Node::is_live)
+        .ok_or_else(|| {
+            ApiError::new(
+                "node_not_found",
+                format!("parent node {new_parent_id} was not found"),
+            )
+        })?;
+    if parent.kind != NodeKind::Directory {
+        return Err(ApiError::with_details(
+            "parent_not_directory",
+            "new parent node must be a directory",
+            serde_json::json!({"new_parent_node_id": new_parent_id}),
+        ));
+    }
+    let sibling_key = case_insensitive_sibling_key(new_name);
+    let conflict_node = inner
+        .nodes
+        .values()
+        .find(|candidate| {
+            candidate.is_live()
+                && candidate.node_id != node_id
+                && candidate.parent_node_id.as_deref() == Some(new_parent_id)
+                && case_insensitive_sibling_key(&candidate.name) == sibling_key
+        })
+        .cloned();
+    if conflict_node.is_some() {
+        return Err(ApiError::with_details(
+            "sibling_name_conflict",
+            "a sibling with the same case-insensitive name already exists",
+            serde_json::json!({"parent_node_id": new_parent_id, "name": new_name}),
+        ));
+    }
+
+    let updated = inner
+        .nodes
+        .get_mut(node_id)
+        .expect("node existence checked before mutable lookup");
+    updated.parent_node_id = Some(new_parent_id.to_string());
+    updated.name = new_name.to_string();
+    updated.updated_at = now;
+    drop(inner);
+    backend.record_event(
+        biohazardfs_api_types::event_types::FILE_CHANGED,
+        serde_json::json!({"node_id": node_id, "operation": "rename"}),
+    );
+    backend.record_audit(
+        "file.rename",
+        source,
+        None,
+        Some(node_id.to_string()),
+        None,
+        None,
+        AuditEventResult::Success,
+        Some(
+            serde_json::json!({"new_parent_node_id": new_parent_id, "new_name": new_name})
+                .to_string(),
+        ),
+    );
+    Ok(serde_json::json!({
+        "renamed": true,
+        "node_id": node_id,
+        "parent_node_id": new_parent_id,
+        "name": new_name,
     }))
 }
 

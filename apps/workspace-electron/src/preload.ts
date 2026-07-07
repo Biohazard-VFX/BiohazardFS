@@ -34,6 +34,18 @@ async function workspaceList(path = ''): Promise<WorkspaceListResult> {
   return (await ipcRenderer.invoke('workspace:list', path)) as WorkspaceListResult;
 }
 
+async function workspaceMount(): Promise<{
+  ok: boolean;
+  mountpoint: string | null;
+  error: string | null;
+}> {
+  return (await ipcRenderer.invoke('workspace:mount')) as {
+    ok: boolean;
+    mountpoint: string | null;
+    error: string | null;
+  };
+}
+
 async function cacheStatus(): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('cache:status')) as DaemonStatusResult;
 }
@@ -184,6 +196,7 @@ contextBridge.exposeInMainWorld('biohazardfs', {
   daemonStatus,
   workspaceStatus,
   workspaceList,
+  workspaceMount,
   cacheStatus,
   cacheList,
   cachePin,

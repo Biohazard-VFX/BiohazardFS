@@ -1,16 +1,15 @@
-//! Linux FUSE adapter for BiohazardFS.
+//! FUSE adapter for BiohazardFS.
 //!
-//! This first slice is intentionally read-only and source-backed: it mounts a
-//! safe virtual view of an existing workspace/source directory. It gives the
-//! product a real mount path while the daemon/server cache and writeback layers
-//! are still evolving.
+//! This first slice supports Linux and macOS systems with a FUSE runtime
+//! installed. It exposes a safe source-backed read-only view and a daemon-backed
+//! workspace mount while the production placeholder drivers are still evolving.
 
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use unix::{
     MountConfig, ReadOnlyWorkspaceFs, WorkspaceFs, WorkspaceIndex, WorkspaceMountConfig,
     mount_read_only_workspace, mount_workspace,
@@ -129,15 +128,15 @@ pub fn validate_mount_inputs(source: &Path, mountpoint: &Path) -> Result<(PathBu
     Ok((canonical_source, canonical_mountpoint))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn mount_read_only_workspace(_config: MountConfig) -> Result<()> {
     Err(FuseError::new(
         FuseErrorKind::UnsupportedPlatform,
-        "BiohazardFS FUSE mounts are currently supported only on Linux platforms",
+        "BiohazardFS FUSE mounts require Linux or macOS with a FUSE runtime installed",
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug, Clone)]
 pub struct MountConfig {
     pub source: PathBuf,
@@ -145,7 +144,7 @@ pub struct MountConfig {
     pub foreground: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug, Clone)]
 pub struct WorkspaceMountConfig {
     pub daemon_endpoint: String,
@@ -155,10 +154,10 @@ pub struct WorkspaceMountConfig {
     pub foreground: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn mount_workspace(_config: WorkspaceMountConfig) -> Result<()> {
     Err(FuseError::new(
         FuseErrorKind::UnsupportedPlatform,
-        "BiohazardFS FUSE mounts are currently supported only on Linux platforms",
+        "BiohazardFS FUSE mounts require Linux or macOS with a FUSE runtime installed",
     ))
 }

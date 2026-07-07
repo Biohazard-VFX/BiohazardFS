@@ -3,7 +3,6 @@ import { CheckCircle2, Circle, LoaderCircle, TriangleAlert } from 'lucide-react'
 
 import { type DaemonSnapshot } from '@/lib/use-daemon';
 import { useDaemonFetch } from '@/lib/use-fetch';
-import { isStubbed } from '@/lib/daemon-capabilities';
 import { asString, extractData } from '@/lib/daemon';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -23,13 +22,21 @@ type Props = {
   snapshot: DaemonSnapshot;
   onClose: () => void;
   onOpenDrive: () => void;
+  onMountWorkspace: () => Promise<{ ok: boolean; mountpoint: string | null; error: string | null }>;
   frameless: boolean;
   platform?: string;
 };
 
 const STEPS = ['Welcome', 'Workstation', 'Mount', 'Access', 'Ready'] as const;
 
-export function Onboarding({ snapshot, onClose, onOpenDrive, frameless, platform }: Props) {
+export function Onboarding({
+  snapshot,
+  onClose,
+  onOpenDrive,
+  onMountWorkspace,
+  frameless,
+  platform,
+}: Props) {
   const [step, setStep] = useState(0);
 
   const workspaceData = extractData(snapshot.workspace);
@@ -108,7 +115,7 @@ export function Onboarding({ snapshot, onClose, onOpenDrive, frameless, platform
             ) : step === 1 ? (
               <PreflightStep reachable={reachable} workspaceReady={workspaceReady} />
             ) : step === 2 ? (
-              <MountStep workspaceRoot={workspaceRoot} />
+              <MountStep workspaceRoot={workspaceRoot} onMountWorkspace={onMountWorkspace} />
             ) : step === 3 ? (
               <AccessStep />
             ) : (
@@ -219,28 +226,41 @@ function PreflightStep({
   );
 }
 
-function MountStep({ workspaceRoot }: { workspaceRoot: string }) {
-  const canAttach = !isStubbed('mount.attach');
+function MountStep({
+  workspaceRoot,
+  onMountWorkspace,
+}: {
+  workspaceRoot: string;
+  onMountWorkspace: () => Promise<{ ok: boolean; mountpoint: string | null; error: string | null }>;
+}) {
+  const [mounting, setMounting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function mount() {
+    setMounting(true);
+    setMessage(null);
+    try {
+      const result = await onMountWorkspace();
+      setMessage(result.ok ? `Mounted at ${result.mountpoint}` : (result.error ?? 'Mount failed'));
+    } finally {
+      setMounting(false);
+    }
+  }
+
   return (
     <section className="flex flex-col gap-3">
       <H>Mount &amp; cache</H>
       <Lead>Defaults are preselected. Mount attaches the studio namespace to a stable path.</Lead>
       <KV label="Mount path" value={workspaceRoot || '(not configured)'} mono />
       <KV label="Cache" value="user-local cache directory (default)" mono />
-      <Button
-        size="sm"
-        className="w-fit"
-        disabled={!canAttach}
-        title={canAttach ? undefined : 'Requires daemon support (mount.attach not built)'}
-      >
-        Mount Studio
+      <Button size="sm" className="w-fit" disabled={mounting} onClick={() => void mount()}>
+        {mounting ? 'Mounting…' : 'Mount Studio'}
       </Button>
-      {!canAttach ? (
-        <p className="text-muted-foreground text-xs">
-          Mount attach is daemon-gated (mount.attach returns method_not_implemented). The local
-          workspace is already mounted in this preview.
-        </p>
-      ) : null}
+      {message ? <p className="text-muted-foreground text-xs">{message}</p> : null}
+      <p className="text-muted-foreground text-xs">
+        macOS requires macFUSE approval in System Settings → Privacy & Security before the mount can
+        become active.
+      </p>
     </section>
   );
 }

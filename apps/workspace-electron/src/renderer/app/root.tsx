@@ -63,6 +63,7 @@ export function Root() {
   // opened manually from the studio rail for review (the seeded daemon always
   // has a workspace, so it won't auto-trigger in the preview).
   const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [desktopMountPath, setDesktopMountPath] = useState<string | null>(null);
   const [onboardingDismissed, setOnboardingDismissedState] = useState(() => {
     try {
       return localStorage.getItem(ONBOARDING_DISMISSED_STORAGE_KEY) === 'true';
@@ -173,6 +174,12 @@ export function Root() {
           setOnboardingDismissed(true);
           setView('drive');
         }}
+        onMountWorkspace={async () => {
+          const result = await window.biohazardfs.workspaceMount();
+          if (result.ok) setDesktopMountPath(result.mountpoint);
+          await refresh();
+          return result;
+        }}
         frameless={appInfo?.frameless ?? false}
         platform={appInfo?.platform}
       />
@@ -228,6 +235,7 @@ export function Root() {
                 onOpenDrive={() => {
                   setView('drive');
                 }}
+                desktopMountPath={desktopMountPath}
                 refreshNonce={refreshNonce}
               />
             ) : view === 'connection' ? (
