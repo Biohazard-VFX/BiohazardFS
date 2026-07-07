@@ -97,6 +97,8 @@ export function SettingsView({ snapshot }: Props) {
 
         <CacheLimitSection />
 
+        <ServerSyncSection />
+
         <AppearanceSection />
 
         <WindowSection />
@@ -432,6 +434,165 @@ function WindowSection() {
             </Button>
           </div>
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// Server sync profile: connect this BiohazardFS client to a control-plane
+// server (URL + bearer token). Saving persists an owner-only profile and
+// restarts the managed daemon so it picks up the new env; Push/Pull run the
+// daemon's sync.push / sync.pull against the configured server.
+function ServerSyncSection() {
+  const [serverUrl, setServerUrl] = useState('');
+  const [serverToken, setServerToken] = useState('');
+  const [allowPlaintext, setAllowPlaintext] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+
+  if (!loaded) {
+    setLoaded(true);
+    void window.biohazardfs.syncProfileGet().then((p) => {
+      setServerUrl(p.serverUrl);
+      setServerToken(p.serverToken);
+      setAllowPlaintext(p.allowPlaintext);
+    });
+  }
+
+  function note(ok: boolean, text: string) {
+    setFeedback({ ok, text });
+  }
+
+  async function save() {
+    if (!serverUrl.trim() || !serverToken.trim()) {
+      note(false, 'Server URL and token are required.');
+      return;
+    }
+    if (!/^https?:\/\//i.test(serverUrl.trim())) {
+      note(false, 'Server URL must start with http:// or https://');
+      return;
+    }
+    setBusy(true);
+    setFeedback(null);
+    const result = await window.biohazardfs.syncProfileSet({
+      serverUrl: serverUrl.trim(),
+      serverToken: serverToken.trim(),
+      allowPlaintext,
+    });
+    setBusy(false);
+    note(
+      result.ok,
+      result.ok ? 'Saved. Daemon restarted to apply.' : (result.error ?? 'Could not save.'),
+    );
+  }
+
+  async function run(action: 'push' | 'pull' | 'status') {
+    setBusy(true);
+    setFeedback(null);
+    const fn =
+      action === 'push'
+        ? window.biohazardfs.syncPush
+        : action === 'pull'
+          ? window.biohazardfs.syncPull
+          : window.biohazardfs.syncStatus;
+    const result = await fn();
+    setBusy(false);
+    if (!result.ok) {
+      const code = (result.body as { error?: { code?: string; message?: string } } | undefined)
+        ?.error;
+      note(
+        false,
+        code ? `${code.code ?? ''}: ${code.message ?? ''}` : (result.error ?? 'Sync failed.'),
+      );
+      return;
+    }
+    const data = (result.body as { data?: Record<string, unknown> } | undefined)?.data;
+    if (action === 'status') {
+      note(true, data?.server_configured ? 'Server configured.' : 'No server configured.');
+    } else {
+      const num = (v: unknown) => (typeof v === 'number' ? String(v) : '0');
+      const dirs = num(data?.directories);
+      const files = num(data?.files);
+      const skipped = num(data?.skipped_files ?? data?.skipped_conflicts);
+      note(true, `${action}: ${dirs} dir(s), ${files} file(s), ${skipped} skipped.`);
+    }
+  }
+
+  return (
+    <Card className="py-4">
+      <CardHeader className="pb-0">
+        <CardTitle className="text-sm">Server sync</CardTitle>
+        <CardDescription>
+          Connect this client to a BiohazardFS control-plane server. Push sends local changes; Pull
+          fetches remote files into the mount.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2">
+        <Input
+          value={serverUrl}
+          onChange={(e) => {
+            setServerUrl(e.target.value);
+          }}
+          placeholder="http://192.168.1.128:30088"
+          aria-label="Server URL"
+          className="font-mono"
+          spellCheck={false}
+        />
+        <Input
+          value={serverToken}
+          onChange={(e) => {
+            setServerToken(e.target.value);
+          }}
+          placeholder="bearer token"
+          aria-label="Server token"
+          type="password"
+          className="font-mono"
+          spellCheck={false}
+        />
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={allowPlaintext}
+            onChange={(e) => {
+              setAllowPlaintext(e.target.checked);
+            }}
+          />
+          Allow plaintext http:// for non-loopback servers (LAN/dev only)
+        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" size="sm" disabled={busy} onClick={() => void save()}>
+            {busy ? 'Working…' : 'Save & apply'}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => void run('push')}
+          >
+            Push
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => void run('pull')}
+          >
+            Pull
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => void run('status')}
+          >
+            Status
+          </Button>
+        </div>
+        {feedback ? <Feedback ok={feedback.ok}>{feedback.text}</Feedback> : null}
       </CardContent>
     </Card>
   );

@@ -191,7 +191,7 @@ export function Root() {
   return (
     <ActionContext.Provider value={actions}>
       <div className="text-foreground relative flex h-screen w-screen overflow-hidden bg-background">
-        {macFrameless ? <WindowChromeOverlay platform={appInfo?.platform} /> : null}
+        {macFrameless ? <WindowChromeOverlay platform={appInfo.platform} /> : null}
         <StudioRail
           reachable={daemonReachable(snapshot)}
           macWindowControls={macFrameless}

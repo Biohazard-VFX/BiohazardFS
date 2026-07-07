@@ -19,7 +19,7 @@ vi.mock('@/lib/use-daemon', () => ({
     snapshot: unconfiguredSnapshot,
     loaded: true,
     lastUpdated: null,
-    refresh: vi.fn(async () => undefined),
+    refresh: vi.fn(() => Promise.resolve()),
   }),
 }));
 

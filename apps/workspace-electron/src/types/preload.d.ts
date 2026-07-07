@@ -10,6 +10,11 @@ export type TransferIdParams = { transfer_id?: string };
 export type LockIdParams = { lock_id: string };
 export type LockExtendParams = { lock_id: string; extend_seconds: number };
 export type ConfigSetParams = { key: string; value: string };
+export type ServerSyncProfile = {
+  serverUrl: string;
+  serverToken: string;
+  allowPlaintext: boolean;
+};
 export type VersionInfo = { app: string; electron: string; chrome: string; node: string };
 
 export type WindowChrome = 'auto' | 'native' | 'frameless';
@@ -62,6 +67,13 @@ declare global {
       lockRelease: (params: LockIdParams) => Promise<DaemonStatusResult>;
       lockExtend: (params: LockExtendParams) => Promise<DaemonStatusResult>;
       configSet: (params: ConfigSetParams) => Promise<DaemonStatusResult>;
+      syncProfileGet: () => Promise<ServerSyncProfile>;
+      syncProfileSet: (
+        profile: ServerSyncProfile,
+      ) => Promise<DaemonStatusResult & { profile?: ServerSyncProfile }>;
+      syncStatus: () => Promise<DaemonStatusResult>;
+      syncPush: () => Promise<DaemonStatusResult>;
+      syncPull: () => Promise<DaemonStatusResult>;
       versions: () => Promise<VersionInfo>;
       rpc: (method: string, params?: Record<string, unknown>) => Promise<DaemonStatusResult>;
       openPath: (target: string) => Promise<{ ok: boolean; error: string | null }>;

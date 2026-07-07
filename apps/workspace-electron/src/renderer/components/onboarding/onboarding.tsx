@@ -241,7 +241,9 @@ function MountStep({
     setMessage(null);
     try {
       const result = await onMountWorkspace();
-      setMessage(result.ok ? `Mounted at ${result.mountpoint}` : (result.error ?? 'Mount failed'));
+      setMessage(
+        result.ok ? `Mounted at ${result.mountpoint ?? '?'}` : (result.error ?? 'Mount failed'),
+      );
     } finally {
       setMounting(false);
     }

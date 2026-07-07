@@ -133,6 +133,68 @@ async function ensureLocalToken(): Promise<string> {
   return localToken;
 }
 
+// Owner-only server sync profile. The desktop stores the BiohazardFS server
+// URL + bearer token here and injects them into the managed daemon's env so
+// the daemon's sync.push/sync.pull can reach the control plane. Stored
+// owner-only (0600) like the daemon token; never logged.
+export type ServerSyncProfile = {
+  serverUrl: string;
+  serverToken: string;
+  allowPlaintext: boolean;
+};
+
+function serverSyncProfilePath(): string {
+  return path.join(app.getPath('userData'), 'server-sync.json');
+}
+
+async function loadServerSyncProfile(): Promise<ServerSyncProfile> {
+  try {
+    const raw = await fs.readFile(serverSyncProfilePath(), 'utf8');
+    const parsed = JSON.parse(raw) as Partial<ServerSyncProfile>;
+    return {
+      serverUrl: typeof parsed.serverUrl === 'string' ? parsed.serverUrl : '',
+      serverToken: typeof parsed.serverToken === 'string' ? parsed.serverToken : '',
+      allowPlaintext: parsed.allowPlaintext === true,
+    };
+  } catch {
+    return { serverUrl: '', serverToken: '', allowPlaintext: false };
+  }
+}
+
+async function saveServerSyncProfile(profile: ServerSyncProfile): Promise<ServerSyncProfile> {
+  const normalized: ServerSyncProfile = {
+    serverUrl: profile.serverUrl.trim(),
+    serverToken: profile.serverToken.trim(),
+    allowPlaintext: profile.allowPlaintext,
+  };
+  await fs.mkdir(path.dirname(serverSyncProfilePath()), { recursive: true });
+  await fs.writeFile(serverSyncProfilePath(), JSON.stringify(normalized, null, 2) + '\n', {
+    mode: 0o600,
+  });
+  await fs.chmod(serverSyncProfilePath(), 0o600).catch(() => undefined);
+  return normalized;
+}
+
+// Restart the managed daemon + FUSE mount so a freshly saved server sync
+// profile (which the daemon only reads from its env at startup) takes effect.
+async function bounceManagedStack(): Promise<void> {
+  unmountManagedWorkspaceSync();
+  if (managedWorkspaceMount && !managedWorkspaceMount.child.killed) {
+    managedWorkspaceMount.child.kill();
+  }
+  managedWorkspaceMount = null;
+  if (managedDaemon && !managedDaemon.killed) {
+    managedDaemon.kill();
+  }
+  managedDaemon = null;
+  // Give the OS a moment to release the port / mountpoint.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await ensureManagedDaemon();
+  if (!IS_SMOKE) {
+    void mountWorkspace();
+  }
+}
+
 async function waitForDaemonReady(timeoutMs = 2500): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -166,6 +228,16 @@ async function ensureManagedDaemon(): Promise<void> {
   };
   if (process.platform !== 'win32') {
     daemonEnv.BIOHAZARDFS_STATE_PATH = path.join(app.getPath('userData'), 'daemon-state.json');
+  }
+  // Inject the persisted server sync profile so sync.push/sync.pull can reach
+  // the configured control plane. The daemon reads these only at startup.
+  const syncProfile = await loadServerSyncProfile();
+  if (syncProfile.serverUrl && syncProfile.serverToken) {
+    daemonEnv.BIOHAZARDFS_SERVER_URL = syncProfile.serverUrl;
+    daemonEnv.BIOHAZARDFS_SERVER_TOKEN = syncProfile.serverToken;
+    if (syncProfile.allowPlaintext) {
+      daemonEnv.BIOHAZARDFS_ALLOW_PLAINTEXT_SERVER = '1';
+    }
   }
 
   const child = spawn(binary, ['--dev-loopback-http', '--addr', DAEMON_ENDPOINT], {
@@ -240,7 +312,7 @@ async function ensureMacVolumeMountpoint(): Promise<string | null> {
   if (await fileExists(DEFAULT_MAC_VOLUME_MOUNTPOINT)) return DEFAULT_MAC_VOLUME_MOUNTPOINT;
   const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
   const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
-  const script = `do shell script "mkdir -p ${DEFAULT_MAC_VOLUME_MOUNTPOINT}; chown ${uid}:${gid} ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true; chmod 755 ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true" with administrator privileges`;
+  const script = `do shell script "mkdir -p ${DEFAULT_MAC_VOLUME_MOUNTPOINT}; chown ${String(uid)}:${String(gid)} ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true; chmod 755 ${DEFAULT_MAC_VOLUME_MOUNTPOINT} || true" with administrator privileges`;
   spawnSync('/usr/bin/osascript', ['-e', script], { stdio: 'ignore' });
   return (await fileExists(DEFAULT_MAC_VOLUME_MOUNTPOINT)) ? DEFAULT_MAC_VOLUME_MOUNTPOINT : null;
 }
@@ -653,6 +725,26 @@ ipcMain.handle('daemon:rpc', (_event, payload: unknown) => {
   }
   return daemonRpc(method, rpcPayloadParams(payload));
 });
+
+// --- server sync profile + sync actions -------------------------------------
+ipcMain.handle('sync:profile.get', () => loadServerSyncProfile());
+ipcMain.handle('sync:profile.set', async (_event, profile: unknown) => {
+  if (!profile || typeof profile !== 'object') {
+    return { ok: false, error: 'invalid profile' };
+  }
+  const p = profile as Partial<ServerSyncProfile>;
+  const saved = await saveServerSyncProfile({
+    serverUrl: typeof p.serverUrl === 'string' ? p.serverUrl : '',
+    serverToken: typeof p.serverToken === 'string' ? p.serverToken : '',
+    allowPlaintext: p.allowPlaintext === true,
+  });
+  // Restart the daemon stack so the daemon picks up the new env.
+  await bounceManagedStack();
+  return { ok: true, profile: saved };
+});
+ipcMain.handle('sync:status', () => daemonRpc('sync.status'));
+ipcMain.handle('sync:push', () => daemonRpc('sync.push'));
+ipcMain.handle('sync:pull', () => daemonRpc('sync.pull'));
 
 // Open a folder in the OS file manager (Finder / Explorer / Files). Main only
 // opens daemon-reported workspace/mount roots or their descendants, and only

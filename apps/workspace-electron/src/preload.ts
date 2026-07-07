@@ -98,6 +98,34 @@ async function configSet(params: ConfigSetParams): Promise<DaemonStatusResult> {
   return (await ipcRenderer.invoke('config:set', params)) as DaemonStatusResult;
 }
 
+type ServerSyncProfile = {
+  serverUrl: string;
+  serverToken: string;
+  allowPlaintext: boolean;
+};
+
+type SyncResult = DaemonStatusResult & { profile?: ServerSyncProfile };
+
+async function syncProfileGet(): Promise<ServerSyncProfile> {
+  return (await ipcRenderer.invoke('sync:profile.get')) as ServerSyncProfile;
+}
+
+async function syncProfileSet(profile: ServerSyncProfile): Promise<SyncResult> {
+  return (await ipcRenderer.invoke('sync:profile.set', profile)) as SyncResult;
+}
+
+async function syncStatus(): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('sync:status')) as DaemonStatusResult;
+}
+
+async function syncPush(): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('sync:push')) as DaemonStatusResult;
+}
+
+async function syncPull(): Promise<DaemonStatusResult> {
+  return (await ipcRenderer.invoke('sync:pull')) as DaemonStatusResult;
+}
+
 async function versions(): Promise<VersionInfo> {
   return (await ipcRenderer.invoke('app:versions')) as VersionInfo;
 }
@@ -210,6 +238,11 @@ contextBridge.exposeInMainWorld('biohazardfs', {
   lockRelease,
   lockExtend,
   configSet,
+  syncProfileGet,
+  syncProfileSet,
+  syncStatus,
+  syncPush,
+  syncPull,
   versions,
   rpc,
   openPath,
