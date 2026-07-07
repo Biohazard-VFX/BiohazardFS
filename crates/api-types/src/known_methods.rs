@@ -213,13 +213,13 @@ pub const DAEMON_METHODS: &[MethodDescriptor] = &[
     MethodDescriptor::daemon(
         "sync.push",
         "sync",
-        M::DataMoving,
+        M::LowRisk,
         "push local namespace/content to server",
     ),
     MethodDescriptor::daemon(
         "sync.pull",
         "sync",
-        M::DataMoving,
+        M::LowRisk,
         "pull server namespace/content into local cache",
     ),
     // transfer
