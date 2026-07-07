@@ -67,6 +67,7 @@ The Rust scaffold now parses TOML config files. Missing default config files are
 | `BIOHAZARDFS_CONFIG_FILE` | path | no | all | explicit config file |
 | `BIOHAZARDFS_CONFIG_DIR` | path | no | all | explicit config dir |
 | `BIOHAZARDFS_LOCAL_TOKEN` | string | yes | daemon/CLI/desktop | local owner token; never pass via argv |
+| `BIOHAZARDFS_STATE_PATH` | path | no | daemon/desktop | dev-loopback scaffold state file; Unix/macOS only until Windows owner-only ACL support lands; desktop sets an owner-only JSON file under user data on supported platforms |
 | `BIOHAZARDFS_SERVER_BIND` | host:port | no | server | default `127.0.0.1:8080`; containers set `0.0.0.0:8080` |
 | `BIOHAZARDFS_SERVER_PUBLIC_URL` | URL | no | server/clients | externally visible server URL |
 | `BIOHAZARDFS_DATABASE_URL` | URL | yes | server | Postgres connection URL; overrides `[database].url`; redact in output |

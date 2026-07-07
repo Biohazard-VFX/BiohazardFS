@@ -20,6 +20,9 @@
 //! a clear message rather than continuing on inconsistent state.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use biohazardfs_api_types::{
@@ -134,6 +137,158 @@ pub struct InMemoryBackend {
 #[derive(Debug, Clone)]
 pub struct DaemonBackend {
     pub inner: Arc<Mutex<InMemoryBackend>>,
+    persistence_path: Option<PathBuf>,
+    persistence_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentBackendState {
+    schema_version: u32,
+    org_id: String,
+    nodes: HashMap<String, Node>,
+    cache_entries: HashMap<String, CacheEntry>,
+    locks: HashMap<String, FileLock>,
+    conflicts: Vec<Conflict>,
+    transfers: Vec<TransferRecord>,
+    audit: Vec<AuditEvent>,
+    file_contents: HashMap<String, Vec<u8>>,
+    file_versions: HashMap<String, FileVersion>,
+    operations: Vec<Operation>,
+}
+
+impl PersistentBackendState {
+    fn from_inner(inner: &InMemoryBackend) -> Self {
+        Self {
+            schema_version: 1,
+            org_id: inner.org_id.clone(),
+            nodes: inner.nodes.clone(),
+            cache_entries: inner.cache_entries.clone(),
+            locks: inner.locks.clone(),
+            conflicts: inner.conflicts.clone(),
+            transfers: inner.transfers.clone(),
+            audit: inner.audit.clone(),
+            file_contents: inner.file_contents.clone(),
+            file_versions: inner.file_versions.clone(),
+            operations: inner.operations.clone(),
+        }
+    }
+
+    fn apply_to(self, inner: &mut InMemoryBackend) -> Result<(), ApiError> {
+        if self.schema_version != 1 {
+            return Err(ApiError::new(
+                "unsupported_state_schema",
+                "daemon persistent state schema is not supported by this build",
+            ));
+        }
+        inner.org_id = self.org_id;
+        inner.nodes = self.nodes;
+        inner.cache_entries = self.cache_entries;
+        inner.locks = self.locks;
+        inner.conflicts = self.conflicts;
+        inner.transfers = self.transfers;
+        inner.audit = self.audit;
+        inner.file_contents = self.file_contents;
+        inner.file_versions = self.file_versions;
+        inner.operations = self.operations;
+        Ok(())
+    }
+}
+
+fn protect_state_parent_for_write(parent: &std::path::Path) -> Result<(), ApiError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = fs::symlink_metadata(parent).map_err(|error| {
+            ApiError::new(
+                "state_dir_failed",
+                format!("could not inspect daemon state directory: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(ApiError::new(
+                "state_dir_unsafe",
+                "daemon persistent state parent must be a directory",
+            ));
+        }
+        // SAFETY: `getuid` reads the current process credentials and has no
+        // preconditions or memory-safety impact.
+        if metadata.uid() != unsafe { libc::getuid() } {
+            return Err(ApiError::new(
+                "state_dir_unsafe",
+                "daemon persistent state directory is not owned by the current user",
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                ApiError::new(
+                    "state_dir_failed",
+                    format!("could not protect daemon state directory: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Err(ApiError::new(
+            "state_persistence_unsupported",
+            "daemon JSON state persistence requires owner-only file permissions, which are not implemented on this platform",
+        ))
+    }
+}
+
+fn validate_state_file_for_load(path: &std::path::Path) -> Result<(), ApiError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            ApiError::new(
+                "state_metadata_failed",
+                format!("could not inspect daemon persistent state: {error}"),
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(ApiError::new(
+                "state_file_unsafe",
+                "daemon persistent state must be a regular file",
+            ));
+        }
+        // SAFETY: `getuid` reads the current process credentials and has no
+        // preconditions or memory-safety impact.
+        if metadata.uid() != unsafe { libc::getuid() } {
+            return Err(ApiError::new(
+                "state_file_unsafe",
+                "daemon persistent state is not owned by the current user",
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(ApiError::new(
+                "state_file_unsafe",
+                "daemon persistent state must not be readable or writable by group/other users",
+            ));
+        }
+        if let Some(parent) = path.parent()
+            && let Ok(parent_metadata) = fs::symlink_metadata(parent)
+            && parent_metadata.mode() & 0o022 != 0
+        {
+            return Err(ApiError::new(
+                "state_dir_unsafe",
+                "daemon persistent state directory must not be writable by group/other users",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(ApiError::new(
+            "state_persistence_unsupported",
+            "daemon JSON state persistence requires owner-only file permissions, which are not implemented on this platform",
+        ))
+    }
 }
 
 impl DaemonBackend {
@@ -231,8 +386,46 @@ impl DaemonBackend {
             operations: Vec::new(),
         };
 
+        Self::from_inner(inner, None)
+    }
+
+    /// Build a backend whose namespace/cache/content state is loaded from and
+    /// saved to `path`. This is the dev-loopback durability seam used by the
+    /// packaged desktop app until the production metadata store lands.
+    pub fn new_persistent(
+        endpoint: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, ApiError> {
+        let mut backend = Self::new(endpoint);
+        let path = path.into();
+        backend.persistence_path = Some(path.clone());
+        if path.exists() {
+            validate_state_file_for_load(&path)?;
+            let bytes = fs::read(&path).map_err(|error| {
+                ApiError::new(
+                    "state_read_failed",
+                    format!("could not read daemon persistent state: {error}"),
+                )
+            })?;
+            let snapshot: PersistentBackendState =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    ApiError::new(
+                        "state_decode_failed",
+                        format!("could not decode daemon persistent state: {error}"),
+                    )
+                })?;
+            let mut inner = backend.lock();
+            snapshot.apply_to(&mut inner)?;
+        }
+        backend.persist()?;
+        Ok(backend)
+    }
+
+    fn from_inner(inner: InMemoryBackend, persistence_path: Option<PathBuf>) -> Self {
         let backend = Self {
             inner: Arc::new(Mutex::new(inner)),
+            persistence_path,
+            persistence_lock: Arc::new(Mutex::new(())),
         };
         // daemon.started is the first event on the wire stream.
         backend.record_event(
@@ -240,6 +433,100 @@ impl DaemonBackend {
             Value::Object(Default::default()),
         );
         backend
+    }
+
+    /// Persist mutable daemon truth before acknowledging filesystem-visible
+    /// mutations. No-op for tests and callers that do not configure a state path.
+    pub fn persist(&self) -> Result<(), ApiError> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        #[cfg(not(unix))]
+        {
+            return Err(ApiError::new(
+                "state_persistence_unsupported",
+                "daemon JSON state persistence requires owner-only file permissions, which are not implemented on this platform",
+            ));
+        }
+        let snapshot = {
+            let inner = self.lock();
+            PersistentBackendState::from_inner(&inner)
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| {
+            ApiError::new(
+                "state_encode_failed",
+                format!("could not encode daemon persistent state: {error}"),
+            )
+        })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ApiError::new(
+                    "state_dir_failed",
+                    format!("could not create daemon state directory: {error}"),
+                )
+            })?;
+            protect_state_parent_for_write(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            let temp_path = path.with_extension("json.tmp");
+            let _ = fs::remove_file(&temp_path);
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temp_path)
+            }
+            .map_err(|error| {
+                ApiError::new(
+                    "state_write_failed",
+                    format!("could not create daemon persistent state: {error}"),
+                )
+            })?;
+            file.write_all(&bytes).map_err(|error| {
+                ApiError::new(
+                    "state_write_failed",
+                    format!("could not write daemon persistent state: {error}"),
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                ApiError::new(
+                    "state_sync_failed",
+                    format!("could not sync daemon persistent state: {error}"),
+                )
+            })?;
+            drop(file);
+            fs::rename(&temp_path, path).map_err(|error| {
+                ApiError::new(
+                    "state_replace_failed",
+                    format!("could not replace daemon persistent state: {error}"),
+                )
+            })?;
+            if let Some(parent) = path.parent()
+                && let Err(error) = fs::File::open(parent).and_then(|dir| dir.sync_all())
+            {
+                eprintln!("biohazardfsd: warning: could not sync daemon state directory: {error}");
+            }
+            Ok(())
+        }
+    }
+
+    fn persist_or_restore(&self, rollback: InMemoryBackend) -> Result<(), ApiError> {
+        match self.persist() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *self.lock() = rollback;
+                Err(error)
+            }
+        }
+    }
+
+    fn persistence_guard(&self) -> MutexGuard<'_, ()> {
+        self.persistence_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Lock the inner state. Poisoning is fatal for a sync daemon; we panic
@@ -781,7 +1068,9 @@ pub fn file_write_payload(
         .map(|value| value.to_string());
     let now = timestamp();
 
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let org_id = inner.org_id.clone();
 
     // Resolve the target node: update an existing file, or build a new one
@@ -1023,6 +1312,7 @@ pub fn file_write_payload(
         // `created` flag; it must never carry `content_hex` or the token.
         Some(build_file_write_audit_payload(&redacted_params, created)),
     );
+    backend.persist_or_restore(rollback)?;
 
     Ok(serde_json::json!({
         "node_id": node_id,
@@ -1054,7 +1344,9 @@ pub fn file_mkdir_payload(
         .to_string();
     let now = timestamp();
 
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let parent = inner
         .nodes
         .get(parent_id)
@@ -1124,6 +1416,7 @@ pub fn file_mkdir_payload(
         AuditEventResult::Success,
         Some(serde_json::json!({"parent_node_id": parent_id, "name": name}).to_string()),
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::json!({
         "created": true,
         "node_id": node_id,
@@ -1161,7 +1454,9 @@ pub fn file_rename_payload(
     }
     let now = timestamp();
 
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let node = inner
         .nodes
         .get(node_id)
@@ -1256,6 +1551,7 @@ pub fn file_rename_payload(
                 .to_string(),
         ),
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::json!({
         "renamed": true,
         "node_id": node_id,
@@ -1337,7 +1633,9 @@ pub fn cache_pin_payload(
     source: Source,
 ) -> Result<Value, ApiError> {
     let node_id = lookup_node_id(backend, params)?;
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let entry = inner
         .cache_entries
         .entry(node_id.clone())
@@ -1381,6 +1679,7 @@ pub fn cache_pin_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("cache entry serializes"))
 }
 
@@ -1390,7 +1689,9 @@ pub fn cache_unpin_payload(
     source: Source,
 ) -> Result<Value, ApiError> {
     let node_id = lookup_node_id(backend, params)?;
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let entry = inner.cache_entries.get_mut(&node_id).ok_or_else(|| {
         ApiError::new(
             "cache_entry_not_found",
@@ -1427,6 +1728,7 @@ pub fn cache_unpin_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("cache entry serializes"))
 }
 
@@ -1447,7 +1749,9 @@ pub fn cache_hydrate_payload(
             ));
         }
     }
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     // Dirty guard: a Dirty entry holds unuploaded local changes. Driving it to
     // Ready (the documented hydrate outcome) would silently discard them. The
     // caller must commit or dehydrate first. Pinned/Ready/Absent/Failed entries
@@ -1500,6 +1804,7 @@ pub fn cache_hydrate_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("cache entry serializes"))
 }
 
@@ -1509,7 +1814,9 @@ pub fn cache_dehydrate_payload(
     source: Source,
 ) -> Result<Value, ApiError> {
     let node_id = lookup_node_id(backend, params)?;
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let entry = inner
         .cache_entries
         .get_mut(&node_id)
@@ -1574,6 +1881,7 @@ pub fn cache_dehydrate_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(snapshot)
 }
 
@@ -1627,7 +1935,9 @@ pub fn lock_acquire_payload(
     let expires_at = expires
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| acquired_at.clone());
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let org_id = inner.org_id.clone();
     // Exclusive per-node locking: at most one effective lock per node_id. A
     // lock counts as effective while Active and not past expires_at (lazy
@@ -1682,6 +1992,7 @@ pub fn lock_acquire_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("lock serializes"))
 }
 
@@ -1701,7 +2012,9 @@ pub fn lock_release_payload(
     let caller_user_id = params.get("user_id").and_then(|value| value.as_str());
     let caller_device_id = params.get("device_id").and_then(|value| value.as_str());
     let now = timestamp();
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let lock = inner
         .locks
         .get_mut(lock_id)
@@ -1744,6 +2057,7 @@ pub fn lock_release_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("lock serializes"))
 }
 
@@ -1786,7 +2100,9 @@ pub fn lock_extend_payload(
             )
         })?;
     let now = time::OffsetDateTime::now_utc();
+    let _persistence_guard = backend.persistence_guard();
     let mut inner = backend.lock();
+    let rollback = inner.clone();
     let lock = inner
         .locks
         .get_mut(lock_id)
@@ -1823,6 +2139,7 @@ pub fn lock_extend_payload(
         AuditEventResult::Success,
         None,
     );
+    backend.persist_or_restore(rollback)?;
     Ok(serde_json::to_value(snapshot).expect("lock serializes"))
 }
 
@@ -2474,6 +2791,83 @@ mod tests {
         let mut request = DaemonRequest::new(method, Source::Test);
         request.params = params;
         request
+    }
+
+    fn temp_state_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock is after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("biohazardfs-{name}-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir.join("state.json")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persistent_backend_survives_reload() {
+        let path = temp_state_path("daemon-state");
+        {
+            let backend = DaemonBackend::new_persistent("127.0.0.1:47666", &path).unwrap();
+            let made_dir = file_mkdir_payload(
+                &backend,
+                &serde_json::json!({"parent_node_id": "node_root", "name": "seq010"}),
+                Source::Test,
+            )
+            .unwrap();
+            let dir_id = made_dir["node_id"].as_str().unwrap();
+            let written = file_write_payload(
+                &backend,
+                &serde_json::json!({
+                    "parent_node_id": dir_id,
+                    "name": "plate.txt",
+                    "content_hex": encode_hex(b"persistent plate"),
+                }),
+                Source::Test,
+            )
+            .unwrap();
+            file_rename_payload(
+                &backend,
+                &serde_json::json!({
+                    "node_id": written["node_id"],
+                    "new_parent_node_id": dir_id,
+                    "new_name": "plate-renamed.txt",
+                }),
+                Source::Test,
+            )
+            .unwrap();
+        }
+
+        let reloaded = DaemonBackend::new_persistent("127.0.0.1:47666", &path).unwrap();
+        let listing = file_list_payload(&reloaded, &serde_json::json!({})).unwrap();
+        assert!(
+            listing["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["name"] == "seq010" && entry["kind"] == "directory" })
+        );
+        let inner = reloaded.lock();
+        let renamed = inner
+            .nodes
+            .values()
+            .find(|node| node.name == "plate-renamed.txt")
+            .expect("renamed persisted node exists");
+        assert_eq!(
+            inner.file_contents.get(&renamed.node_id).map(Vec::as_slice),
+            Some(b"persistent plate".as_slice())
+        );
+        drop(inner);
+        let parent = path.parent().map(std::path::Path::to_path_buf);
+        let _ = fs::remove_file(path);
+        if let Some(parent) = parent {
+            let _ = fs::remove_dir(parent);
+        }
     }
 
     #[test]

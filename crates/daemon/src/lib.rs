@@ -34,6 +34,7 @@ pub use transport::{TransportDescriptor, TransportKind};
 use backend as b;
 
 pub const LOCAL_TOKEN_ENV: &str = "BIOHAZARDFS_LOCAL_TOKEN";
+pub const STATE_PATH_ENV: &str = "BIOHAZARDFS_STATE_PATH";
 pub const WORKSPACE_ROOT_ENV: &str = "BIOHAZARDFS_WORKSPACE_ROOT";
 const MAX_RPC_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
@@ -54,7 +55,16 @@ impl DevLoopbackConfig {
     /// Build a config with a fresh seeded backend bound to `addr`.
     pub fn new(addr: impl Into<String>, local_token: impl Into<String>) -> Self {
         let addr = addr.into();
-        let backend = Arc::new(DaemonBackend::new(addr.clone()));
+        let backend = match std::env::var_os(STATE_PATH_ENV) {
+            Some(path) => match DaemonBackend::new_persistent(addr.clone(), path) {
+                Ok(backend) => Arc::new(backend),
+                Err(error) => {
+                    eprintln!("failed to open daemon persistent state: {}", error.message);
+                    std::process::exit(2);
+                }
+            },
+            None => Arc::new(DaemonBackend::new(addr.clone())),
+        };
         Self {
             addr,
             local_token: local_token.into(),

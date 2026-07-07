@@ -113,6 +113,7 @@ dependencies = [
  "biohazardfs-api-types",
  "biohazardfs-core",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "time",

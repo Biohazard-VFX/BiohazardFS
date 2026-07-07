@@ -394,6 +394,7 @@ BIOHAZARDFS_LOCAL_TOKEN=<local-token> biohazardfs daemon workspace-list --path p
 Rules:
 
 - The daemon reads `BIOHAZARDFS_WORKSPACE_ROOT` from its own environment; clients do not pass workspace roots through argv.
+- When `BIOHAZARDFS_STATE_PATH` is set, the dev-loopback daemon persists scaffold namespace/cache/content/audit state to that owner-only JSON file before acknowledging `file.write`, `file.mkdir`, or `file.rename`. The desktop app sets this path automatically under its per-user application data directory.
 - `workspace-list` accepts only relative paths that stay inside the configured workspace root.
 - These methods are local runtime inspection primitives for the daemon/Electron/CLI path, not server file APIs.
 

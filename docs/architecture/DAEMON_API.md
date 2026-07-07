@@ -111,7 +111,7 @@ Descriptor and token files must be readable only by the owning OS user.
 
 **Target behavior (production):** the daemon uses an owner-only SQLite local state DB.
 
-**Current scaffold:** the local state is in-memory (`DaemonBackend`) and rebuilt on each daemon start; nothing is persisted to SQLite yet (see "Spine — SCAFFOLD" below). The SQLite projection is planned work.
+**Current scaffold:** `DaemonBackend` is still the in-process authority, but dev-loopback can persist its namespace/cache/content/audit scaffold state to an owner-only JSON file when `BIOHAZARDFS_STATE_PATH` is set. The packaged desktop app sets this path under its per-user application data directory so Finder-created files and folders survive daemon restart. This is not the production SQLite projection; SQLite remains planned work.
 
 The local state DB tracks:
 
@@ -673,7 +673,7 @@ Beyond this slice, the spine now covers read surfaces for locks, conflicts, tran
 Next required work before this stops being a scaffold:
 
 - Production IPC transport (Unix socket / named pipe) plus the owner-only descriptor file on disk.
-- SQLite projection of cache index, transfer queue, operation tokens, audit buffer, and event cursors so dirty and queued state survives restart.
+- SQLite projection of cache index, transfer queue, operation tokens, audit buffer, and event cursors. The current `BIOHAZARDFS_STATE_PATH` JSON file is a scaffold persistence seam, not the final local DB.
 - NDJSON/SSE event transport wired to the existing event buffer.
 - Promoting destructive/data-moving periphery (`file.delete`, `file.move`, `file.restore`, `cache.evict`, `mount.attach`/`detach`, `auth.logout`, and the rest) off `method_not_implemented`.
 

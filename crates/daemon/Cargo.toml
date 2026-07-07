@@ -16,6 +16,7 @@ path = "src/main.rs"
 biohazardfs-api-types = { path = "../api-types" }
 biohazardfs-core = { path = "../core" }
 clap.workspace = true
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 # `time` is already a workspace dep (used by api-types for RFC3339 timestamps) and

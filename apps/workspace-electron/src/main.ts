@@ -159,12 +159,17 @@ async function ensureManagedDaemon(): Promise<void> {
   const binary = await daemonBinaryPath();
   if (!binary) return;
 
+  const daemonEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    BIOHAZARDFS_LOCAL_TOKEN: localToken,
+    BIOHAZARDFS_WORKSPACE_ROOT: defaultWorkspaceRoot(),
+  };
+  if (process.platform !== 'win32') {
+    daemonEnv.BIOHAZARDFS_STATE_PATH = path.join(app.getPath('userData'), 'daemon-state.json');
+  }
+
   const child = spawn(binary, ['--dev-loopback-http', '--addr', DAEMON_ENDPOINT], {
-    env: {
-      ...process.env,
-      BIOHAZARDFS_LOCAL_TOKEN: localToken,
-      BIOHAZARDFS_WORKSPACE_ROOT: defaultWorkspaceRoot(),
-    },
+    env: daemonEnv,
     stdio: ['ignore', 'ignore', 'pipe'],
     windowsHide: true,
   });
